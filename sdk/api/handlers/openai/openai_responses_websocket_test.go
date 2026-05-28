@@ -952,6 +952,7 @@ func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
 			errCh,
 			timelineLog,
 			"session-1",
+			nil,
 		)
 		if err != nil {
 			serverErrCh <- err
@@ -1035,6 +1036,7 @@ func TestForwardResponsesWebsocketLogsAttemptedResponseOnWriteFailure(t *testing
 			errCh,
 			timelineLog,
 			"session-1",
+			nil,
 		)
 		if err == nil {
 			serverErrCh <- errors.New("expected websocket write failure")

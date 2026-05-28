@@ -16,6 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	requestlogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/monitor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -222,6 +223,15 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	requestLogEnabled := h != nil && h.Cfg != nil && h.Cfg.RequestLog
 	wsTimelineLog := newWebsocketTimelineLog(requestLogEnabled, websocketTimelineSourceFromContext(c))
 
+	// The monitor middleware does not register an entry for the WebSocket
+	// upgrade itself (one row would not be useful for a long-lived session
+	// that multiplexes many logical requests). Instead we pull the Registry
+	// from context and create a fresh entry per logical frame below.
+	monRegistry := monitor.RegistryFromContext(c.Request.Context())
+	monClientIP := websocketClientAddress(c)
+	monUserAgent := c.Request.Header.Get("User-Agent")
+	monPath := c.Request.URL.Path
+
 	wsDone := make(chan struct{})
 	defer close(wsDone)
 
@@ -395,14 +405,43 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
+
+		// Register a fresh in-flight monitor entry for this logical request.
+		// One WS session multiplexes many response.create calls; tracking
+		// each as its own row gives operators per-keypress granularity.
+		// monHandle is nil-safe — methods become no-ops when monRegistry is
+		// nil or the entry was never created.
+		var monHandle *monitor.Handle
+		if monRegistry != nil {
+			frameID := requestlogging.GenerateRequestID()
+			monHandle = monRegistry.RegisterHandle(
+				frameID,
+				"WS",
+				monitor.TransportWS,
+				monPath,
+				monClientIP,
+				monUserAgent,
+				int64(len(payload)),
+				func() { cliCancel(nil) },
+			)
+			monHandle.MarkStreaming()
+			if frameModel := strings.TrimSpace(gjson.GetBytes(payload, "model").String()); frameModel != "" {
+				monHandle.SetModel(frameModel)
+			}
+		}
+
 		if pinnedAuthID != "" {
 			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
+			// Monitor: the auth is already known up-front; record it now.
+			monHandle.SetAuth(pinnedAuthID)
 		} else {
 			cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
 				authID = strings.TrimSpace(authID)
 				if authID == "" || h == nil || h.AuthManager == nil {
 					return
 				}
+				// Monitor: surface the auth selected by the conductor.
+				monHandle.SetAuth(authID)
 				selectedAuth, ok := sessionAuthByID(authID)
 				if !ok || selectedAuth == nil {
 					return
@@ -414,7 +453,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 
-		completedOutput, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, wsTimelineLog, passthroughSessionID)
+		completedOutput, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, wsTimelineLog, passthroughSessionID, monHandle)
+		monHandle.Finish()
 		if errForward != nil {
 			wsTerminateErr = errForward
 			log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
@@ -1089,6 +1129,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	errs <-chan *interfaces.ErrorMessage,
 	wsTimelineLog websocketTimelineAppender,
 	sessionID string,
+	monHandle *monitor.Handle,
 ) ([]byte, *interfaces.ErrorMessage, error) {
 	completed := false
 	completedOutput := []byte("[]")
@@ -1177,6 +1218,11 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					completed = true
 					completedOutput = responseCompletedOutputFromPayload(payloads[i])
 				}
+				// Monitor: record TTFB on first emitted payload, accumulate
+				// response bytes, and harvest provider usage when present.
+				monHandle.MarkFirstByte()
+				monHandle.AddResponseBytes(len(payloads[i]))
+				monHandle.ExtractUsage(payloads[i])
 				markAPIResponseTimestamp(c)
 				// log.Infof(
 				// 	"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
