@@ -1,0 +1,138 @@
+name: sync-upstream-release
+
+# Watches upstream (router-for-me/CLIProxyAPI) for new releases and, when one
+# appears, rebases this fork's monitor-feature branch onto the new upstream
+# tag and pushes a matching `<upstream-tag>+monitor` tag. That tag push then
+# triggers .github/workflows/release.yml, which builds binaries and publishes
+# a GitHub Release on the fork.
+#
+# Run cadence: every 6 hours, plus a workflow_dispatch button for manual runs.
+# Required permissions: contents (push branch + tag) and issues (open a
+# conflict-report issue if the auto-rebase fails).
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: router-for-me/CLIProxyAPI
+  FEATURE_BRANCH: monitor-feature
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FEATURE_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch tags
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream --tags --prune
+
+      - name: Detect upstream latest release
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)
+          if [ -z "$UPSTREAM_TAG" ] || [ "$UPSTREAM_TAG" = "null" ]; then
+            echo "Could not resolve upstream latest release tag." >&2
+            exit 1
+          fi
+          FORK_TAG="${UPSTREAM_TAG}+monitor"
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          echo "fork_tag=$FORK_TAG"         >> "$GITHUB_OUTPUT"
+          echo "Upstream latest release: $UPSTREAM_TAG"
+          echo "Target fork tag:        $FORK_TAG"
+          if git rev-parse "refs/tags/$FORK_TAG" >/dev/null 2>&1; then
+            echo "Fork already has $FORK_TAG; nothing to do."
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify upstream tag exists locally
+        if: steps.detect.outputs.skip != 'true'
+        run: |
+          if ! git rev-parse "refs/tags/${{ steps.detect.outputs.upstream_tag }}" >/dev/null 2>&1; then
+            echo "Upstream tag ${{ steps.detect.outputs.upstream_tag }} was not fetched." >&2
+            exit 1
+          fi
+
+      - name: Attempt rebase onto upstream tag
+        if: steps.detect.outputs.skip != 'true'
+        id: rebase
+        run: |
+          set +e
+          git rebase "${{ steps.detect.outputs.upstream_tag }}" 2>&1 | tee /tmp/rebase.log
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            git rebase --abort 2>/dev/null || true
+            echo "rebase_failed=true" >> "$GITHUB_OUTPUT"
+            {
+              echo 'REBASE_LOG<<REBASE_LOG_EOF'
+              tail -200 /tmp/rebase.log
+              echo 'REBASE_LOG_EOF'
+            } >> "$GITHUB_ENV"
+          else
+            echo "rebase_failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push rebased branch and tag
+        if: steps.detect.outputs.skip != 'true' && steps.rebase.outputs.rebase_failed != 'true'
+        run: |
+          git push --force-with-lease origin "${FEATURE_BRANCH}"
+          git tag "${{ steps.detect.outputs.fork_tag }}"
+          git push origin "${{ steps.detect.outputs.fork_tag }}"
+          echo "Pushed ${{ steps.detect.outputs.fork_tag }} — release workflow will take over."
+
+      - name: Open conflict report issue
+        if: steps.detect.outputs.skip != 'true' && steps.rebase.outputs.rebase_failed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_TAG: ${{ steps.detect.outputs.upstream_tag }}
+          FORK_TAG:     ${{ steps.detect.outputs.fork_tag }}
+        run: |
+          BODY_FILE=$(mktemp)
+          {
+            echo "Scheduled sync could not auto-rebase \`${FEATURE_BRANCH}\` onto upstream tag **${UPSTREAM_TAG}**."
+            echo
+            echo "## Rebase output"
+            echo
+            echo '```'
+            printf '%s\n' "$REBASE_LOG"
+            echo '```'
+            echo
+            echo "## Manual recovery"
+            echo
+            echo '```sh'
+            echo "git fetch upstream --tags"
+            echo "git checkout ${FEATURE_BRANCH}"
+            echo "git rebase ${UPSTREAM_TAG}"
+            echo "# resolve conflicts, then:"
+            echo "git push --force-with-lease origin ${FEATURE_BRANCH}"
+            echo "git tag ${FORK_TAG}"
+            echo "git push origin ${FORK_TAG}"
+            echo '```'
+            echo
+            echo "Pushing the \`${FORK_TAG}\` tag triggers the release workflow automatically."
+          } > "$BODY_FILE"
+          gh issue create \
+            --title "auto-sync: rebase conflict against ${UPSTREAM_TAG}" \
+            --label "auto-sync" \
+            --body-file "$BODY_FILE" || true
