@@ -399,8 +399,13 @@ extract_release_info() {
         expected_filename="${expected_filename}.tar.gz"
     fi
     
-    download_url=$(echo "$release_info" | grep -o "\"browser_download_url\": *\"[^\"]*${expected_filename}[^\"]*\"" | cut -d'"' -f4)
-    
+    # GitHub URL-encodes characters that are unsafe in URL paths when
+    # composing release asset URLs. The '+' in our +monitor tag is rendered
+    # as %2B inside the JSON's browser_download_url field, so a grep for
+    # the literal filename misses every asset. Encode '+' before matching.
+    local expected_filename_for_grep="${expected_filename//+/%2B}"
+    download_url=$(echo "$release_info" | grep -o "\"browser_download_url\": *\"[^\"]*${expected_filename_for_grep}[^\"]*\"" | cut -d'"' -f4)
+
     if [[ -z "$download_url" ]]; then
         log_error "Failed to find download URL for ${expected_filename}"
         exit 1
