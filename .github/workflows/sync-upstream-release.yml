@@ -2,13 +2,15 @@ name: sync-upstream-release
 
 # Watches upstream (router-for-me/CLIProxyAPI) for new releases and, when one
 # appears, rebases this fork's monitor-feature branch onto the new upstream
-# tag and pushes a matching `<upstream-tag>+monitor` tag. That tag push then
-# triggers .github/workflows/release.yml, which builds binaries and publishes
-# a GitHub Release on the fork.
+# tag, pushes a matching <upstream-tag>+monitor tag, and immediately runs
+# goreleaser to publish binaries as a GitHub Release on the fork.
 #
-# Run cadence: every 6 hours, plus a workflow_dispatch button for manual runs.
-# Required permissions: contents (push branch + tag) and issues (open a
-# conflict-report issue if the auto-rebase fails).
+# Everything runs in one workflow on purpose: the default GITHUB_TOKEN does
+# not trigger downstream workflows on push events, so splitting the rebase
+# step and the release step into separate workflows would leave the tag
+# push unhandled.
+#
+# Cadence: every 6 hours, plus a workflow_dispatch button for manual runs.
 
 on:
   schedule:
@@ -24,7 +26,7 @@ env:
   FEATURE_BRANCH: monitor-feature
 
 jobs:
-  sync:
+  sync-and-release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -99,7 +101,41 @@ jobs:
           git push --force-with-lease origin "${FEATURE_BRANCH}"
           git tag "${{ steps.detect.outputs.fork_tag }}"
           git push origin "${{ steps.detect.outputs.fork_tag }}"
-          echo "Pushed ${{ steps.detect.outputs.fork_tag }} — release workflow will take over."
+          echo "Pushed ${{ steps.detect.outputs.fork_tag }}; goreleaser step will publish binaries."
+
+      - name: Refresh models catalog
+        if: steps.detect.outputs.skip != 'true' && steps.rebase.outputs.rebase_failed != 'true'
+        run: |
+          git fetch --depth 1 https://github.com/router-for-me/models.git main
+          git show FETCH_HEAD:models.json > internal/registry/models/models.json
+
+      - uses: actions/setup-go@v5
+        if: steps.detect.outputs.skip != 'true' && steps.rebase.outputs.rebase_failed != 'true'
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate build metadata
+        if: steps.detect.outputs.skip != 'true' && steps.rebase.outputs.rebase_failed != 'true'
+        env:
+          FORK_TAG: ${{ steps.detect.outputs.fork_tag }}
+        run: |
+          echo "VERSION=${FORK_TAG}"                       >> "$GITHUB_ENV"
+          echo "COMMIT=$(git rev-parse --short HEAD)"      >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - uses: goreleaser/goreleaser-action@v6
+        if: steps.detect.outputs.skip != 'true' && steps.rebase.outputs.rebase_failed != 'true'
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean --skip=validate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ steps.detect.outputs.fork_tag }}
+          VERSION:    ${{ env.VERSION }}
+          COMMIT:     ${{ env.COMMIT }}
+          BUILD_DATE: ${{ env.BUILD_DATE }}
 
       - name: Open conflict report issue
         if: steps.detect.outputs.skip != 'true' && steps.rebase.outputs.rebase_failed == 'true'
@@ -130,7 +166,7 @@ jobs:
             echo "git push origin ${FORK_TAG}"
             echo '```'
             echo
-            echo "Pushing the \`${FORK_TAG}\` tag triggers the release workflow automatically."
+            echo "Pushing the \`${FORK_TAG}\` tag manually does NOT trigger an automatic release (GitHub blocks downstream workflow triggers from the default GITHUB_TOKEN). Re-run this workflow via 'Actions → sync-upstream-release → Run workflow' after the tag is in place; it will detect the new tag and proceed to the goreleaser step."
           } > "$BODY_FILE"
           gh issue create \
             --title "auto-sync: rebase conflict against ${UPSTREAM_TAG}" \
