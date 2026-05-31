@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -33,6 +34,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/monitor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
@@ -63,6 +65,25 @@ type serverOptionConfig struct {
 
 // ServerOption customises HTTP server construction.
 type ServerOption func(*serverOptionConfig)
+
+// displayProxyURL returns the proxy URL in a form safe to surface in the
+// monitor UI: scheme + host[:port], with any embedded user/password
+// credentials stripped. Returns "" when the input is empty or unparseable
+// so the UI just hides the field rather than showing junk.
+func displayProxyURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	if u.Scheme == "" {
+		return u.Host
+	}
+	return u.Scheme + "://" + u.Host
+}
 
 func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.RequestLogger {
 	configDir := filepath.Dir(configPath)
@@ -191,6 +212,11 @@ type Server struct {
 	keepAliveOnTimeout func()
 	keepAliveHeartbeat chan struct{}
 	keepAliveStop      chan struct{}
+
+	// monitorRegistry tracks in-flight AI requests for the operator monitor UI.
+	monitorRegistry *monitor.Registry
+	// monitorStop terminates the monitor watcher goroutine on shutdown.
+	monitorStop chan struct{}
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -266,7 +292,31 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		currentPath:         wd,
 		envManagementSecret: envManagementSecret,
 		wsRoutes:            make(map[string]struct{}),
+		monitorRegistry:     monitor.NewRegistry(),
 	}
+	if authManager != nil {
+		s.monitorRegistry.SetAuthLookup(func(authID string) (string, string, string, bool) {
+			a, ok := authManager.GetByID(authID)
+			if !ok || a == nil {
+				return "", "", "", false
+			}
+			label := a.Label
+			if label == "" {
+				label = a.ID
+			}
+			return label, a.Provider, displayProxyURL(a.ProxyURL), true
+		})
+	}
+	// Persist monitor settings next to the active config file; persist the
+	// cancellation history JSONL in the shared logs directory.
+	configDir := filepath.Dir(configFilePath)
+	s.monitorRegistry.AttachSettings(monitor.NewSettingsStore(filepath.Join(configDir, "monitor-settings.json")))
+	s.monitorRegistry.AttachHistoryLog(filepath.Join(logging.ResolveLogDirectory(cfg), "monitor-cancels.jsonl"))
+	s.monitorStop = make(chan struct{})
+	s.monitorRegistry.StartWatcher(s.monitorStop)
+	// Install monitor middleware after request logging so it can rely on the
+	// pre-generated request ID and on body restoration.
+	engine.Use(monitor.Middleware(s.monitorRegistry))
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	// Save initial YAML snapshot
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
@@ -372,6 +422,7 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/monitor.html", monitor.ServeUI())
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -708,6 +759,17 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 	}
+
+	// In-flight request monitor endpoints. Reuses the same auth middleware as
+	// the rest of the management API; SSE listeners may pass the key via
+	// ?key=... since EventSource cannot send custom headers.
+	monitorGroup := s.engine.Group("/v0/management")
+	monitorGroup.Use(
+		s.managementAvailabilityMiddleware(),
+		monitor.QueryKeyToAuthHeader(),
+		s.mgmt.Middleware(),
+	)
+	monitor.RegisterRoutes(monitorGroup, s.monitorRegistry)
 }
 
 func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
@@ -1284,6 +1346,16 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+
+	if s.monitorStop != nil {
+		select {
+		case <-s.monitorStop:
+			// already closed
+		default:
+			close(s.monitorStop)
+		}
+		s.monitorStop = nil
+	}
 
 	if s.keepAliveEnabled {
 		select {
