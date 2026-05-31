@@ -1,0 +1,971 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CPA In-Flight Monitor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg:           #0b1018;
+    --bg-grad-top:  #0c1320;
+    --bg-grad-bot:  #08090f;
+    --panel:        #11172380;
+    --panel-solid:  #11172a;
+    --panel-elev:   #161e30;
+    --border:       #25304a;
+    --border-soft:  rgba(255,255,255,0.06);
+    --text:         #e8edfa;
+    --text-dim:     #b8c2dc;
+    --muted:        #7a89a8;
+    --accent:       #6aa3ff;
+    --accent-glow:  rgba(106,163,255,0.18);
+    --accent-soft:  #243f74;
+    --good:         #34d399;
+    --good-bg:      rgba(52,211,153,0.12);
+    --warn:         #f5b450;
+    --warn-bg:      rgba(245,180,80,0.12);
+    --bad:          #ef5b6e;
+    --bad-bg:       rgba(239,91,110,0.12);
+    --info:         #8ab4f8;
+    --info-bg:      rgba(138,180,248,0.12);
+    --radius:       12px;
+    --shadow-card:  0 1px 0 rgba(255,255,255,0.04) inset, 0 1px 24px -8px rgba(0,0,0,0.6);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: "Inter", "InterVariable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-feature-settings: "cv11", "ss01", "ss03";
+    background:
+      radial-gradient(1200px 600px at 20% -10%, rgba(106,163,255,0.10), transparent 60%),
+      radial-gradient(900px 500px at 110% 0%, rgba(167,107,255,0.07), transparent 60%),
+      linear-gradient(180deg, var(--bg-grad-top), var(--bg-grad-bot));
+    background-attachment: fixed;
+    color: var(--text);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    padding: 14px 24px;
+    background: rgba(11,16,24,0.78);
+    backdrop-filter: saturate(140%) blur(10px);
+    -webkit-backdrop-filter: saturate(140%) blur(10px);
+    border-bottom: 1px solid var(--border-soft);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  header h1 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  header h1::before {
+    content: "";
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 4px var(--accent-glow);
+  }
+  header .meta { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  header .right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+  button {
+    background: linear-gradient(180deg, #5d97f8, #4d83de);
+    color: white;
+    border: none;
+    padding: 7px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: transform 0.06s ease, filter 0.15s ease, box-shadow 0.15s ease;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.12) inset, 0 4px 14px -6px rgba(106,163,255,0.4);
+  }
+  button:hover { filter: brightness(1.07); }
+  button:active { transform: translateY(1px); }
+  button.secondary {
+    background: rgba(255,255,255,0.04);
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    box-shadow: none;
+  }
+  button.secondary:hover { background: rgba(255,255,255,0.07); border-color: #3a4767; }
+  button.danger {
+    background: linear-gradient(180deg, #ef5b6e, #cc4456);
+    box-shadow: 0 1px 0 rgba(255,255,255,0.1) inset, 0 4px 14px -6px rgba(239,91,110,0.5);
+  }
+
+  input.key, input[type=number], input[type=text] {
+    background: rgba(11,15,24,0.8);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 7px 12px;
+    font-size: 13px;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    outline: none;
+  }
+  input.key { width: 240px; }
+  input[type=number] { width: 110px; }
+  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+
+  main { padding: 22px 24px 56px; max-width: 1700px; margin: 0 auto; }
+
+  /* Card-style panels */
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    margin-bottom: 16px;
+    box-shadow: var(--shadow-card);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+  }
+  .panel h2 {
+    margin: 0 0 10px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+  .panel .row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  .panel label {
+    display: flex; flex-direction: column; gap: 6px;
+    font-size: 12px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-weight: 600;
+  }
+
+  /* Empty / status */
+  .empty { text-align: center; color: var(--muted); padding: 56px 0; font-size: 14px; }
+  .status-line { padding: 10px 2px; color: var(--muted); font-size: 13px; }
+  .status-line.error { color: var(--bad); }
+  .toolbar {
+    color: var(--muted);
+    font-size: 13px;
+    margin: 8px 2px 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  /* Table card */
+  .table-wrap {
+    background: var(--panel);
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-card);
+    overflow: hidden;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+  }
+  table { width: 100%; border-collapse: separate; border-spacing: 0; }
+  th, td {
+    padding: 11px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-soft);
+    font-size: 13px;
+    vertical-align: top;
+  }
+  th {
+    background: rgba(255,255,255,0.025);
+    font-weight: 600;
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+  }
+  tbody tr {
+    transition: background-color 0.12s ease, box-shadow 0.12s ease;
+    position: relative;
+  }
+  tbody tr:hover { background: rgba(106,163,255,0.04); }
+  tbody tr:last-child td { border-bottom: none; }
+
+  /* Row left-accent via box-shadow: works without disturbing border collapse */
+  tbody tr td:first-child {
+    position: relative;
+    padding-left: 18px;
+  }
+  tbody tr td:first-child::before {
+    content: "";
+    position: absolute;
+    left: 0; top: 6px; bottom: 6px;
+    width: 3px;
+    border-radius: 2px;
+    background: transparent;
+    transition: background 0.15s ease, box-shadow 0.15s ease;
+  }
+  tbody tr.transport-ws td:first-child::before {
+    background: var(--accent);
+    box-shadow: 0 0 12px 0 var(--accent-glow);
+  }
+  tbody tr.transport-http td:first-child::before {
+    background: var(--border);
+  }
+
+  tr.terminal { opacity: 0.55; }
+  tr.terminal:hover { background: transparent; }
+  @keyframes streamPulse {
+    0%, 100% { box-shadow: inset 2px 0 0 0 transparent; }
+    50%      { box-shadow: inset 2px 0 0 0 rgba(52,211,153,0.4); }
+  }
+  tr.streaming-active { animation: streamPulse 2.4s ease-in-out infinite; }
+  @keyframes rowFadeIn {
+    from { opacity: 0; transform: translateY(-2px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  /* Only newly-inserted rows fade in. The diff renderer reuses existing
+     <tr> nodes, so updates do not re-trigger the animation. */
+  tbody tr.row-enter { animation: rowFadeIn 0.18s ease-out; }
+
+  /* Pills */
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    background: var(--accent-soft);
+    color: var(--text);
+    border: 1px solid transparent;
+  }
+  .pill::before {
+    content: "";
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.85;
+  }
+  .pill.streaming { background: var(--good-bg); color: var(--good); border-color: rgba(52,211,153,0.25); }
+  .pill.canceling { background: var(--warn-bg); color: var(--warn); border-color: rgba(245,180,80,0.25); }
+  .pill.canceled  { background: var(--bad-bg);  color: var(--bad);  border-color: rgba(239,91,110,0.25); }
+  .pill.finished  { background: var(--info-bg); color: var(--info); border-color: rgba(138,180,248,0.25); }
+  .pill.error     { background: var(--bad-bg);  color: var(--bad);  border-color: rgba(239,91,110,0.25); }
+
+  .pill.streaming::before { box-shadow: 0 0 8px currentColor; animation: dotPulse 1.6s ease-in-out infinite; }
+  @keyframes dotPulse { 50% { opacity: 0.45; transform: scale(0.85); } }
+
+  /* Transport pill */
+  .transport-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 7px;
+    border-radius: 6px;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    margin-right: 8px;
+    border: 1px solid transparent;
+    text-transform: uppercase;
+    font-variant-numeric: tabular-nums;
+  }
+  .transport-pill.ws   {
+    background: rgba(106,163,255,0.14);
+    color: #8ab9ff;
+    border-color: rgba(106,163,255,0.35);
+    box-shadow: 0 0 0 3px rgba(106,163,255,0.05);
+  }
+  .transport-pill.http { background: rgba(255,255,255,0.05); color: var(--text-dim); border-color: var(--border); }
+  .path-cell {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    color: var(--text-dim);
+  }
+  td.method-path { white-space: nowrap; }
+  .proxy-line {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: #8ab9ff;
+    opacity: 0.85;
+    margin-top: 2px;
+  }
+  .proxy-line::before {
+    content: "↳ ";
+    opacity: 0.6;
+  }
+
+  /* Reason pill (history) */
+  .reason-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    border: 1px solid transparent;
+  }
+  .reason-pill.manual     { background: rgba(167,107,255,0.12); color: #c4a0ff; border-color: rgba(167,107,255,0.3); }
+  .reason-pill.auto-stall { background: rgba(245,180,80,0.14);  color: #f5c98a; border-color: rgba(245,180,80,0.3); }
+
+  /* Typography helpers */
+  .muted { color: var(--muted); }
+  .id-cell {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-dim);
+    letter-spacing: 0.02em;
+  }
+  .duration, .bytes { font-variant-numeric: tabular-nums; color: var(--text-dim); }
+  .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+
+  /* History details */
+  details.history { margin-top: 20px; }
+  details.history > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 10px 14px;
+    background: var(--panel);
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius);
+    font-size: 12px;
+    color: var(--text-dim);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    transition: background-color 0.12s ease;
+    user-select: none;
+    box-shadow: var(--shadow-card);
+  }
+  details.history > summary::-webkit-details-marker { display: none; }
+  details.history > summary::before {
+    content: "▸";
+    display: inline-block;
+    margin-right: 10px;
+    transition: transform 0.15s ease;
+    color: var(--muted);
+  }
+  details.history[open] > summary::before { transform: rotate(90deg); }
+  details.history > summary:hover { background: var(--panel-elev); }
+  details.history[open] > summary {
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+    border-bottom-color: transparent;
+  }
+  details.history .table-wrap {
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+    border-top: none;
+    margin-top: -1px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>CPA In-Flight Monitor</h1>
+  <span class="meta" id="metaCount">0 active</span>
+  <div class="right">
+    <input id="mgmtKey" class="key" type="password" placeholder="Management key" autocomplete="off">
+    <button id="connectBtn">Connect</button>
+    <button id="refreshBtn" class="secondary">Refresh</button>
+  </div>
+</header>
+<main>
+  <div class="toolbar">
+    <span class="muted">Auto-refreshes via SSE. Cancel button aborts the upstream request and frees the credential.</span>
+  </div>
+
+  <section class="panel" id="settingsPanel" hidden>
+    <h2>Auto-cancel settings</h2>
+    <div class="row">
+      <label>
+        Stall timeout (seconds)
+        <input id="stallInput" type="number" min="0" step="1" value="0">
+      </label>
+      <button id="saveSettingsBtn">Save</button>
+      <span class="muted" id="settingsHint">0 disables auto-cancel. When &gt;0, any non-terminal request with no response activity for that many seconds is cancelled automatically.</span>
+    </div>
+    <div id="settingsStatus" class="status-line"></div>
+  </section>
+
+  <div id="status" class="status-line">Not connected. Enter the management key and press Connect.</div>
+  <div class="table-wrap" id="tableWrap" hidden>
+    <table id="table">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Started / TTFB</th>
+          <th>Duration</th>
+          <th>Method / Path</th>
+          <th>Model</th>
+          <th>Account</th>
+          <th>Req → Resp</th>
+          <th>Tokens</th>
+          <th>Status</th>
+          <th>Client</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+  <div id="empty" class="empty" hidden>No in-flight requests right now.</div>
+
+  <details class="history" id="historySection" hidden>
+    <summary>Recent cancellations (<span id="historyCount">0</span>)</summary>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>When</th>
+            <th>ID</th>
+            <th>Reason</th>
+            <th>By</th>
+            <th>Path</th>
+            <th>Model</th>
+            <th>Account</th>
+            <th>Bytes</th>
+            <th>Duration</th>
+          </tr>
+        </thead>
+        <tbody id="historyBody"></tbody>
+      </table>
+    </div>
+  </details>
+</main>
+<script>
+(function () {
+  const KEY_STORAGE = 'cpa.monitor.key';
+  const entries = new Map();
+  let evt = null;
+
+  const $ = (id) => document.getElementById(id);
+  const tbody = $('tbody');
+  const tableEl = $('tableWrap');
+  const emptyEl = $('empty');
+  const statusEl = $('status');
+  const metaCount = $('metaCount');
+  const keyEl = $('mgmtKey');
+
+  keyEl.value = sessionStorage.getItem(KEY_STORAGE) || '';
+
+  // Server-vs-client clock offset. The browser's Date.now() can drift several
+  // seconds away from the server (NTP skew, VM suspend, etc.). Without this,
+  // a brand-new entry whose started_at sits a couple seconds in the browser's
+  // future shows a negative duration until the wall clock catches up.
+  // Updated whenever a server response includes a "now" timestamp.
+  let clockOffsetMs = 0;
+  function noteServerNow(iso) {
+    if (!iso) return;
+    const serverNow = new Date(iso).getTime();
+    if (!serverNow) return;
+    clockOffsetMs = serverNow - Date.now();
+  }
+  function serverNow() { return Date.now() + clockOffsetMs; }
+
+  function fmtBytes(n) {
+    if (!n) return '0 B';
+    const units = ['B','KB','MB','GB'];
+    let i = 0, v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return v.toFixed(v >= 10 || i === 0 ? 0 : 1) + ' ' + units[i];
+  }
+
+  function fmtDuration(ms) {
+    if (ms < 0) ms = 0;
+    if (ms < 1000) return ms + ' ms';
+    const s = ms / 1000;
+    if (s < 60) return s.toFixed(1) + ' s';
+    const m = Math.floor(s / 60);
+    return m + 'm ' + Math.floor(s - m * 60) + 's';
+  }
+
+  function fmtStarted(iso) {
+    try {
+      const d = new Date(iso);
+      return d.toLocaleTimeString();
+    } catch { return iso; }
+  }
+
+  function statusPill(e) {
+    if (e.status === 'canceling') return '<span class="pill canceling">canceling</span>';
+    if (e.status === 'canceled')  return '<span class="pill canceled">canceled</span>';
+    if (e.status === 'finished')  return '<span class="pill finished">finished</span>';
+    if (e.streaming) return '<span class="pill streaming">streaming</span>';
+    return '<span class="pill">' + (e.status || 'running') + '</span>';
+  }
+
+  function isTerminal(e) {
+    return e.status === 'finished' || e.status === 'canceled';
+  }
+
+  function methodCell(e) {
+    let pill;
+    if (e.transport === 'ws') {
+      pill = '<span class="transport-pill ws">WS</span>';
+    } else {
+      const m = escapeHtml(e.method || '');
+      pill = '<span class="transport-pill http">' + (m || 'HTTP') + '</span>';
+    }
+    return pill + '<span class="path-cell">' + escapeHtml(e.path || '') + '</span>';
+  }
+
+  // Treat the zero-time marker as "no first chunk yet".
+  function firstChunkMs(e) {
+    if (!e.first_chunk_at) return 0;
+    const t = new Date(e.first_chunk_at).getTime();
+    if (!t || t <= 0) return 0;
+    return t;
+  }
+
+  function fmtStartedCell(e, now) {
+    const startedStr = fmtStarted(e.started_at);
+    const fc = firstChunkMs(e);
+    if (fc > 0) {
+      const ttfb = fc - new Date(e.started_at).getTime();
+      return `${startedStr}<div class="muted">TTFB ${fmtDuration(Math.max(0, ttfb))}</div>`;
+    }
+    // No first byte yet — show live "waiting" timer.
+    const waitingMs = now - new Date(e.started_at).getTime();
+    return `${startedStr}<div class="muted">waiting ${fmtDuration(waitingMs)}</div>`;
+  }
+
+  function fmtTokensCell(e, now) {
+    const hasIn = e.input_tokens > 0;
+    const hasOut = e.output_tokens > 0;
+    if (!hasIn && !hasOut) {
+      return '<span class="muted">—</span>';
+    }
+    let parts = [];
+    if (hasIn) parts.push(`<span>${e.input_tokens.toLocaleString()} in</span>`);
+    if (hasOut) parts.push(`<span>${e.output_tokens.toLocaleString()} out</span>`);
+    let s = parts.join(' / ');
+    if (hasOut) {
+      const fc = firstChunkMs(e);
+      if (fc > 0) {
+        const endMs = isTerminal(e) && e.last_activity
+          ? new Date(e.last_activity).getTime()
+          : now;
+        const elapsedSec = (endMs - fc) / 1000;
+        if (elapsedSec >= 0.1) {
+          const tps = e.output_tokens / elapsedSec;
+          s += `<div class="muted">${tps.toFixed(1)} tok/s</div>`;
+        }
+      }
+    }
+    return s;
+  }
+
+  // entryRows caches one Row object per entry id. We update individual cells
+  // on each render tick instead of rebuilding the entire tbody, which would
+  // otherwise (a) replay the row fade-in animation every second and (b) make
+  // text contents briefly disappear when innerHTML is reset.
+  const entryRows = new Map();
+
+  function createRow(e) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="cell-id id-cell"></td>
+      <td class="cell-started"></td>
+      <td class="cell-duration duration"></td>
+      <td class="cell-method method-path"></td>
+      <td class="cell-model"></td>
+      <td class="cell-account"></td>
+      <td class="cell-bytes bytes"></td>
+      <td class="cell-tokens bytes"></td>
+      <td class="cell-status"></td>
+      <td class="cell-client"></td>
+      <td class="cell-action row-actions"></td>
+    `;
+    const row = {
+      tr,
+      cells: {
+        id:       tr.querySelector('.cell-id'),
+        started:  tr.querySelector('.cell-started'),
+        duration: tr.querySelector('.cell-duration'),
+        method:   tr.querySelector('.cell-method'),
+        model:    tr.querySelector('.cell-model'),
+        account:  tr.querySelector('.cell-account'),
+        bytes:    tr.querySelector('.cell-bytes'),
+        tokens:   tr.querySelector('.cell-tokens'),
+        status:   tr.querySelector('.cell-status'),
+        client:   tr.querySelector('.cell-client'),
+        action:   tr.querySelector('.cell-action'),
+      },
+      // Per-cell last-rendered cache, so we skip DOM writes when content
+      // hasn't changed. Keeps the duration tick (every 1s) cheap and
+      // eliminates layout thrash.
+      last: {},
+    };
+    return row;
+  }
+
+  function setText(node, value, cache, key) {
+    if (cache[key] === value) return;
+    cache[key] = value;
+    node.textContent = value;
+  }
+  function setHTML(node, value, cache, key) {
+    if (cache[key] === value) return;
+    cache[key] = value;
+    node.innerHTML = value;
+  }
+
+  function toggleClass(el, cls, want, cache, key) {
+    if (cache[key] === want) return;
+    cache[key] = want;
+    el.classList.toggle(cls, want);
+  }
+
+  function updateRow(row, e, now) {
+    const tr = row.tr;
+    const cache = row.last;
+    const terminal = isTerminal(e);
+
+    // Row-level state (classes)
+    toggleClass(tr, 'terminal',         terminal,                cache, '_terminal');
+    toggleClass(tr, 'transport-ws',     e.transport === 'ws',    cache, '_tws');
+    toggleClass(tr, 'transport-http',   e.transport !== 'ws',    cache, '_thttp');
+    toggleClass(tr, 'streaming-active', !terminal && !!e.streaming, cache, '_streamactive');
+
+    // Frozen cells (typically set once)
+    setText(row.cells.id, e.id || '', cache, 'id');
+
+    // Started / TTFB cell: ticks every second while waiting; frozen once
+    // first byte arrives.
+    setHTML(row.cells.started, fmtStartedCell(e, now), cache, 'started');
+
+    // Live duration
+    const endMs = terminal && e.last_activity
+      ? new Date(e.last_activity).getTime()
+      : now;
+    const liveMs = endMs - new Date(e.started_at).getTime();
+    setText(row.cells.duration, fmtDuration(liveMs), cache, 'duration');
+
+    setHTML(row.cells.method, methodCell(e), cache, 'method');
+    setHTML(row.cells.model,  escapeHtml(e.model || ''), cache, 'model');
+    const providerLine = escapeHtml(e.provider || '');
+    const proxyLine = e.auth_proxy ? '<div class="muted proxy-line">' + escapeHtml(e.auth_proxy) + '</div>' : '';
+    setHTML(row.cells.account,
+      escapeHtml(e.auth_label || e.auth_id || '') +
+      '<div class="muted">' + providerLine + '</div>' +
+      proxyLine,
+      cache, 'account');
+    setText(row.cells.bytes,
+      fmtBytes(e.request_bytes) + ' → ' + fmtBytes(e.response_bytes),
+      cache, 'bytes');
+    setHTML(row.cells.tokens, fmtTokensCell(e, now), cache, 'tokens');
+
+    const statusHTML = statusPill(e) + (e.status_code ? '<div class="muted">' + e.status_code + '</div>' : '');
+    setHTML(row.cells.status, statusHTML, cache, 'status');
+
+    setHTML(row.cells.client,
+      '<div>' + escapeHtml(e.client_ip || '') + '</div>' +
+      '<div class="muted">' + escapeHtml((e.user_agent || '').substring(0, 30)) + '</div>',
+      cache, 'client');
+
+    const actionHTML = terminal
+      ? '<span class="muted">—</span>'
+      : `<button class="danger" data-cancel="${escapeAttr(e.id)}">Cancel</button>`;
+    setHTML(row.cells.action, actionHTML, cache, 'action');
+  }
+
+  function render() {
+    const list = Array.from(entries.values())
+      .sort((a, b) => new Date(b.started_at) - new Date(a.started_at));
+    metaCount.textContent = list.length + ' active';
+    if (list.length === 0) {
+      tableEl.hidden = true;
+      emptyEl.hidden = false;
+      // Drop any leftover rows on the way out.
+      for (const r of entryRows.values()) r.tr.remove();
+      entryRows.clear();
+      return;
+    }
+    tableEl.hidden = false;
+    emptyEl.hidden = true;
+    const now = serverNow();
+    const seen = new Set();
+
+    // Insert / update.
+    for (const e of list) {
+      seen.add(e.id);
+      let row = entryRows.get(e.id);
+      if (!row) {
+        row = createRow(e);
+        entryRows.set(e.id, row);
+        row.tr.classList.add('row-enter');
+        row.tr.addEventListener('animationend', () => {
+          row.tr.classList.remove('row-enter');
+        }, { once: true });
+        // New entries are the newest by started_at, so prepend.
+        tbody.insertBefore(row.tr, tbody.firstChild);
+      }
+      updateRow(row, e, now);
+    }
+
+    // Drop rows whose entries have been removed.
+    for (const [id, row] of entryRows) {
+      if (!seen.has(id)) {
+        row.tr.remove();
+        entryRows.delete(id);
+      }
+    }
+
+    // Stable order fix: walk the sorted list and only reorder when needed.
+    // Most ticks this is a no-op since rows arrive newest-first.
+    let prev = null;
+    for (const e of list) {
+      const row = entryRows.get(e.id);
+      const expectedPrev = prev ? prev.tr : null;
+      if (row.tr.previousElementSibling !== expectedPrev) {
+        const ref = expectedPrev ? expectedPrev.nextSibling : tbody.firstChild;
+        if (ref !== row.tr) tbody.insertBefore(row.tr, ref);
+      }
+      prev = row;
+    }
+  }
+
+  function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"]/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+  }
+  function escapeAttr(s) { return escapeHtml(s); }
+
+  function setStatus(msg, isError) {
+    statusEl.textContent = msg;
+    statusEl.classList.toggle('error', !!isError);
+  }
+
+  async function apiFetch(path, opts) {
+    const key = keyEl.value.trim();
+    if (!key) throw new Error('Missing management key');
+    const headers = Object.assign({}, opts && opts.headers, {
+      'Authorization': 'Bearer ' + key,
+    });
+    const res = await fetch(path, Object.assign({}, opts, { headers }));
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error('HTTP ' + res.status + ': ' + text);
+    }
+    return res;
+  }
+
+  async function refresh() {
+    try {
+      const res = await apiFetch('/v0/management/in-flight');
+      const data = await res.json();
+      noteServerNow(data.now);
+      entries.clear();
+      for (const e of data.entries || []) entries.set(e.id, e);
+      render();
+      setStatus('Loaded ' + (data.entries || []).length + ' active requests.');
+    } catch (err) {
+      setStatus(err.message, true);
+    }
+  }
+
+  async function loadSettings() {
+    try {
+      const res = await apiFetch('/v0/management/in-flight/settings');
+      const s = await res.json();
+      $('stallInput').value = s.stall_timeout_seconds || 0;
+      $('settingsPanel').hidden = false;
+    } catch (err) {
+      $('settingsStatus').textContent = err.message;
+      $('settingsStatus').classList.add('error');
+    }
+  }
+
+  async function saveSettings() {
+    const val = parseInt($('stallInput').value, 10);
+    if (isNaN(val) || val < 0) {
+      $('settingsStatus').textContent = 'Stall timeout must be a non-negative integer.';
+      $('settingsStatus').classList.add('error');
+      return;
+    }
+    try {
+      const res = await apiFetch('/v0/management/in-flight/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stall_timeout_seconds: val }),
+      });
+      const s = await res.json();
+      $('stallInput').value = s.stall_timeout_seconds || 0;
+      $('settingsStatus').classList.remove('error');
+      $('settingsStatus').textContent = val > 0
+        ? 'Auto-cancel enabled: requests stalled for ' + val + 's will be cancelled.'
+        : 'Auto-cancel disabled.';
+    } catch (err) {
+      $('settingsStatus').classList.add('error');
+      $('settingsStatus').textContent = err.message;
+    }
+  }
+
+  function fmtAgo(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    const sec = Math.max(0, Math.floor((serverNow() - d.getTime()) / 1000));
+    if (sec < 60) return sec + 's ago';
+    if (sec < 3600) return Math.floor(sec / 60) + 'm ago';
+    return Math.floor(sec / 3600) + 'h ago';
+  }
+
+  // Cached history rows keyed by record signature so the periodic refresh
+  // never tears down rows whose content hasn't changed.
+  const historyRows = new Map();
+  function historyKey(r) {
+    const e = r.entry || {};
+    // canceled_at + entry id uniquely identifies a cancel event.
+    return (r.canceled_at || '') + '|' + (e.id || '');
+  }
+
+  async function loadHistory() {
+    try {
+      const res = await apiFetch('/v0/management/in-flight/history?limit=50');
+      const data = await res.json();
+      noteServerNow(data.now);
+      const records = data.records || [];
+      $('historyCount').textContent = records.length;
+      $('historySection').hidden = false;
+      const body = $('historyBody');
+      const seen = new Set();
+
+      // Insert new records (newest first). Skip rebuilds for rows we already
+      // rendered — only the relative-time text in the "When" cell needs a
+      // periodic refresh, which we apply below.
+      for (let i = records.length - 1; i >= 0; i--) {
+        const r = records[i];
+        const key = historyKey(r);
+        seen.add(key);
+        if (historyRows.has(key)) continue;
+        const e = r.entry || {};
+        const reasonClass = (r.reason || 'manual').replace(/[^a-z0-9-]/gi, '');
+        const durMs = e.last_activity
+          ? new Date(e.last_activity).getTime() - new Date(e.started_at).getTime()
+          : 0;
+        const tr = document.createElement('tr');
+        tr.classList.add('transport-' + (e.transport === 'ws' ? 'ws' : 'http'));
+        tr.innerHTML = `
+          <td><div class="hist-ago"></div><div class="muted">${fmtStarted(r.canceled_at)}</div></td>
+          <td class="id-cell">${escapeHtml(e.id || '')}</td>
+          <td><span class="reason-pill ${escapeAttr(reasonClass)}">${escapeHtml(r.reason || '')}</span></td>
+          <td>${escapeHtml(r.canceled_by || '')}</td>
+          <td class="method-path">${methodCell(e)}</td>
+          <td>${escapeHtml(e.model || '')}</td>
+          <td>${escapeHtml(e.auth_label || e.auth_id || '')}<div class="muted">${escapeHtml(e.provider || '')}</div>${e.auth_proxy ? '<div class="muted proxy-line">'+escapeHtml(e.auth_proxy)+'</div>' : ''}</td>
+          <td class="bytes">${fmtBytes(e.request_bytes || 0)} → ${fmtBytes(e.response_bytes || 0)}</td>
+          <td class="duration">${fmtDuration(durMs)}</td>
+        `;
+        body.insertBefore(tr, body.firstChild);
+        historyRows.set(key, { tr, canceledAt: r.canceled_at, lastAgo: '' });
+      }
+
+      // Update the relative "Xm ago" text on every existing row so it stays
+      // accurate without re-creating DOM nodes.
+      for (const [key, h] of historyRows) {
+        if (!seen.has(key)) {
+          h.tr.remove();
+          historyRows.delete(key);
+          continue;
+        }
+        const ago = fmtAgo(h.canceledAt);
+        if (ago !== h.lastAgo) {
+          h.lastAgo = ago;
+          const cell = h.tr.querySelector('.hist-ago');
+          if (cell) cell.textContent = ago;
+        }
+      }
+    } catch (err) {
+      // history is best-effort; don't override main status line
+    }
+  }
+
+  function connect() {
+    const key = keyEl.value.trim();
+    if (!key) {
+      setStatus('Enter the management key first.', true);
+      return;
+    }
+    sessionStorage.setItem(KEY_STORAGE, key);
+    if (evt) { evt.close(); evt = null; }
+    // EventSource does not support custom headers; embed the key in the URL.
+    const url = '/v0/management/in-flight/stream?key=' + encodeURIComponent(key);
+    evt = new EventSource(url);
+    let opened = false;
+    evt.onopen = () => { opened = true; setStatus('Connected. Streaming live updates.'); };
+    evt.onerror = (err) => {
+      if (!opened) setStatus('Connection failed. Check the management key.', true);
+      else setStatus('Connection interrupted; retrying.', true);
+    };
+    const handle = (ev) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        const entry = payload.entry;
+        if (!entry) return;
+        if (ev.type === 'removed') entries.delete(entry.id);
+        else entries.set(entry.id, entry);
+        render();
+      } catch (e) { /* ignore */ }
+    };
+    evt.addEventListener('snapshot', handle);
+    evt.addEventListener('added', handle);
+    evt.addEventListener('updated', handle);
+    evt.addEventListener('removed', handle);
+    refresh();
+    loadSettings();
+    loadHistory();
+  }
+
+  $('connectBtn').addEventListener('click', connect);
+  $('refreshBtn').addEventListener('click', () => { refresh(); loadHistory(); });
+  $('saveSettingsBtn').addEventListener('click', saveSettings);
+  tbody.addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-cancel]');
+    if (!btn) return;
+    const id = btn.getAttribute('data-cancel');
+    btn.disabled = true;
+    btn.textContent = '...';
+    try {
+      await apiFetch('/v0/management/in-flight/' + encodeURIComponent(id) + '/cancel', { method: 'POST' });
+      setStatus('Cancel requested for ' + id + '.');
+      // Allow the backend to record the history entry, then refresh the panel.
+      setTimeout(loadHistory, 500);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'Cancel';
+      setStatus(err.message, true);
+    }
+  });
+
+  // Belt-and-suspenders refresh: re-fetch both the active list and the
+  // history every 10s. The SSE stream is still the primary update path,
+  // but a dropped Critical event (subscriber channel saturated for >250ms)
+  // would otherwise leave the UI stuck on a stale snapshot.
+  setInterval(() => {
+    if (!keyEl.value) return;
+    refresh();
+    loadHistory();
+  }, 10000);
+
+  // Live-update the duration column even when no events arrive.
+  setInterval(() => { if (entries.size > 0) render(); }, 1000);
+
+  if (keyEl.value) connect();
+})();
+</script>
+</body>
+</html>
