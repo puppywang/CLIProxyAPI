@@ -246,6 +246,15 @@ type RoutingConfig struct {
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
 	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+
+	// SessionAffinityStrict makes the session-affinity selector refuse to fall
+	// back to a different credential when the bound auth becomes unavailable
+	// (cooldown / unauthorized / quota). Instead, the request returns an
+	// error to the client, who can then start a new conversation. This
+	// prevents the "in-flight conversation suddenly switches account" signal
+	// that upstreams like ChatGPT/Codex use as a cross-account abuse marker.
+	// Defaults to false (legacy: silently failover to a fresh credential).
+	SessionAffinityStrict bool `yaml:"session-affinity-strict,omitempty" json:"session-affinity-strict,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

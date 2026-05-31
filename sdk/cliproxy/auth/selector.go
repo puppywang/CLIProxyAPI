@@ -3,16 +3,21 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"io/fs"
 	"math"
 	"math/rand/v2"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -28,6 +33,18 @@ type RoundRobinSelector struct {
 	mu      sync.Mutex
 	cursors map[string]int
 	maxKeys int
+
+	// persistPath, when non-empty, points to a JSON file where the cursor
+	// state is mirrored. The cursor map is loaded from this file on startup
+	// and a background goroutine writes any changes back. Without this, a
+	// process restart resets every cursor to a random offset — combined with
+	// the session-affinity cache persistence that DOES survive restarts, that
+	// re-roll occasionally lands a freshly-bound session on the same auth as
+	// an existing persisted binding, leaving N windows clustered on fewer
+	// than N accounts. Persisting the cursor closes that gap.
+	persistPath string
+	dirty       atomic.Bool
+	stopCh      chan struct{}
 }
 
 // FillFirstSelector selects the first available credential (deterministic ordering).
@@ -305,18 +322,161 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		}
 		s.cursors[innerKey] = innerIndex + 1
 		s.mu.Unlock()
+		s.dirty.Store(true)
 		return group[innerIndex%len(group)], nil
 	}
 
-	// Flat round-robin for non-grouped auths (original behavior).
+	// Flat round-robin for non-grouped auths.
+	//
+	// Seed a fresh cursor key with a random initial offset (mirroring the
+	// virtual-parent branch above). Without this, every process restart wipes
+	// the cursor map and every new cursor key starts at 0, which combined with
+	// the deterministic alphabetical sort of `available` means the first
+	// post-restart session for each provider/model always lands on the
+	// alphabetically-first auth. With session-affinity persistence enabled,
+	// that auth then keeps every following first-time session as well —
+	// permanently overloading one credential across restarts.
 	s.ensureCursorKey(key, limit)
+	if _, exists := s.cursors[key]; !exists {
+		s.cursors[key] = rand.IntN(len(available))
+	}
 	index := s.cursors[key]
 	if index >= 2_147_483_640 {
 		index = 0
 	}
 	s.cursors[key] = index + 1
 	s.mu.Unlock()
+	s.dirty.Store(true)
 	return available[index%len(available)], nil
+}
+
+// rrCursorSnapshot is the on-disk JSON shape for persisted RR cursors.
+type rrCursorSnapshot struct {
+	Version int            `json:"version"`
+	Cursors map[string]int `json:"cursors"`
+}
+
+const rrPersistFlushInterval = 30 * time.Second
+
+// NewRoundRobinSelectorWithPersistence returns a RoundRobinSelector that
+// mirrors its cursor state to the given file path. The cursor map is loaded
+// on construction and a background goroutine flushes any changes every 30s.
+// When path is empty the selector behaves identically to a zero-value
+// RoundRobinSelector (in-memory only) — call Stop() when retiring the
+// selector to flush a final snapshot.
+func NewRoundRobinSelectorWithPersistence(path string) *RoundRobinSelector {
+	s := &RoundRobinSelector{persistPath: strings.TrimSpace(path)}
+	if s.persistPath == "" {
+		return s
+	}
+	s.loadCursors()
+	s.stopCh = make(chan struct{})
+	go s.persistLoop()
+	return s
+}
+
+// Stop terminates the background persistence goroutine and flushes a final
+// snapshot to disk. Safe to call multiple times. A nil receiver or a
+// selector constructed without persistence is a no-op.
+func (s *RoundRobinSelector) Stop() {
+	if s == nil || s.stopCh == nil {
+		return
+	}
+	select {
+	case <-s.stopCh:
+		// already stopped
+	default:
+		close(s.stopCh)
+	}
+	s.persistNow()
+}
+
+func (s *RoundRobinSelector) loadCursors() {
+	if s.persistPath == "" {
+		return
+	}
+	data, err := os.ReadFile(s.persistPath)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			log.WithError(err).WithField("path", s.persistPath).
+				Warn("rr cursor: read failed; starting empty")
+		}
+		return
+	}
+	var snap rrCursorSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		log.WithError(err).WithField("path", s.persistPath).
+			Warn("rr cursor: parse failed; starting empty")
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cursors == nil {
+		s.cursors = make(map[string]int, len(snap.Cursors))
+	}
+	for k, v := range snap.Cursors {
+		if k == "" {
+			continue
+		}
+		s.cursors[k] = v
+	}
+	log.WithField("path", s.persistPath).
+		WithField("loaded", len(snap.Cursors)).
+		Info("rr cursor: restored from disk")
+}
+
+func (s *RoundRobinSelector) persistLoop() {
+	ticker := time.NewTicker(rrPersistFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			if s.dirty.CompareAndSwap(true, false) {
+				s.persistNow()
+			}
+		}
+	}
+}
+
+func (s *RoundRobinSelector) persistNow() {
+	if s.persistPath == "" {
+		return
+	}
+	s.mu.Lock()
+	snap := rrCursorSnapshot{
+		Version: 1,
+		Cursors: make(map[string]int, len(s.cursors)),
+	}
+	for k, v := range s.cursors {
+		snap.Cursors[k] = v
+	}
+	s.mu.Unlock()
+
+	payload, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		log.WithError(err).Warn("rr cursor: marshal failed")
+		return
+	}
+	if dir := filepath.Dir(s.persistPath); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.WithError(err).WithField("dir", dir).
+				Warn("rr cursor: mkdir failed")
+			return
+		}
+	}
+	tmp := s.persistPath + ".tmp"
+	if err := os.WriteFile(tmp, append(payload, '\n'), 0o600); err != nil {
+		log.WithError(err).WithField("path", tmp).
+			Warn("rr cursor: tmp write failed")
+		return
+	}
+	if err := os.Rename(tmp, s.persistPath); err != nil {
+		log.WithError(err).WithField("path", s.persistPath).
+			Warn("rr cursor: rename failed")
+		return
+	}
 }
 
 // ensureCursorKey ensures the cursor map has capacity for the given key.
@@ -433,16 +593,34 @@ var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 
 // SessionAffinitySelector wraps another selector with session-sticky behavior.
 // It extracts session ID from multiple sources and maintains session-to-auth
-// mappings with automatic failover when the bound auth becomes unavailable.
+// mappings. When the bound auth becomes unavailable, by default the selector
+// falls back to its base selector to pick a fresh credential. Set
+// SessionAffinityConfig.Strict to true to instead surface an error in that
+// case (recommended when upstream risk-control treats cross-account
+// continuation of one conversation as abuse).
 type SessionAffinitySelector struct {
 	fallback Selector
 	cache    *SessionCache
+	strict   bool
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
 	Fallback Selector
 	TTL      time.Duration
+	// PersistencePath, when non-empty, points to a JSON file where the
+	// session-to-auth bindings are persisted. The cache is restored from
+	// this file on startup, so existing client conversations stay bound to
+	// their original auth across CPA restarts. Empty disables persistence
+	// (legacy in-memory-only behaviour).
+	PersistencePath string
+	// Strict, when true, refuses to silently switch the bound auth if the
+	// originally selected credential is no longer available. The Pick call
+	// returns an error so the conductor can surface it to the client
+	// instead of replaying the same conversation on a fresh credential —
+	// which is the exact signal that upstream risk control flags as
+	// cross-account abuse.
+	Strict bool
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -463,27 +641,45 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	}
 	return &SessionAffinitySelector{
 		fallback: cfg.Fallback,
-		cache:    NewSessionCache(cfg.TTL),
+		cache:    NewSessionCacheWithPersistence(cfg.TTL, cfg.PersistencePath),
+		strict:   cfg.Strict,
 	}
 }
 
 // Pick selects an auth with session affinity when possible.
 // Priority for session ID extraction:
 //  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority
-//  2. X-Session-ID header
-//  3. Session_id header (Codex)
-//  4. X-Amp-Thread-Id header (Amp CLI thread ID)
-//  5. X-Client-Request-Id header (PI)
-//  6. metadata.user_id (non-Claude Code format)
-//  7. conversation_id field in request body
-//  8. Stable hash from first few messages content (fallback)
+//  2. X-Codex-Turn-Metadata header — thread_id/session_id JSON (Codex VSCode / CLI)
+//  3. X-Session-ID header
+//  4. Session_id / Session-Id header (Codex CLI legacy and upstream restored)
+//  5. X-Amp-Thread-Id header (Amp CLI thread ID)
+//  6. X-Client-Request-Id header (PI / Codex thread_id fallback)
+//  7. metadata.user_id (non-Claude Code format)
+//  8. conversation_id field in request body
+//  9. Stable hash from first few messages content (fallback)
 //
-// Note: The cache key includes provider, session ID, and model to handle cases where
-// a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
-// that may be supported by different auth credentials, and to avoid cross-provider conflicts.
-func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+// The cache key is provider+session (model is intentionally NOT in the key). The
+// upstream risk-control signal that drove this whole design is per-conversation,
+// not per-model: replaying one conversation under multiple chatgpt_account_ids
+// looks like account abuse regardless of which model each call used. Including
+// the model in the key would let a single VSCode window split across two
+// accounts the moment Codex switches from gpt-5.5 (chat) to codex-auto-review
+// (sub-agent) — the exact signal we are trying to avoid. Per-model availability
+// is still enforced downstream: `available` is already filtered to auths that
+// can serve the requested model, so if the bound auth cannot serve it the
+// existing "bound auth unavailable" branch fires (strict-mode error or
+// fallback reselect, depending on configuration).
+func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (selectedAuth *Auth, retErr error) {
 	entry := selectorLogEntry(ctx)
-	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	// Temporary diagnostic: when a Codex client sends X-Codex-Turn-Metadata,
+	// log the full session_id / thread_id / turn_id / model / chosen auth_id so
+	// we can verify whether the sub-agent (codex-auto-review) reuses the
+	// primary chat's thread_id. The answer determines whether we can safely
+	// switch the affinity key from session_id (one VSCode window = one auth)
+	// to thread_id (one conversation = one auth, allowing /new to redistribute).
+	// Remove this log once that question is settled.
+	defer logCodexTurnSample(entry, opts.Headers, provider, model, selectedAuth, retErr)
+	primaryID, fallbackID, mirrorID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
 		return s.fallback.Pick(ctx, provider, model, opts, auths)
@@ -495,13 +691,45 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 
-	cacheKey := provider + "::" + primaryID + "::" + model
+	cacheKey := provider + "::" + primaryID
+	mirrorKey := ""
+	if mirrorID != "" && mirrorID != primaryID {
+		mirrorKey = provider + "::" + mirrorID
+	}
+	// writeBinding records the new authoritative binding under both the
+	// primary key and the mirror key (when set). The mirror lets a Codex
+	// sub-agent — whose lookup key is the parent's window session_id — find
+	// the binding the parent thread established. Subsequent /new operations
+	// on the same window mint a new thread_id, miss the primary key, and
+	// overwrite the mirror so future sub-agents inherit the freshest
+	// parent's binding rather than a stale one.
+	writeBinding := func(authID string) {
+		s.cache.Set(cacheKey, authID)
+		if mirrorKey != "" {
+			s.cache.Set(mirrorKey, authID)
+		}
+	}
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
+				if mirrorKey != "" {
+					s.cache.Set(mirrorKey, auth.ID)
+				}
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
+			}
+		}
+		// Bound auth is no longer available. Strict mode refuses to silently
+		// reselect — replaying the same conversation on a different account
+		// is the precise signal that upstream risk-control treats as
+		// account abuse. Surface the error so the client can decide what
+		// to do (typically: start a new conversation).
+		if s.strict {
+			entry.Warnf("session-affinity: bound auth unavailable, refusing fallback (strict) | session=%s bound_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
+			return nil, &Error{
+				Code:    "auth_bound_unavailable",
+				Message: "session-bound auth is currently unavailable; start a new conversation to pick a different credential",
 			}
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
@@ -509,17 +737,17 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if err != nil {
 			return nil, err
 		}
-		s.cache.Set(cacheKey, auth.ID)
+		writeBinding(auth.ID)
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
 
 	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey := provider + "::" + fallbackID + "::" + model
+		fallbackKey := provider + "::" + fallbackID
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
-					s.cache.Set(cacheKey, auth.ID)
+					writeBinding(auth.ID)
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, nil
 				}
@@ -531,7 +759,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil {
 		return nil, err
 	}
-	s.cache.Set(cacheKey, auth.ID)
+	writeBinding(auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
 }
@@ -554,6 +782,43 @@ func truncateSessionID(id string) string {
 	return id[:8] + "..."
 }
 
+// logCodexTurnSample emits a one-line diagnostic for every Pick that carries
+// an X-Codex-Turn-Metadata header, recording the full session_id, thread_id,
+// turn_id, request model, and the auth that was selected (or the error code
+// when strict mode refused to fail over). The output is intentionally
+// parseable: grep for "codex-turn-sample" then awk on the key=value pairs.
+// This is observation-only — no behavior change — and is meant to be removed
+// once we have enough samples to decide whether thread_id is a safe replacement
+// for session_id as the affinity key.
+func logCodexTurnSample(entry *log.Entry, headers http.Header, provider, model string, selected *Auth, retErr error) {
+	if entry == nil || headers == nil {
+		return
+	}
+	raw := strings.TrimSpace(headers.Get("X-Codex-Turn-Metadata"))
+	if raw == "" {
+		return
+	}
+	sessionID := gjson.Get(raw, "session_id").String()
+	threadID := gjson.Get(raw, "thread_id").String()
+	turnID := gjson.Get(raw, "turn_id").String()
+	threadSource := gjson.Get(raw, "thread_source").String()
+	authID := ""
+	if selected != nil {
+		authID = selected.ID
+	}
+	errCode := ""
+	if retErr != nil {
+		var ae *Error
+		if errors.As(retErr, &ae) && ae != nil {
+			errCode = ae.Code
+		} else {
+			errCode = "error"
+		}
+	}
+	entry.Infof("codex-turn-sample | provider=%s model=%s session_id=%s thread_id=%s turn_id=%s thread_source=%s auth=%s err=%s",
+		provider, model, sessionID, threadID, turnID, threadSource, authID, errCode)
+}
+
 // Stop releases resources held by the selector.
 func (s *SessionAffinitySelector) Stop() {
 	if s.cache != nil {
@@ -572,22 +837,33 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 // ExtractSessionID extracts session identifier from multiple sources.
 // Priority order:
 //  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority for Claude Code clients
-//  2. X-Session-ID header
-//  3. Session_id header (Codex)
-//  4. X-Amp-Thread-Id header (Amp CLI thread ID)
-//  5. X-Client-Request-Id header (PI)
-//  6. metadata.user_id (non-Claude Code format)
-//  7. conversation_id field in request body
-//  8. Stable hash from first few messages content (fallback)
+//  2. X-Codex-Turn-Metadata header — thread_id/session_id JSON (Codex VSCode / CLI)
+//  3. X-Session-ID header
+//  4. Session_id / Session-Id header (Codex CLI legacy and upstream restored)
+//  5. X-Amp-Thread-Id header (Amp CLI thread ID)
+//  6. X-Client-Request-Id header (PI / Codex thread_id fallback)
+//  7. metadata.user_id (non-Claude Code format)
+//  8. conversation_id field in request body
+//  9. Stable hash from first few messages content (fallback)
 func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]any) string {
-	primary, _ := extractSessionIDs(headers, payload, metadata)
+	primary, _, _ := extractSessionIDs(headers, payload, metadata)
 	return primary
 }
 
-// extractSessionIDs returns (primaryID, fallbackID) for session affinity.
-// primaryID: full hash including assistant response (stable after first turn)
-// fallbackID: short hash without assistant (used to inherit binding from first turn)
-func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
+// extractSessionIDs returns (primaryID, fallbackID, mirrorID) for session affinity.
+//
+//   - primaryID: the lookup/write key for this turn's binding. Cache reads
+//     consult this key first.
+//   - fallbackID: a secondary key consulted on a primary cache miss
+//     (legacy Claude-Code short-hash inheritance). When present and cached,
+//     the existing binding is adopted onto the primary key.
+//   - mirrorID: an additional key the binding is also WRITTEN under on bind
+//     and on every refresh. Reads do NOT consult the mirror directly. This
+//     is what lets a Codex sub-agent (which uses the window-stable session
+//     id as its lookup key) inherit the parent conversation's binding while
+//     /new — which mints a fresh thread_id — still misses cleanly and
+//     receives a freshly-selected auth via the fallback selector.
+func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string, string) {
 	// 1. metadata.user_id with Claude Code session format (highest priority)
 	if len(payload) > 0 {
 		userID := gjson.GetBytes(payload, "metadata.user_id").String()
@@ -595,66 +871,113 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 			// Old format: user_{hash}_account__session_{uuid}
 			if matches := sessionPattern.FindStringSubmatch(userID); len(matches) >= 2 {
 				id := "claude:" + matches[1]
-				return id, ""
+				return id, "", ""
 			}
 			// New format: JSON object with session_id field
 			// e.g. {"device_id":"...","account_uuid":"...","session_id":"uuid"}
 			if len(userID) > 0 && userID[0] == '{' {
 				if sid := gjson.Get(userID, "session_id").String(); sid != "" {
-					return "claude:" + sid, ""
+					return "claude:" + sid, "", ""
 				}
 			}
 		}
 	}
 
-	// 2. X-Session-ID header
+	// 2. X-Codex-Turn-Metadata header (Codex VSCode / CLI).
+	//
+	// Codex clients embed turn metadata as a JSON blob under this header,
+	// e.g. {"session_id":"<window-stable uuid>","thread_id":"<per-thread>",
+	//        "turn_id":"<per-message>","thread_source":"user|subagent", ...}.
+	//
+	// We bind on the granularity of one conversation (thread_id) so that
+	// /new in the same window — which keeps session_id stable but mints a
+	// fresh thread_id — naturally falls through to the quota-aware fallback
+	// selector and gets a different credential. Continuing the same
+	// conversation keeps the same thread_id and stays on the bound auth.
+	//
+	// Sub-agent calls (code review, etc.) carry their own thread_id but
+	// share the parent conversation's session_id. We give them the
+	// session-level key as their PRIMARY key so they look up directly
+	// under the mirror that the parent's user-thread Pick writes. This is
+	// essential for upstream risk-control: a sub-agent split across
+	// credentials within one logical conversation looks like account
+	// abuse on OpenAI's side.
+	//
+	// Real Codex VSCode always populates session_id; an X-Codex-Turn-Metadata
+	// header without it is treated as malformed and we fall through to the
+	// next extractor.
+	if headers != nil {
+		if meta := headers.Get("X-Codex-Turn-Metadata"); meta != "" {
+			sid := strings.TrimSpace(gjson.Get(meta, "session_id").String())
+			tid := strings.TrimSpace(gjson.Get(meta, "thread_id").String())
+			source := strings.ToLower(strings.TrimSpace(gjson.Get(meta, "thread_source").String()))
+			if sid != "" {
+				if source == "subagent" {
+					return "codex-window:" + sid, "", ""
+				}
+				if tid != "" {
+					mirror := ""
+					if tid != sid {
+						mirror = "codex-window:" + sid
+					}
+					return "codex-thread:" + tid, "", mirror
+				}
+				return "codex-window:" + sid, "", ""
+			}
+		}
+	}
+
+	// 3. X-Session-ID header
 	if headers != nil {
 		if sid := headers.Get("X-Session-ID"); sid != "" {
-			return "header:" + sid, ""
+			return "header:" + sid, "", ""
 		}
 	}
 
-	// 3. Session_id header (Codex)
+	// 4. Session_id / Session-Id header (Codex CLI legacy + upstream restored
+	// for the latest VSCode/CLI Codex clients).
 	if headers != nil {
 		if sid := headers.Get("Session-Id"); sid != "" {
-			return "codex:" + sid, ""
+			return "codex:" + sid, "", ""
 		}
 		if sid := headers.Get("Session_id"); sid != "" {
-			return "codex:" + sid, ""
+			return "codex:" + sid, "", ""
 		}
 	}
 
-	// 4. X-Amp-Thread-Id header (Amp CLI thread ID)
+	// 5. X-Amp-Thread-Id header (Amp CLI thread ID)
 	if headers != nil {
 		if tid := headers.Get("X-Amp-Thread-Id"); tid != "" {
-			return "amp:" + tid, ""
+			return "amp:" + tid, "", ""
 		}
 	}
 
-	// 5. X-Client-Request-Id header (PI)
+	// 6. X-Client-Request-Id header (PI; for Codex this is the thread_id —
+	// which changes per sub-agent invocation. Kept as a fallback only.)
 	if headers != nil {
 		if rid := headers.Get("X-Client-Request-Id"); rid != "" {
-			return "clientreq:" + rid, ""
+			return "clientreq:" + rid, "", ""
 		}
 	}
 
 	if len(payload) == 0 {
-		return "", ""
+		return "", "", ""
 	}
 
-	// 6. metadata.user_id (non-Claude Code format)
+	// 7. metadata.user_id (non-Claude Code format)
 	userID := gjson.GetBytes(payload, "metadata.user_id").String()
 	if userID != "" {
-		return "user:" + userID, ""
+		return "user:" + userID, "", ""
 	}
 
-	// 7. conversation_id field
+	// 8. conversation_id field
 	if convID := gjson.GetBytes(payload, "conversation_id").String(); convID != "" {
-		return "conv:" + convID, ""
+		return "conv:" + convID, "", ""
 	}
 
-	// 8. Hash-based fallback from message content
-	return extractMessageHashIDs(payload)
+	// 9. Hash-based fallback from message content
+	primary, fb := extractMessageHashIDs(payload)
+	return primary, fb, ""
 }
 
 func extractMessageHashIDs(payload []byte) (primaryID, fallbackID string) {

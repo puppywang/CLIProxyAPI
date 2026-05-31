@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/quota"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
@@ -109,6 +111,38 @@ type Service struct {
 //   - plugin: The usage plugin to register
 func (s *Service) RegisterUsagePlugin(plugin usage.Plugin) {
 	usage.RegisterPlugin(plugin)
+}
+
+// sessionAffinityCachePath returns the on-disk path used to persist the
+// session-affinity selector's bindings. The cache lives next to the auth
+// token files (cfg.AuthDir) so it shares the same protection as the
+// credentials themselves. Returns "" when no AuthDir is configured, which
+// disables persistence and keeps the legacy in-memory-only behaviour.
+func sessionAffinityCachePath(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	dir := strings.TrimSpace(cfg.AuthDir)
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "session-affinity-cache.json")
+}
+
+// rrCursorPath returns the on-disk path used to persist the round-robin
+// selector's cursor map. Without this, every restart wipes the cursor and
+// re-seeds randomly, which combined with the persisted session-affinity
+// cache occasionally causes a freshly-bound new window to land on the same
+// auth as an existing persisted binding (N windows → fewer than N accounts).
+func rrCursorPath(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	dir := strings.TrimSpace(cfg.AuthDir)
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "round-robin-cursor.json")
 }
 
 // newDefaultAuthManager creates a default authentication manager with all supported providers.
@@ -485,11 +519,13 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 	previousStrategy := ""
 	var previousSessionAffinity bool
 	var previousSessionAffinityTTL string
+	var previousSessionAffinityStrict bool
 	s.cfgMu.RLock()
 	if s.cfg != nil {
 		previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
 		previousSessionAffinity = s.cfg.Routing.SessionAffinity
 		previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
+		previousSessionAffinityStrict = s.cfg.Routing.SessionAffinityStrict
 	}
 	s.cfgMu.RUnlock()
 
@@ -516,10 +552,12 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 
 	nextSessionAffinity := newCfg.Routing.SessionAffinity
 	nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
+	nextSessionAffinityStrict := newCfg.Routing.SessionAffinityStrict
 
 	selectorChanged := previousStrategy != nextStrategy ||
 		previousSessionAffinity != nextSessionAffinity ||
-		previousSessionAffinityTTL != nextSessionAffinityTTL
+		previousSessionAffinityTTL != nextSessionAffinityTTL ||
+		previousSessionAffinityStrict != nextSessionAffinityStrict
 
 	if s.coreManager != nil && selectorChanged {
 		var selector coreauth.Selector
@@ -527,8 +565,16 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 		case "fill-first":
 			selector = &coreauth.FillFirstSelector{}
 		default:
-			selector = &coreauth.RoundRobinSelector{}
+			selector = coreauth.NewRoundRobinSelectorWithPersistence(rrCursorPath(newCfg))
 		}
+
+		// Wrap with quota-aware selection (delegates to inner for non-codex
+		// pools or when wham/usage data is not yet warm). Mirrors the chain
+		// in builder.go for the fresh-start path.
+		selector = coreauth.NewLeastRemainingQuotaSelector(coreauth.LeastRemainingQuotaConfig{
+			Inner:   selector,
+			Fetcher: quota.NewCodexWhamFetcher(),
+		})
 
 		if nextSessionAffinity {
 			ttl := time.Hour
@@ -538,8 +584,10 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 				}
 			}
 			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-				Fallback: selector,
-				TTL:      ttl,
+				Fallback:        selector,
+				TTL:             ttl,
+				PersistencePath: sessionAffinityCachePath(newCfg),
+				Strict:          nextSessionAffinityStrict,
 			})
 		}
 
