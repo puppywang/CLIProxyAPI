@@ -12,6 +12,7 @@ import (
 	configaccess "github.com/router-for-me/CLIProxyAPI/v7/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/quota"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
@@ -249,14 +250,31 @@ func (b *Builder) Build() (*Service, error) {
 		case "fill-first", "fillfirst", "ff":
 			selector = &coreauth.FillFirstSelector{}
 		default:
-			selector = &coreauth.RoundRobinSelector{}
+			selector = coreauth.NewRoundRobinSelectorWithPersistence(rrCursorPath(b.cfg))
 		}
 
-		// Wrap with session affinity if enabled (failover is always on)
+		// Wrap RR with the quota-aware selector so that codex cache-miss
+		// picks land on whichever credential currently has the most
+		// remaining ChatGPT quota (sourced from /backend-api/wham/usage).
+		// Non-codex pools transparently fall through to the inner selector.
+		selector = coreauth.NewLeastRemainingQuotaSelector(coreauth.LeastRemainingQuotaConfig{
+			Inner:   selector,
+			Fetcher: quota.NewCodexWhamFetcher(),
+		})
+
+		// Wrap with session affinity if enabled. Strict mode (when set) makes
+		// the selector refuse to silently fail over to a different credential
+		// when the session-bound auth is unavailable.
 		if sessionAffinity {
+			strict := false
+			if b.cfg != nil {
+				strict = b.cfg.Routing.SessionAffinityStrict
+			}
 			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-				Fallback: selector,
-				TTL:      sessionAffinityTTL,
+				Fallback:        selector,
+				TTL:             sessionAffinityTTL,
+				PersistencePath: sessionAffinityCachePath(b.cfg),
+				Strict:          strict,
 			})
 		}
 

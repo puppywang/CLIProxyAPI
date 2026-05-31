@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# codex-refresh-check — exercise a single refresh_token against ChatGPT/Codex's
+# OAuth token endpoint and report whether it is still alive.
+#
+# Hits the exact same endpoint the CPA Codex executor uses
+# (https://auth.openai.com/oauth/token with the same client_id and grant), so
+# a successful run here means CPA's auto-refresh would have worked too.
+#
+# Usage:
+#   codex-refresh-check <refresh_token>
+#   codex-refresh-check --file path/to/codex-<email>.json
+#   echo "<refresh_token>" | codex-refresh-check
+#   codex-refresh-check --file <path> --apply       # also rewrite the file in-place
+#
+# Exit codes:
+#   0  refresh succeeded
+#   1  refresh rejected by upstream (token dead / reused / revoked)
+#   2  bad CLI arguments / local error
+
+set -euo pipefail
+
+TOKEN_URL='https://auth.openai.com/oauth/token'
+CLIENT_ID='app_EMoamEEZ73f0CkXaXp7hrann'
+
+die()  { printf 'error: %s\n' "$*" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+refresh_token=""
+auth_file=""
+apply=0
+
+while (( $# )); do
+  case "$1" in
+    -h|--help)
+      sed -n '2,17p' -- "$0"; exit 0 ;;
+    --file)
+      shift
+      [[ -f "${1:-}" ]] || die "file not found: ${1:-<missing>}"
+      auth_file="$1"
+      shift ;;
+    --apply)
+      apply=1; shift ;;
+    --*)
+      die "unknown flag: $1" ;;
+    *)
+      [[ -z "$refresh_token" ]] || die "refresh_token specified more than once"
+      refresh_token="$1"; shift ;;
+  esac
+done
+
+if [[ -n "$auth_file" ]]; then
+  have jq || die "--file mode needs jq installed"
+  refresh_token=$(jq -er '.refresh_token // empty' "$auth_file") \
+    || die "no .refresh_token field in $auth_file"
+fi
+
+if [[ -z "$refresh_token" ]] && ! [ -t 0 ]; then
+  refresh_token=$(cat); refresh_token="${refresh_token//[$'\r\n\t ']/}"
+fi
+
+[[ -n "$refresh_token" ]] || die "no refresh_token provided (positional arg, --file, or stdin)"
+
+prefix="${refresh_token:0:16}"
+printf 'POST %s  (refresh_token=%s...)\n' "$TOKEN_URL" "$prefix"
+
+tmp=$(mktemp)
+trap 'rm -f -- "$tmp"' EXIT
+
+http_code=$(curl -sS -o "$tmp" -w '%{http_code}' \
+  -X POST "$TOKEN_URL" \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -H 'Accept: application/json' \
+  --data-urlencode "client_id=$CLIENT_ID" \
+  --data-urlencode 'grant_type=refresh_token' \
+  --data-urlencode "refresh_token=$refresh_token" \
+  --data-urlencode 'scope=openid profile email')
+
+printf '\nHTTP %s\n' "$http_code"
+
+if [[ "$http_code" != '200' ]]; then
+  printf 'FAILED — refresh_token is rejected.\n'
+  printf '\nResponse body:\n'
+  if have jq; then jq . "$tmp" 2>/dev/null || cat "$tmp"; else cat "$tmp"; fi
+  echo
+  exit 1
+fi
+
+printf 'OK — refresh succeeded.\n\n'
+
+if have jq; then
+  jq -r '
+    "access_token  : " + (.access_token  | (.[0:24] + "...(" + (length|tostring) + " chars)")),
+    "id_token      : " + (.id_token      | (.[0:24] + "...(" + (length|tostring) + " chars)")),
+    "refresh_token : " + ((.refresh_token // "<unchanged>") | (.[0:24] + (if . == "<unchanged>" then "" else "...(" + (length|tostring) + " chars)" end))),
+    "token_type    : " + (.token_type // "?"),
+    "expires_in    : \(.expires_in // "?") s"
+  ' "$tmp"
+else
+  printf '(install jq for parsed output; raw response below)\n\n'
+  cat "$tmp"
+fi
+
+if [[ -n "$auth_file" && "$apply" -eq 1 ]]; then
+  have jq || die "--apply needs jq installed"
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  backup="${auth_file}.bak-$(date +%Y%m%d-%H%M%S)"
+  cp -- "$auth_file" "$backup"
+
+  new_id=$(jq -r '.id_token'      "$tmp")
+  new_acc=$(jq -r '.access_token' "$tmp")
+  new_rt=$(jq -r '.refresh_token // empty' "$tmp")
+  expires_in=$(jq -r '.expires_in // 0' "$tmp")
+  expired_at=$(date -u -d "+${expires_in} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+               || date -u -v+"${expires_in}"S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+               || printf '')
+
+  filter='.access_token = $acc | .id_token = $id | .last_refresh = $ts'
+  args=( --arg acc "$new_acc" --arg id "$new_id" --arg ts "$ts" )
+  if [[ -n "$new_rt" ]]; then
+    filter+=' | .refresh_token = $rt'
+    args+=( --arg rt "$new_rt" )
+  fi
+  if [[ -n "$expired_at" ]]; then
+    filter+=' | .expired = $exp'
+    args+=( --arg exp "$expired_at" )
+  fi
+
+  jq "${args[@]}" "$filter" "$auth_file" > "${auth_file}.new"
+  mv -- "${auth_file}.new" "$auth_file"
+  printf '\nWrote new tokens to %s (backup: %s)\n' "$auth_file" "$backup"
+  printf 'Reminder: CPA hot-reloads auth files; you should see this account come back to active within a few seconds.\n'
+fi
