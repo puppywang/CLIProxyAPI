@@ -457,6 +457,14 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 			parentCtx = logging.WithRequestID(parentCtx, requestID)
 		}
 	}
+	// Carry over the selected-auth callback set by upstream middleware so the
+	// auth conductor can publish the chosen credential to observers (e.g. the
+	// in-flight request monitor).
+	if requestCtx != nil {
+		if cb := selectedAuthIDCallbackFromContext(requestCtx); cb != nil {
+			parentCtx = WithSelectedAuthIDCallback(parentCtx, cb)
+		}
+	}
 	newCtx, cancel := context.WithCancel(parentCtx)
 
 	endpoint := ""
