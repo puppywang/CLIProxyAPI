@@ -1,0 +1,144 @@
+// Package quota provides per-credential quota lookups for the auth selectors.
+// Today this is a thin wrapper around ChatGPT's backend wham/usage endpoint,
+// the same call exposed by the management UI's "remaining quota" widgets.
+package quota
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/tidwall/gjson"
+
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+)
+
+// whamUsageURL is the ChatGPT backend endpoint that returns per-account
+// remaining-quota information. It is undocumented but used by the Codex CLI
+// and by CPA's own management panel.
+const whamUsageURL = "https://chatgpt.com/backend-api/wham/usage"
+
+// defaultUserAgent matches the Codex CLI's user-agent so that wham/usage
+// behaves consistently with the rest of the Codex traffic the credential
+// already sees. Keep this aligned with codexUserAgent in
+// internal/runtime/executor/codex_executor.go.
+const defaultUserAgent = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
+
+// fetchTimeout caps each individual wham/usage call. The selector applies
+// a tighter global deadline across all parallel fetches; this is a per-call
+// safety net for slow proxies.
+const fetchTimeout = 1200 * time.Millisecond
+
+// CodexWhamFetcher implements coreauth.QuotaFetcher by querying
+// chatgpt.com/backend-api/wham/usage with each candidate auth's bearer
+// token and per-auth proxy. Non-Codex auths return ok=false so the
+// selector can degrade gracefully for mixed pools.
+type CodexWhamFetcher struct{}
+
+// NewCodexWhamFetcher returns a fetcher with default settings. The fetcher
+// is stateless — concurrent Fetch calls are safe.
+func NewCodexWhamFetcher() *CodexWhamFetcher {
+	return &CodexWhamFetcher{}
+}
+
+// Fetch implements coreauth.QuotaFetcher. ok=false means "no data for this
+// auth, do not include it in quota-driven ranking"; err covers transient
+// failures (network, parse, non-2xx response).
+func (f *CodexWhamFetcher) Fetch(ctx context.Context, auth *coreauth.Auth) (coreauth.QuotaSnapshot, bool, error) {
+	if auth == nil {
+		return coreauth.QuotaSnapshot{}, false, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return coreauth.QuotaSnapshot{}, false, nil
+	}
+	accessToken := metaString(auth.Metadata, "access_token")
+	if accessToken == "" {
+		return coreauth.QuotaSnapshot{}, false, nil
+	}
+
+	transport, _, err := proxyutil.BuildHTTPTransport(strings.TrimSpace(auth.ProxyURL))
+	client := &http.Client{}
+	if err == nil && transport != nil {
+		client.Transport = transport
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, whamUsageURL, nil)
+	if err != nil {
+		return coreauth.QuotaSnapshot{}, false, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("User-Agent", defaultUserAgent)
+	if accountID := metaString(auth.Metadata, "account_id"); accountID != "" {
+		req.Header.Set("Chatgpt-Account-Id", accountID)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return coreauth.QuotaSnapshot{}, false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return coreauth.QuotaSnapshot{}, false, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return coreauth.QuotaSnapshot{}, false, fmt.Errorf("wham/usage status %d: %s", resp.StatusCode, truncate(body, 200))
+	}
+	return parseWhamUsage(body)
+}
+
+// parseWhamUsage extracts the fields the selector needs from a wham/usage
+// response body. The endpoint is undocumented and has shipped extra fields
+// over time; we read defensively via gjson rather than binding to a
+// fixed-shape struct.
+func parseWhamUsage(body []byte) (coreauth.QuotaSnapshot, bool, error) {
+	if len(body) == 0 {
+		return coreauth.QuotaSnapshot{}, false, nil
+	}
+	if !gjson.GetBytes(body, "rate_limit").Exists() {
+		return coreauth.QuotaSnapshot{}, false, nil
+	}
+	snap := coreauth.QuotaSnapshot{
+		UsedPercentPrimary:   int(gjson.GetBytes(body, "rate_limit.primary_window.used_percent").Int()),
+		UsedPercentSecondary: int(gjson.GetBytes(body, "rate_limit.secondary_window.used_percent").Int()),
+		LimitReached:         gjson.GetBytes(body, "rate_limit.limit_reached").Bool(),
+		FetchedAt:            time.Now(),
+	}
+	if v := gjson.GetBytes(body, "rate_limit.primary_window.reset_at").Int(); v > 0 {
+		snap.ResetAtPrimary = time.Unix(v, 0)
+	}
+	if v := gjson.GetBytes(body, "rate_limit.secondary_window.reset_at").Int(); v > 0 {
+		snap.ResetAtSecondary = time.Unix(v, 0)
+	}
+	if !snap.LimitReached {
+		if gjson.GetBytes(body, "rate_limit.allowed").Exists() && !gjson.GetBytes(body, "rate_limit.allowed").Bool() {
+			snap.LimitReached = true
+		}
+	}
+	return snap, true, nil
+}
+
+func metaString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	if v, ok := metadata[key].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func truncate(payload []byte, max int) string {
+	if len(payload) <= max {
+		return string(payload)
+	}
+	return string(payload[:max]) + "..."
+}
