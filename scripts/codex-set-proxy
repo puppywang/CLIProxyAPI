@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# codex-set-proxy — assign per-account proxy URLs through the CPA management API.
+#
+# Reads a mapping file with lines like:
+#
+#     socks5://127.0.0.1:7891  chatartpro@gmail.com suzukiyuki2003@edu.btuu.de
+#     socks5://127.0.0.1:7892  ikedamiku04@edu.btuu.de sarahkim09@edu.btuu.de
+#     direct                    foo@example.com
+#
+# Each line: <proxy_url> <space> <email1> [<email2> ...]
+# Use the literal value `direct` (without scheme) to clear any existing proxy.
+#
+# Lines starting with '#' and blank lines are ignored.
+#
+# Usage:
+#   codex-set-proxy --base-url http://127.0.0.1:8317 --key <mgmt-key> --file mapping.txt
+#   codex-set-proxy --base-url ... --key ...           # interactive: prompts for mapping inline
+#
+# Env vars CPA_BASE_URL and CPA_MGMT_KEY override --base-url / --key flags.
+
+set -euo pipefail
+
+die() { printf 'error: %s\n' "$*" >&2; exit 2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+base_url="${CPA_BASE_URL:-}"
+key="${CPA_MGMT_KEY:-}"
+mapping_file=""
+dry_run=0
+
+while (( $# )); do
+  case "$1" in
+    --base-url) shift; base_url="${1:-}"; shift ;;
+    --key)      shift; key="${1:-}"; shift ;;
+    --file)     shift; mapping_file="${1:-}"; shift ;;
+    --dry-run)  dry_run=1; shift ;;
+    -h|--help)  sed -n '2,21p' -- "$0"; exit 0 ;;
+    *)          die "unknown arg: $1" ;;
+  esac
+done
+
+[[ -n "$base_url" ]] || die "missing --base-url (or CPA_BASE_URL env)"
+[[ -n "$key"      ]] || die "missing --key (or CPA_MGMT_KEY env)"
+have jq   || die "jq required"
+have curl || die "curl required"
+
+# Collect mapping lines: read file or stdin
+if [[ -n "$mapping_file" ]]; then
+  exec 3< "$mapping_file"
+else
+  printf 'Reading mapping from stdin. Lines: "<proxy_url> <email1> <email2> ...". EOF to finish.\n' >&2
+  exec 3<&0
+fi
+
+# Snapshot current auth-files to look up filenames per email
+list_json=$(curl -fsS -H "Authorization: Bearer $key" "$base_url/v0/management/auth-files") \
+  || die "cannot fetch auth-files (check key / base-url)"
+
+filename_for() {
+  local email="$1"
+  jq -r --arg e "$email" '
+    .files[] | select(.provider=="codex" and .email==$e) | .name
+  ' <<<"$list_json"
+}
+
+set_proxy() {
+  local file="$1" proxy="$2"
+  local body
+  if [[ "$proxy" == "direct" ]]; then
+    body=$(jq -nc --arg n "$file" '{name:$n, proxy_url:""}')
+  else
+    body=$(jq -nc --arg n "$file" --arg p "$proxy" '{name:$n, proxy_url:$p}')
+  fi
+  if (( dry_run )); then
+    printf '[dry-run] PATCH %s\n' "$body"
+    return 0
+  fi
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -X PATCH \
+    -H "Authorization: Bearer $key" \
+    -H 'Content-Type: application/json' \
+    -d "$body" \
+    "$base_url/v0/management/auth-files/fields")
+  if [[ "$code" == "200" ]]; then
+    printf '  OK   %s\n' "$file"
+  else
+    printf '  FAIL %s  HTTP=%s\n' "$file" "$code"
+  fi
+}
+
+while IFS= read -r line <&3; do
+  line="${line%%#*}"  # strip comments
+  line="${line## }"; line="${line%% }"
+  [[ -z "$line" ]] && continue
+
+  read -r -a tokens <<<"$line"
+  (( ${#tokens[@]} >= 2 )) || { printf 'skip (need <proxy> <email>...): %s\n' "$line"; continue; }
+  proxy="${tokens[0]}"
+
+  printf '== proxy=%s ==\n' "$proxy"
+  for email in "${tokens[@]:1}"; do
+    files=$(filename_for "$email")
+    if [[ -z "$files" ]]; then
+      printf '  WARN no auth-file found for %s\n' "$email"
+      continue
+    fi
+    # Same email can have multiple files (re-logins); patch each.
+    while IFS= read -r file; do
+      [[ -z "$file" ]] && continue
+      set_proxy "$file" "$proxy"
+    done <<<"$files"
+  done
+done
+
+# Final verification snapshot
+if (( ! dry_run )); then
+  printf '\n== final state ==\n'
+  curl -fsS -H "Authorization: Bearer $key" "$base_url/v0/management/auth-files" \
+    | jq -r '.files[] | select(.provider=="codex") | [(.proxy_url // "<direct>"), .email, .name] | @tsv' \
+    | column -t -s $'\t'
+fi

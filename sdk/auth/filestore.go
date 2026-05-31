@@ -106,6 +106,15 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			auth.Metadata = make(map[string]any)
 		}
 		auth.Metadata["disabled"] = auth.Disabled
+		// Preserve user-managed top-level fields (proxy_url, prefix, headers,
+		// priority, note, websockets) from the existing file on disk so that
+		// a re-login (which produces a fresh Auth with empty metadata) does
+		// not silently wipe them. Values already present in auth.Metadata
+		// always win — re-login does not override a value the caller has
+		// explicitly set on the in-memory record.
+		if existing, errRead := os.ReadFile(path); errRead == nil {
+			preservePreviousAuthFields(existing, auth, auth.Metadata)
+		}
 		if setter, ok := auth.Storage.(metadataSetter); ok {
 			setter.SetMetadata(auth.Metadata)
 		}
@@ -154,6 +163,57 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	}
 
 	return path, nil
+}
+
+// preservedAuthFileFields is the set of top-level JSON keys in an auth file
+// that are managed by the user (via the management API or manual edits) and
+// must survive a re-login that otherwise produces a fresh Auth with empty
+// metadata. The list matches syncAuthFileMetadataFields in the management API.
+var preservedAuthFileFields = []string{
+	"proxy_url",
+	"prefix",
+	"headers",
+	"priority",
+	"note",
+	"websockets",
+}
+
+// preservePreviousAuthFields decodes the existing auth file JSON and copies
+// preservedAuthFileFields into the in-memory metadata when metadata does not
+// already have a value for that key. It also mirrors proxy_url / prefix back
+// onto the Auth struct fields so the in-memory record reflects what is being
+// persisted (the management API does the same in syncAuthFileMetadataFields).
+func preservePreviousAuthFields(existing []byte, auth *cliproxyauth.Auth, metadata map[string]any) {
+	if len(existing) == 0 || metadata == nil {
+		return
+	}
+	var prev map[string]any
+	if err := json.Unmarshal(existing, &prev); err != nil {
+		return
+	}
+	for _, k := range preservedAuthFileFields {
+		if _, has := metadata[k]; has {
+			continue
+		}
+		v, ok := prev[k]
+		if !ok {
+			continue
+		}
+		metadata[k] = v
+	}
+	if auth == nil {
+		return
+	}
+	if strings.TrimSpace(auth.ProxyURL) == "" {
+		if v, ok := metadata["proxy_url"].(string); ok {
+			auth.ProxyURL = strings.TrimSpace(v)
+		}
+	}
+	if strings.TrimSpace(auth.Prefix) == "" {
+		if v, ok := metadata["prefix"].(string); ok {
+			auth.Prefix = strings.TrimSpace(v)
+		}
+	}
 }
 
 // List enumerates all auth JSON files under the configured directory.
