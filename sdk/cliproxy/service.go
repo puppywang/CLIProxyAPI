@@ -99,6 +99,21 @@ type Service struct {
 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
 	pluginHost *pluginhost.Host
 
+	// quotaFetcher loads wham/usage snapshots for codex auths. Shared with
+	// quotaRefresher; nil when an external caller supplied their own
+	// coreManager (and thus owns the quota subsystem too).
+	quotaFetcher *quota.CodexWhamFetcher
+
+	// quotaSelector is the inner LeastRemainingQuotaSelector that owns the
+	// quota cache. quotaRefresher pushes wham/usage snapshots here on a
+	// background cycle so Pick stays off the network.
+	quotaSelector *coreauth.LeastRemainingQuotaSelector
+
+	// quotaRefresher periodically refreshes quotaSelector's cache for
+	// every codex auth. Started in Run, stopped in Shutdown. Replaced
+	// from applyConfigUpdate when the selector chain is rebuilt.
+	quotaRefresher *quota.Refresher
+
 	// shutdownOnce ensures shutdown is called only once.
 	shutdownOnce sync.Once
 
@@ -755,6 +770,14 @@ func (s *Service) completeModelRegistrationForAuth(ctx context.Context, auth *co
 	// have an empty supportedModelSet (because Register/Update upserts into the
 	// scheduler before registerModelsForAuth runs) and are invisible to the scheduler.
 	s.coreManager.RefreshSchedulerEntry(auth.ID)
+
+	// Kick the background refresher so this auth gets a fresh wham/usage
+	// snapshot without waiting for the next periodic tick. Important for
+	// re-login flows where the user expects the credential to be usable
+	// (and quota-ranked) immediately, not 30 seconds later.
+	if s.quotaRefresher != nil {
+		s.quotaRefresher.Trigger(auth.ID)
+	}
 }
 
 func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
@@ -775,6 +798,45 @@ func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 		executor.CloseCodexWebsocketSessionsForAuthID(id, "auth_removed")
 	}
 	s.syncPluginRuntime(ctx)
+}
+
+// startQuotaRefresher constructs and starts the background quota
+// refresher. Safe to call when the service has no quota subsystem (e.g.
+// SDK callers that supplied their own coreManager) — it becomes a
+// no-op. Existing refreshers are stopped before being replaced so the
+// method is also safe to call after applyConfigUpdate rebuilds the
+// selector chain.
+func (s *Service) startQuotaRefresher(ctx context.Context) {
+	if s == nil || s.quotaFetcher == nil || s.quotaSelector == nil || s.coreManager == nil {
+		return
+	}
+	if s.quotaRefresher != nil {
+		s.quotaRefresher.Stop()
+		s.quotaRefresher = nil
+	}
+	// The refresher reads through s.coreManager so it automatically
+	// observes auth additions, removals, and re-logins without needing
+	// its own subscription. The selector is captured here; if a config
+	// reload swaps it (applyConfigUpdate), this refresher is stopped and
+	// replaced by a new one bound to the new selector.
+	selector := s.quotaSelector
+	refresher := quota.NewRefresher(
+		s.quotaFetcher,
+		func() []*coreauth.Auth { return s.coreManager.List() },
+		selector.PushSnapshot,
+	)
+	refresher.Start(ctx)
+	s.quotaRefresher = refresher
+	log.Infof("quota refresher started (interval=%s, concurrency=%d)", quota.DefaultRefreshInterval, quota.DefaultConcurrency)
+}
+
+// stopQuotaRefresher stops the background refresher if running. Idempotent.
+func (s *Service) stopQuotaRefresher() {
+	if s == nil || s.quotaRefresher == nil {
+		return
+	}
+	s.quotaRefresher.Stop()
+	s.quotaRefresher = nil
 }
 
 func (s *Service) applyRetryConfig(cfg *config.Config) {
@@ -1197,13 +1259,19 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 			selector = coreauth.NewRoundRobinSelectorWithPersistence(rrCursorPath(newCfg))
 		}
 
-		// Wrap with quota-aware selection (delegates to inner for non-codex
-		// pools or when wham/usage data is not yet warm). Mirrors the chain
-		// in builder.go for the fresh-start path.
-		selector = coreauth.NewLeastRemainingQuotaSelector(coreauth.LeastRemainingQuotaConfig{
+		// Wrap with quota-aware selection. Mirrors the chain in builder.go
+		// for the fresh-start path. Async mode keeps Pick latency bounded
+		// to cache reads; the refresher is restarted below so it pushes
+		// snapshots into the NEW selector instance.
+		quotaFetcher := quota.NewCodexWhamFetcher()
+		quotaSelector := coreauth.NewLeastRemainingQuotaSelector(coreauth.LeastRemainingQuotaConfig{
 			Inner:   selector,
-			Fetcher: quota.NewCodexWhamFetcher(),
+			Fetcher: quotaFetcher,
+			Async:   true,
 		})
+		selector = quotaSelector
+		s.quotaFetcher = quotaFetcher
+		s.quotaSelector = quotaSelector
 
 		if nextSessionAffinity {
 			ttl := time.Hour
@@ -1221,6 +1289,13 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 		}
 
 		s.coreManager.SetSelector(selector)
+
+		// Rebind the background quota refresher to the freshly constructed
+		// selector + fetcher. Home mode runs without a refresher; if the
+		// service did not have one already, do not start one now.
+		if s.quotaRefresher != nil {
+			s.startQuotaRefresher(context.Background())
+		}
 	}
 
 	s.applyRetryConfig(newCfg)
@@ -1576,8 +1651,27 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}()
 
-	time.Sleep(100 * time.Millisecond)
-	fmt.Printf("API server started successfully on: %s:%d\n", s.cfg.Host, s.cfg.Port)
+	// Race the server's startup against a short delay. net.Listen
+	// returns its bind error synchronously, so 100ms is plenty for the
+	// goroutine above to report a bind failure before we proceed to
+	// start the watcher / refreshers — all of which write to auth files
+	// and would thrash them across competing instances if the listener
+	// never bound. Without this guard, the "started successfully"
+	// message below would print even when the bind failed, then setup
+	// would continue, OAuth refresh would rotate tokens behind the back
+	// of the real owner of the port, and every restart cycle would
+	// invalidate live credentials silently.
+	select {
+	case errServer := <-s.serverErr:
+		if errServer != nil {
+			log.Errorf("API server failed to start on %s:%d: %v", s.cfg.Host, s.cfg.Port, errServer)
+			return errServer
+		}
+		log.Warnf("API server returned nil during startup window — treating as early shutdown")
+		return nil
+	case <-time.After(100 * time.Millisecond):
+		fmt.Printf("API server started successfully on: %s:%d\n", s.cfg.Host, s.cfg.Port)
+	}
 
 	s.applyPprofConfig(s.cfg)
 
@@ -1617,6 +1711,14 @@ func (s *Service) Run(ctx context.Context) error {
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+	}
+
+	// Quota refresher starts after auth load so the very first cycle
+	// already sees the persisted credential list. Home mode is excluded —
+	// home pushes auth bundles from a remote source on its own schedule
+	// and runs its own selector chain.
+	if !homeEnabled {
+		s.startQuotaRefresher(context.Background())
 	}
 
 	select {
@@ -1666,6 +1768,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if s.watcherCancel != nil {
 			s.watcherCancel()
 		}
+		s.stopQuotaRefresher()
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
 		}
