@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -28,21 +29,59 @@ const whamUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 // internal/runtime/executor/codex_executor.go.
 const defaultUserAgent = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
 
-// fetchTimeout caps each individual wham/usage call. The selector applies
-// a tighter global deadline across all parallel fetches; this is a per-call
-// safety net for slow proxies.
-const fetchTimeout = 1200 * time.Millisecond
+// DefaultFetchTimeout caps each individual wham/usage call. Because the
+// fetcher is now invoked from a background refresher rather than the
+// request hot path, we can afford a more generous deadline that survives
+// a slow SOCKS5 handshake on the first request through a fresh transport.
+const DefaultFetchTimeout = 5 * time.Second
 
 // CodexWhamFetcher implements coreauth.QuotaFetcher by querying
 // chatgpt.com/backend-api/wham/usage with each candidate auth's bearer
 // token and per-auth proxy. Non-Codex auths return ok=false so the
 // selector can degrade gracefully for mixed pools.
-type CodexWhamFetcher struct{}
+//
+// Transports are cached per proxy URL so consecutive fetches reuse the
+// underlying TCP / TLS / SOCKS5 connection pool instead of paying for
+// a fresh handshake on every call. The pool is unbounded — codex auths
+// realistically share a handful of proxy URLs at most.
+type CodexWhamFetcher struct {
+	timeout    time.Duration
+	transports sync.Map // proxyURL string -> *http.Transport
+}
 
 // NewCodexWhamFetcher returns a fetcher with default settings. The fetcher
-// is stateless — concurrent Fetch calls are safe.
+// is safe for concurrent use — Fetch calls share a per-proxy transport
+// pool but never mutate one in flight.
 func NewCodexWhamFetcher() *CodexWhamFetcher {
-	return &CodexWhamFetcher{}
+	return &CodexWhamFetcher{timeout: DefaultFetchTimeout}
+}
+
+// transportFor returns the cached transport for the given proxy URL,
+// constructing one on first use. A nil transport means "use net/http
+// defaults" — preserved as the empty-key entry so subsequent calls also
+// reuse the default RoundTripper instead of constructing fresh clients.
+func (f *CodexWhamFetcher) transportFor(proxyURL string) (http.RoundTripper, error) {
+	key := strings.TrimSpace(proxyURL)
+	if cached, ok := f.transports.Load(key); ok {
+		if rt, ok := cached.(http.RoundTripper); ok {
+			return rt, nil
+		}
+	}
+	transport, _, err := proxyutil.BuildHTTPTransport(key)
+	if err != nil {
+		return nil, err
+	}
+	var rt http.RoundTripper
+	if transport != nil {
+		rt = transport
+	}
+	// Store nil values too — that lets us avoid re-parsing the empty
+	// proxy URL on every call when the auth has no proxy configured.
+	actual, _ := f.transports.LoadOrStore(key, rt)
+	if cached, ok := actual.(http.RoundTripper); ok {
+		return cached, nil
+	}
+	return rt, nil
 }
 
 // Fetch implements coreauth.QuotaFetcher. ok=false means "no data for this
@@ -60,13 +99,17 @@ func (f *CodexWhamFetcher) Fetch(ctx context.Context, auth *coreauth.Auth) (core
 		return coreauth.QuotaSnapshot{}, false, nil
 	}
 
-	transport, _, err := proxyutil.BuildHTTPTransport(strings.TrimSpace(auth.ProxyURL))
-	client := &http.Client{}
-	if err == nil && transport != nil {
-		client.Transport = transport
+	rt, err := f.transportFor(auth.ProxyURL)
+	if err != nil {
+		return coreauth.QuotaSnapshot{}, false, err
 	}
+	client := &http.Client{Transport: rt}
 
-	reqCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
+	timeout := f.timeout
+	if timeout <= 0 {
+		timeout = DefaultFetchTimeout
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, whamUsageURL, nil)
 	if err != nil {
