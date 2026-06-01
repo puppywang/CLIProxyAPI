@@ -767,18 +767,28 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	// StatusDisabled, or per-model StatusDisabled) still trigger the
 	// strict-refuse path.
 	if hit && s.strict {
-		if bound := findCacheHitAuthForStrictBypass(auths, cachedAuthID, model); bound != nil {
-			if mirrorKey != "" {
-				s.cache.Set(mirrorKey, bound.ID)
+		bound := findCacheHitAuthForStrictBypass(auths, cachedAuthID, model)
+		if bound == nil {
+			entry.Warnf("session-affinity: bound auth missing or disabled, refusing fallback (strict) | session=%s bound_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
+			return nil, &Error{
+				Code:    "auth_bound_unavailable",
+				Message: "session-bound auth is currently unavailable; start a new conversation to pick a different credential",
 			}
-			entry.Infof("session-affinity: cache hit (strict, bypassing availability) | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), bound.ID, provider, model)
-			return bound, nil
 		}
-		entry.Warnf("session-affinity: bound auth missing or disabled, refusing fallback (strict) | session=%s bound_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
-		return nil, &Error{
-			Code:    "auth_bound_unavailable",
-			Message: "session-bound auth is currently unavailable; start a new conversation to pick a different credential",
+		if mirrorKey != "" {
+			s.cache.Set(mirrorKey, bound.ID)
 		}
+		// Distinguish a normal cache hit (auth fully available) from a
+		// real bypass (auth is currently in cooldown / unavailable). The
+		// bypass case is the interesting one for operators investigating
+		// upstream blips; the normal case should look like the
+		// non-strict cache-hit log to avoid alert noise.
+		if blocked, _, _ := isAuthBlockedForModel(bound, model, now); blocked {
+			entry.Infof("session-affinity: cache hit (strict, bypassing cooldown) | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), bound.ID, provider, model)
+		} else {
+			entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), bound.ID, provider, model)
+		}
+		return bound, nil
 	}
 
 	available, err := getAvailableAuths(auths, provider, model, now)
