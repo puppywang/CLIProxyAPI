@@ -587,6 +587,55 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	return false, blockReasonNone, time.Time{}
 }
 
+// findCacheHitAuthForStrictBypass looks up a previously-bound auth by
+// ID in the full pool, returning it even when isAuthBlockedForModel
+// would currently filter it out (cooldown / 5xx / quota / 401 / etc.).
+// The strict session-affinity selector uses this to honour the binding
+// through a temporary upstream failure rather than amplifying a
+// 1-second network hiccup into a 60-second strict-reject storm.
+//
+// What we still refuse to return:
+//
+//   - the auth is no longer in the pool (removed by admin / hot reload);
+//   - the auth has been administratively disabled (auth.Disabled or
+//     auth.Status == StatusDisabled);
+//   - the per-model state is administratively disabled
+//     (state.Status == StatusDisabled).
+//
+// Anything else — including a state currently in cooldown, marked
+// Unavailable, or with a non-zero NextRetryAfter — is returned so the
+// conductor can surface the real upstream response to the client. The
+// conductor's MarkResult path will re-record any persistent failure on
+// the next attempt, so we do not lose the eventual-consistency
+// signalling that a truly broken auth should be avoided.
+func findCacheHitAuthForStrictBypass(auths []*Auth, id, model string) *Auth {
+	if id == "" {
+		return nil
+	}
+	for _, a := range auths {
+		if a == nil || a.ID != id {
+			continue
+		}
+		if a.Disabled || a.Status == StatusDisabled {
+			return nil
+		}
+		if model != "" && len(a.ModelStates) > 0 {
+			state, ok := a.ModelStates[model]
+			if (!ok || state == nil) && model != "" {
+				baseModel := canonicalModelKey(model)
+				if baseModel != "" && baseModel != model {
+					state, ok = a.ModelStates[baseModel]
+				}
+			}
+			if ok && state != nil && state.Status == StatusDisabled {
+				return nil
+			}
+		}
+		return a
+	}
+	return nil
+}
+
 // sessionPattern matches Claude Code user_id format:
 // user_{hash}_account__session_{uuid}
 var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
@@ -686,11 +735,6 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
-	if err != nil {
-		return nil, err
-	}
-
 	cacheKey := provider + "::" + primaryID
 	mirrorKey := ""
 	if mirrorID != "" && mirrorID != primaryID {
@@ -710,7 +754,42 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
+	cachedAuthID, hit := s.cache.GetAndRefresh(cacheKey)
+
+	// Strict-mode bypass: when we already have a binding for this session,
+	// honor it even if the auth is currently in a temporary cooldown. The
+	// conductor will surface the real upstream result; if it succeeds (the
+	// usual case for transient 5xx / connection-reset) the user never sees
+	// the cooldown. The original strict design — refuse fallback on
+	// unavailable — was protecting against silently routing to a *different*
+	// account, not against retrying the bound one through a 1-minute
+	// network blip. Administratively disabled auths (Disabled flag, status
+	// StatusDisabled, or per-model StatusDisabled) still trigger the
+	// strict-refuse path.
+	if hit && s.strict {
+		if bound := findCacheHitAuthForStrictBypass(auths, cachedAuthID, model); bound != nil {
+			if mirrorKey != "" {
+				s.cache.Set(mirrorKey, bound.ID)
+			}
+			entry.Infof("session-affinity: cache hit (strict, bypassing availability) | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), bound.ID, provider, model)
+			return bound, nil
+		}
+		entry.Warnf("session-affinity: bound auth missing or disabled, refusing fallback (strict) | session=%s bound_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
+		return nil, &Error{
+			Code:    "auth_bound_unavailable",
+			Message: "session-bound auth is currently unavailable; start a new conversation to pick a different credential",
+		}
+	}
+
+	available, err := getAvailableAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+
+	if hit {
+		// Non-strict cache hit: strict was handled above. Either return the
+		// bound auth if it's still in the available pool, or transparently
+		// reselect through the fallback selector.
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
 				if mirrorKey != "" {
@@ -718,18 +797,6 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				}
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
-			}
-		}
-		// Bound auth is no longer available. Strict mode refuses to silently
-		// reselect — replaying the same conversation on a different account
-		// is the precise signal that upstream risk-control treats as
-		// account abuse. Surface the error so the client can decide what
-		// to do (typically: start a new conversation).
-		if s.strict {
-			entry.Warnf("session-affinity: bound auth unavailable, refusing fallback (strict) | session=%s bound_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
-			return nil, &Error{
-				Code:    "auth_bound_unavailable",
-				Message: "session-bound auth is currently unavailable; start a new conversation to pick a different credential",
 			}
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
