@@ -225,6 +225,14 @@ func (b *Builder) Build() (*Service, error) {
 	}
 	accessManager.SetProviders(sdkaccess.RegisteredProviders())
 
+	// Declared at the outer scope so the constructed Service can pick them
+	// up even though they are only populated in the "build a fresh
+	// coreManager" branch below.
+	var (
+		quotaFetcher  *quota.CodexWhamFetcher
+		quotaSelector *coreauth.LeastRemainingQuotaSelector
+	)
+
 	coreManager := b.coreManager
 	if coreManager == nil {
 		tokenStore := sdkAuth.GetTokenStore()
@@ -257,10 +265,18 @@ func (b *Builder) Build() (*Service, error) {
 		// picks land on whichever credential currently has the most
 		// remaining ChatGPT quota (sourced from /backend-api/wham/usage).
 		// Non-codex pools transparently fall through to the inner selector.
-		selector = coreauth.NewLeastRemainingQuotaSelector(coreauth.LeastRemainingQuotaConfig{
+		//
+		// Async mode keeps Pick latency bounded to in-memory cache reads —
+		// the quota.Refresher started in Service.Run owns wham/usage
+		// fetching so a slow SOCKS5 first call never collapses the
+		// candidate pool to whichever credential responded fastest.
+		quotaFetcher = quota.NewCodexWhamFetcher()
+		quotaSelector = coreauth.NewLeastRemainingQuotaSelector(coreauth.LeastRemainingQuotaConfig{
 			Inner:   selector,
-			Fetcher: quota.NewCodexWhamFetcher(),
+			Fetcher: quotaFetcher,
+			Async:   true,
 		})
+		selector = quotaSelector
 
 		// Wrap with session affinity if enabled. Strict mode (when set) makes
 		// the selector refuse to silently fail over to a different credential
@@ -305,6 +321,11 @@ func (b *Builder) Build() (*Service, error) {
 		service.serverOptions = append(service.serverOptions, api.WithPostAuthHook(b.postAuthHook))
 	}
 	service.serverOptions = append(service.serverOptions, api.WithPostAuthPersistHook(service.runtimeAuthSyncHook()), api.WithPluginHost(pluginHost))
+	// Capture the quota-aware components only when they were constructed
+	// here. A caller that supplied a pre-built coreManager (rare; the SDK
+	// embed path) drives its own quota subsystem.
+	service.quotaFetcher = quotaFetcher
+	service.quotaSelector = quotaSelector
 	return service, nil
 }
 
