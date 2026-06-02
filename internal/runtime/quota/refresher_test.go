@@ -336,6 +336,61 @@ func TestRefresher_ConcurrencyCap(t *testing.T) {
 	}
 }
 
+// TestRefresher_BackoffSurvivesHighFailureCount is the regression guard
+// for the silent-stuck bug observed on 2026-06-02: after ~50 consecutive
+// failures the previous math.Pow-based delay formula overflowed the
+// float-to-time.Duration conversion, producing wildly out-of-range
+// nextAt values that effectively pinned the auth out of the refresher
+// rotation for the lifetime of the process.
+//
+// At 1000 simulated failures, recordFailure must still leave nextAt at
+// a time strictly within (now, now+MaxBackoff]. If it lands further out
+// or in the past, the refresher will either give up on the auth or busy
+// loop on it — both regressions we've actually shipped before.
+func TestRefresher_BackoffSurvivesHighFailureCount(t *testing.T) {
+	t.Parallel()
+
+	r := NewRefresher(
+		newFakeFetcher(),
+		func() []*coreauth.Auth { return nil },
+		func(string, coreauth.QuotaSnapshot) {},
+		WithInterval(30*time.Second),
+	)
+
+	authID := "stuck-account"
+	before := time.Now()
+	for i := 0; i < 1000; i++ {
+		r.recordFailure(authID)
+	}
+	after := time.Now()
+
+	r.mu.Lock()
+	state := r.backoffs[authID]
+	r.mu.Unlock()
+	if state == nil {
+		t.Fatal("no backoff state recorded after 1000 failures")
+	}
+
+	// nextAt must be within (call window, call window + MaxBackoff] —
+	// the floor guards against negative-duration wraparound, the ceiling
+	// against runaway exponentiation.
+	earliestExpected := before
+	latestExpected := after.Add(MaxBackoff + time.Second)
+	if state.nextAt.Before(earliestExpected) {
+		t.Fatalf("nextAt = %v is before the call window start %v (negative-duration wraparound bug)", state.nextAt, earliestExpected)
+	}
+	if state.nextAt.After(latestExpected) {
+		t.Fatalf("nextAt = %v is more than MaxBackoff (%v) past the call window end %v (overflow bug)", state.nextAt, MaxBackoff, latestExpected)
+	}
+
+	// And allowed() at the future "after backoff" point should return
+	// true — the auth must still be reachable on the regular cadence,
+	// not silently quarantined.
+	if !r.allowed(authID, after.Add(MaxBackoff+time.Second)) {
+		t.Fatalf("allowed=false after MaxBackoff window — high-failure auth got permanently parked")
+	}
+}
+
 // TestRefresher_StopIsIdempotentAndSafeBeforeStart guards against the
 // service shutting down before the refresher ever started, and against
 // double-Stop calls from defensive callers.
