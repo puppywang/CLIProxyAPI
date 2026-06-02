@@ -23,6 +23,7 @@ func RegisterRoutes(group *gin.RouterGroup, reg *Registry) {
 	group.GET("/in-flight/settings", settingsGetHandler(reg))
 	group.PUT("/in-flight/settings", settingsPutHandler(reg))
 	group.GET("/in-flight/history", historyHandler(reg))
+	group.GET("/in-flight/recent-errors", recentErrorsHandler(reg))
 }
 
 func settingsGetHandler(reg *Registry) gin.HandlerFunc {
@@ -44,6 +45,21 @@ func settingsPutHandler(reg *Registry) gin.HandlerFunc {
 			return
 		}
 		c.JSON(http.StatusOK, updated)
+	}
+}
+
+func recentErrorsHandler(reg *Registry) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		limit := 50
+		if v := strings.TrimSpace(c.Query("limit")); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"records": reg.RecentErrors(limit),
+			"now":     time.Now(),
+		})
 	}
 }
 
