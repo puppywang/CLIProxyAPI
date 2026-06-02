@@ -391,6 +391,141 @@ func TestRefresher_BackoffSurvivesHighFailureCount(t *testing.T) {
 	}
 }
 
+// TestRefresher_AlignCooldownEndPullsNextAtForward verifies the
+// "next_refresh = min(interval, resets_at)" scheduling rule: when the
+// conductor has already recorded a future cooldown end (from upstream's
+// resets_at), the refresher's per-auth nextAt is pulled back to that
+// moment so the regular tick fires the refresh exactly when upstream
+// says the credential is unblocked, rather than waiting out the full
+// interval.
+func TestRefresher_AlignCooldownEndPullsNextAtForward(t *testing.T) {
+	t.Parallel()
+
+	r := NewRefresher(
+		newFakeFetcher(),
+		func() []*coreauth.Auth { return nil },
+		func(string, coreauth.QuotaSnapshot) {},
+		WithInterval(10*time.Minute),
+	)
+	const authID = "a"
+
+	// Seed a "just refreshed, next due in 10 minutes" state.
+	r.recordSuccess(authID)
+	r.mu.Lock()
+	originalNext := r.backoffs[authID].nextAt
+	r.mu.Unlock()
+	if originalNext.Before(time.Now().Add(9 * time.Minute)) {
+		t.Fatalf("recordSuccess should schedule ~10min ahead, got nextAt=%v", originalNext)
+	}
+
+	// Conductor reports a cooldown ending in 2 minutes — earlier than
+	// the next scheduled refresh.
+	cooldownEnd := time.Now().Add(2 * time.Minute)
+	r.alignCooldownEnd(authID, cooldownEnd)
+	r.mu.Lock()
+	aligned := r.backoffs[authID].nextAt
+	r.mu.Unlock()
+	if !aligned.Equal(cooldownEnd) {
+		t.Fatalf("alignCooldownEnd should pull nextAt back to cooldownEnd; got %v, want %v", aligned, cooldownEnd)
+	}
+
+	// And a later "cooldown end" must NOT push the refresh further out
+	// — the regular cadence still bounds nextAt from above.
+	r.alignCooldownEnd(authID, time.Now().Add(1*time.Hour))
+	r.mu.Lock()
+	stillAligned := r.backoffs[authID].nextAt
+	r.mu.Unlock()
+	if !stillAligned.Equal(cooldownEnd) {
+		t.Fatalf("alignCooldownEnd must not move nextAt later; got %v, want %v", stillAligned, cooldownEnd)
+	}
+}
+
+// TestKnownCooldownEnd_ReadsAuthAndModelStates verifies the per-auth /
+// per-model unification: knownCooldownEnd returns the LATEST future
+// NextRetryAfter across both the auth-level field and every model
+// state, so the refresher only pulls forward to the moment when all
+// known per-model locks have cleared (account-wide rate-limit data
+// cannot usefully change before then).
+func TestKnownCooldownEnd_ReadsAuthAndModelStates(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	short := now.Add(2 * time.Minute)
+	long := now.Add(20 * time.Minute)
+
+	cases := []struct {
+		name string
+		auth *coreauth.Auth
+		want time.Time
+	}{
+		{"nil auth", nil, time.Time{}},
+		{"no cooldown anywhere", &coreauth.Auth{}, time.Time{}},
+		{
+			"only auth-level cooldown",
+			&coreauth.Auth{NextRetryAfter: short},
+			short,
+		},
+		{
+			"only per-model cooldown",
+			&coreauth.Auth{
+				ModelStates: map[string]*coreauth.ModelState{
+					"gpt-5.5": {NextRetryAfter: short},
+				},
+			},
+			short,
+		},
+		{
+			"multiple model cooldowns — latest wins",
+			&coreauth.Auth{
+				ModelStates: map[string]*coreauth.ModelState{
+					"a": {NextRetryAfter: short},
+					"b": {NextRetryAfter: long},
+				},
+			},
+			long,
+		},
+		{
+			"auth-level vs model-level — latest wins",
+			&coreauth.Auth{
+				NextRetryAfter: short,
+				ModelStates: map[string]*coreauth.ModelState{
+					"a": {NextRetryAfter: long},
+				},
+			},
+			long,
+		},
+		{
+			"past cooldown ignored",
+			&coreauth.Auth{
+				NextRetryAfter: now.Add(-1 * time.Minute),
+				ModelStates: map[string]*coreauth.ModelState{
+					"a": {NextRetryAfter: short},
+				},
+			},
+			short,
+		},
+		{
+			"nil model state entries are skipped",
+			&coreauth.Auth{
+				ModelStates: map[string]*coreauth.ModelState{
+					"a": nil,
+					"b": {NextRetryAfter: short},
+				},
+			},
+			short,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := knownCooldownEnd(tc.auth, now)
+			if !got.Equal(tc.want) {
+				t.Fatalf("knownCooldownEnd = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRefresher_StopIsIdempotentAndSafeBeforeStart guards against the
 // service shutting down before the refresher ever started, and against
 // double-Stop calls from defensive callers.
