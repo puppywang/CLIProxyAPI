@@ -1268,6 +1268,11 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 			Inner:   selector,
 			Fetcher: quotaFetcher,
 			Async:   true,
+			// Mirror the builder's TTL choice — see the comment there
+			// for the rationale (TTL must outlast the refresh interval
+			// so async picks never fall back to neutral while the
+			// refresher is between successful cycles).
+			TTL: 2 * quota.DefaultRefreshInterval,
 		})
 		selector = quotaSelector
 		s.quotaFetcher = quotaFetcher

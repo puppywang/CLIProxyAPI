@@ -275,6 +275,16 @@ func (b *Builder) Build() (*Service, error) {
 			Inner:   selector,
 			Fetcher: quotaFetcher,
 			Async:   true,
+			// TTL must exceed the refresher's interval so a freshly
+			// pushed snapshot stays usable until the next refresh
+			// arrives. With 10-min interval + 5-min default TTL the
+			// cache was stale for half of every cycle and Pick fell
+			// back to the neutral 50/50 score — which is exactly what
+			// we saw in production (every picked log showed 50%/50%
+			// regardless of the auth's real wham data). Doubling the
+			// interval gives a small safety margin if a refresh round
+			// slips slightly.
+			TTL: 2 * quota.DefaultRefreshInterval,
 		})
 		selector = quotaSelector
 
