@@ -411,6 +411,7 @@
           <th>Duration</th>
           <th>Method / Path</th>
           <th>Model</th>
+          <th>Window</th>
           <th>Account</th>
           <th>Req → Resp</th>
           <th>Tokens</th>
@@ -423,6 +424,28 @@
     </table>
   </div>
   <div id="empty" class="empty" hidden>No in-flight requests right now.</div>
+
+  <details class="history" id="errorsSection" hidden>
+    <summary>Recent errors (<span id="errorsCount">0</span>)</summary>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>When</th>
+            <th>ID</th>
+            <th>Reason</th>
+            <th>Status</th>
+            <th>Path</th>
+            <th>Model</th>
+            <th>Window</th>
+            <th>Account</th>
+            <th>Duration</th>
+          </tr>
+        </thead>
+        <tbody id="errorsBody"></tbody>
+      </table>
+    </div>
+  </details>
 
   <details class="history" id="historySection" hidden>
     <summary>Recent cancellations (<span id="historyCount">0</span>)</summary>
@@ -512,6 +535,37 @@
     return e.status === 'finished' || e.status === 'canceled';
   }
 
+  // Short, fixed-width prefix of a UUID so the Window cell stays narrow
+  // even when entries are stacked. 8 hex chars is enough to disambiguate
+  // any plausible number of concurrent windows.
+  function shortID(s) {
+    if (!s) return '';
+    s = String(s);
+    return s.length > 8 ? s.substring(0, 8) + '…' : s;
+  }
+
+  // windowCell renders the per-conversation identity an entry belongs
+  // to: session_id (window-stable) on top, thread_id below, plus a
+  // subtle [subagent] / [user] tag so operators can see at a glance
+  // when a sub-agent has split off from its parent's auth.
+  function windowCell(e) {
+    const sid = e.session_id || '';
+    const tid = e.thread_id || '';
+    if (!sid && !tid) return '<span class="muted">—</span>';
+    const sidLine = sid
+      ? '<div title="' + escapeAttr(sid) + '">' + escapeHtml(shortID(sid)) + '</div>'
+      : '';
+    let tidLine = '';
+    if (tid) {
+      const tag = e.thread_source
+        ? ' <span class="muted">[' + escapeHtml(e.thread_source) + ']</span>'
+        : '';
+      tidLine = '<div class="muted" title="' + escapeAttr(tid) + '">' +
+        escapeHtml(shortID(tid)) + tag + '</div>';
+    }
+    return sidLine + tidLine;
+  }
+
   function methodCell(e) {
     let pill;
     if (e.transport === 'ws') {
@@ -583,6 +637,7 @@
       <td class="cell-duration duration"></td>
       <td class="cell-method method-path"></td>
       <td class="cell-model"></td>
+      <td class="cell-window"></td>
       <td class="cell-account"></td>
       <td class="cell-bytes bytes"></td>
       <td class="cell-tokens bytes"></td>
@@ -598,6 +653,7 @@
         duration: tr.querySelector('.cell-duration'),
         method:   tr.querySelector('.cell-method'),
         model:    tr.querySelector('.cell-model'),
+        window:   tr.querySelector('.cell-window'),
         account:  tr.querySelector('.cell-account'),
         bytes:    tr.querySelector('.cell-bytes'),
         tokens:   tr.querySelector('.cell-tokens'),
@@ -657,6 +713,7 @@
 
     setHTML(row.cells.method, methodCell(e), cache, 'method');
     setHTML(row.cells.model,  escapeHtml(e.model || ''), cache, 'model');
+    setHTML(row.cells.window, windowCell(e), cache, 'window');
     const providerLine = escapeHtml(e.provider || '');
     const proxyLine = e.auth_proxy ? '<div class="muted proxy-line">' + escapeHtml(e.auth_proxy) + '</div>' : '';
     setHTML(row.cells.account,
@@ -894,6 +951,71 @@
     }
   }
 
+  // Recent errors panel. Mirrors loadHistory's row-caching pattern so
+  // the "X minutes ago" tick doesn't tear down rows whose payload is
+  // unchanged. Each record is keyed by (recorded_at, entry id).
+  const errorRows = new Map();
+  function errorKey(r) {
+    const e = r.entry || {};
+    return (r.recorded_at || '') + '|' + (e.id || '');
+  }
+
+  async function loadRecentErrors() {
+    try {
+      const res = await apiFetch('/v0/management/in-flight/recent-errors?limit=50');
+      const data = await res.json();
+      noteServerNow(data.now);
+      const records = data.records || [];
+      $('errorsCount').textContent = records.length;
+      $('errorsSection').hidden = records.length === 0;
+      const body = $('errorsBody');
+      const seen = new Set();
+
+      for (let i = records.length - 1; i >= 0; i--) {
+        const r = records[i];
+        const key = errorKey(r);
+        seen.add(key);
+        if (errorRows.has(key)) continue;
+        const e = r.entry || {};
+        const reasonClass = (r.reason || 'error').replace(/[^a-z0-9-]/gi, '');
+        const durMs = e.last_activity
+          ? new Date(e.last_activity).getTime() - new Date(e.started_at).getTime()
+          : 0;
+        const tr = document.createElement('tr');
+        tr.classList.add('transport-' + (e.transport === 'ws' ? 'ws' : 'http'));
+        tr.innerHTML = `
+          <td><div class="hist-ago"></div><div class="muted">${fmtStarted(r.recorded_at)}</div></td>
+          <td class="id-cell">${escapeHtml(e.id || '')}</td>
+          <td><span class="reason-pill ${escapeAttr(reasonClass)}">${escapeHtml(r.reason || '')}</span></td>
+          <td>${r.status_code ? escapeHtml(String(r.status_code)) : '<span class="muted">—</span>'}</td>
+          <td class="method-path">${methodCell(e)}</td>
+          <td>${escapeHtml(e.model || '')}</td>
+          <td>${windowCell(e)}</td>
+          <td>${escapeHtml(e.auth_label || e.auth_id || '')}<div class="muted">${escapeHtml(e.provider || '')}</div></td>
+          <td class="duration">${fmtDuration(durMs)}</td>
+        `;
+        body.insertBefore(tr, body.firstChild);
+        errorRows.set(key, { tr, recordedAt: r.recorded_at, lastAgo: '' });
+      }
+
+      for (const [key, h] of errorRows) {
+        if (!seen.has(key)) {
+          h.tr.remove();
+          errorRows.delete(key);
+          continue;
+        }
+        const ago = fmtAgo(h.recordedAt);
+        if (ago !== h.lastAgo) {
+          h.lastAgo = ago;
+          const cell = h.tr.querySelector('.hist-ago');
+          if (cell) cell.textContent = ago;
+        }
+      }
+    } catch (err) {
+      // best-effort; don't override main status line
+    }
+  }
+
   function connect() {
     const key = keyEl.value.trim();
     if (!key) {
@@ -928,10 +1050,11 @@
     refresh();
     loadSettings();
     loadHistory();
+    loadRecentErrors();
   }
 
   $('connectBtn').addEventListener('click', connect);
-  $('refreshBtn').addEventListener('click', () => { refresh(); loadHistory(); });
+  $('refreshBtn').addEventListener('click', () => { refresh(); loadHistory(); loadRecentErrors(); });
   $('saveSettingsBtn').addEventListener('click', saveSettings);
   tbody.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-cancel]');
@@ -959,6 +1082,7 @@
     if (!keyEl.value) return;
     refresh();
     loadHistory();
+    loadRecentErrors();
   }, 10000);
 
   // Live-update the duration column even when no events arrive.
