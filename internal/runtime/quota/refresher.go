@@ -315,6 +315,14 @@ func (r *Refresher) refreshByID(ctx context.Context, authID string) {
 // refresh performs one fetch and pushes the snapshot to the selector on
 // success. Failures bump per-auth backoff; ok=false (wrong provider /
 // missing token) is silently ignored and does not count as a failure.
+//
+// Successful fetches log at debug level so an operator can verify the
+// refresher is actually keeping the cache warm. Without this log the
+// only externally-visible signal of refresher activity was "fetch
+// failed" lines — making it impossible to tell whether silence meant
+// "all healthy" or "refresher quietly broken" (we hit the latter once
+// when a backoff overflow parked an auth, and again when a stale-cache
+// gap made every Pick fall back to neutral 50%).
 func (r *Refresher) refresh(ctx context.Context, a *coreauth.Auth) {
 	snap, ok, err := r.fetcher.Fetch(ctx, a)
 	if err != nil {
@@ -330,6 +338,8 @@ func (r *Refresher) refresh(ctx context.Context, a *coreauth.Auth) {
 	}
 	r.pusher(a.ID, snap)
 	r.recordSuccess(a.ID)
+	log.Debugf("quota-refresher: fetch ok | auth=%s primary_used=%d%% secondary_used=%d%% limit_reached=%t",
+		a.ID, snap.UsedPercentPrimary, snap.UsedPercentSecondary, snap.LimitReached)
 }
 
 // allowed reports whether the auth is currently outside its backoff window.
