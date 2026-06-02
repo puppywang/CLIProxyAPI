@@ -102,6 +102,15 @@ func Middleware(reg *Registry) gin.HandlerFunc {
 			reg.SetModel(entry, model)
 		}
 
+		// Extract Codex window/turn metadata from the request headers so
+		// the live in-flight view shows which conversation each request
+		// belongs to. This is the same source the session-affinity
+		// selector uses, so the two views agree on what "the same
+		// window" means.
+		if sid, tid, turn, source := peekTurnMetadata(c); sid != "" || tid != "" || turn != "" {
+			reg.SetTurnMetadata(entry, sid, tid, turn, source)
+		}
+
 		handle := &Handle{r: reg, t: entry}
 
 		// Install the selected-auth callback. The handler code reads this from
@@ -127,6 +136,55 @@ func Middleware(reg *Registry) gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+// peekTurnMetadata reads conversation-level identifiers from the
+// incoming request without consuming the body. It checks the headers
+// every Codex client populates today, in order of specificity:
+//
+//  1. X-Codex-Turn-Metadata (a JSON blob carrying session/thread/turn
+//     IDs and thread_source). Codex VSCode always sets this on every
+//     /v1/responses call.
+//  2. Plain Session-Id / Thread-Id / X-Codex-Window-Id / X-Client-
+//     Request-Id headers, used by older CLI versions and fallbacks.
+//
+// Empty values are returned when the headers are missing or malformed
+// — the caller treats this as "no metadata" and leaves the entry's
+// fields untouched. We deliberately do not touch the request body
+// here; peekModelFromRequest already restored it, and the turn
+// metadata lives in headers anyway.
+func peekTurnMetadata(c *gin.Context) (sessionID, threadID, turnID, threadSource string) {
+	if c == nil || c.Request == nil {
+		return "", "", "", ""
+	}
+	h := c.Request.Header
+	if meta := h.Get("X-Codex-Turn-Metadata"); meta != "" {
+		sessionID = strings.TrimSpace(gjson.Get(meta, "session_id").String())
+		threadID = strings.TrimSpace(gjson.Get(meta, "thread_id").String())
+		turnID = strings.TrimSpace(gjson.Get(meta, "turn_id").String())
+		threadSource = strings.ToLower(strings.TrimSpace(gjson.Get(meta, "thread_source").String()))
+	}
+	if sessionID == "" {
+		if v := strings.TrimSpace(h.Get("Session-Id")); v != "" {
+			sessionID = v
+		} else if v := strings.TrimSpace(h.Get("X-Codex-Window-Id")); v != "" {
+			// X-Codex-Window-Id sometimes carries "<session-id>:<n>"
+			// — split off the suffix.
+			if idx := strings.IndexByte(v, ':'); idx > 0 {
+				sessionID = v[:idx]
+			} else {
+				sessionID = v
+			}
+		}
+	}
+	if threadID == "" {
+		if v := strings.TrimSpace(h.Get("Thread-Id")); v != "" {
+			threadID = v
+		} else if v := strings.TrimSpace(h.Get("X-Client-Request-Id")); v != "" {
+			threadID = v
+		}
+	}
+	return sessionID, threadID, turnID, threadSource
 }
 
 func peekModelFromRequest(c *gin.Context) string {
