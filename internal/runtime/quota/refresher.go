@@ -39,10 +39,16 @@ type SnapshotPusher func(authID string, snap coreauth.QuotaSnapshot)
 
 // Default operational parameters. Exported for tests and for callers that
 // want to mirror the defaults when constructing custom configurations.
+// DefaultRefreshInterval is both the regular per-auth refresh cadence
+// and the cap on consecutive-failure exponential backoff. 10 minutes is
+// the right scale: scheduling decisions tolerate quota data that's a
+// few minutes stale, OpenAI's account-wide rate-limit windows roll over
+// at the minutes scale, and we never want to wait beyond this for a
+// retry even if many fetches have failed in a row.
 const (
-	DefaultRefreshInterval = 30 * time.Second
+	DefaultRefreshInterval = 10 * time.Minute
 	DefaultConcurrency     = 2
-	MaxBackoff             = 5 * time.Minute
+	MaxBackoff             = 10 * time.Minute
 )
 
 // Refresher periodically refreshes per-auth quota snapshots in the
@@ -227,6 +233,16 @@ func (r *Refresher) loop(ctx context.Context, done chan struct{}) {
 
 // runOnce refreshes every eligible codex auth in a single cycle, honoring
 // the concurrency cap. Disabled auths and auths under backoff are skipped.
+//
+// When the conductor has already recorded a future NextRetryAfter for an
+// auth (set from upstream's `resets_at` / `resets_in_seconds`), the
+// refresher pulls that auth's nextAt back to the cooldown end so it
+// refreshes exactly when upstream says the credential is unblocked,
+// rather than waiting for the next regular tick. This implements the
+// "next_refresh = min(interval, resets_at)" scheduling rule: the
+// regular cadence covers steady-state polling; the resets_at signal
+// covers known recovery moments. Refresh is never skipped entirely —
+// the scheduler still needs periodic data for quota-based ranking.
 func (r *Refresher) runOnce(ctx context.Context) {
 	auths := r.lister()
 	if len(auths) == 0 {
@@ -240,6 +256,9 @@ func (r *Refresher) runOnce(ctx context.Context) {
 		}
 		if !strings.EqualFold(strings.TrimSpace(a.Provider), "codex") {
 			continue
+		}
+		if cd := knownCooldownEnd(a, now); !cd.IsZero() {
+			r.alignCooldownEnd(a.ID, cd)
 		}
 		if !r.allowed(a.ID, now) {
 			continue
@@ -324,6 +343,61 @@ func (r *Refresher) allowed(authID string, now time.Time) bool {
 	return !now.Before(state.nextAt)
 }
 
+// knownCooldownEnd returns the latest in-the-future NextRetryAfter the
+// conductor has recorded for this auth, looking at both the auth-level
+// field and every per-model state. Zero means no conductor cooldown is
+// currently active — the refresher then follows its regular cadence.
+//
+// We take the latest (not earliest) cooldown end across model states
+// because account-wide rate-limit data exposed by wham/usage cannot
+// usefully change until every per-model lock has cleared. Refreshing
+// earlier would mostly observe the same "limit reached" state.
+func knownCooldownEnd(a *coreauth.Auth, now time.Time) time.Time {
+	if a == nil {
+		return time.Time{}
+	}
+	latest := time.Time{}
+	if a.NextRetryAfter.After(now) {
+		latest = a.NextRetryAfter
+	}
+	for _, st := range a.ModelStates {
+		if st == nil {
+			continue
+		}
+		if !st.NextRetryAfter.After(now) {
+			continue
+		}
+		if latest.IsZero() || st.NextRetryAfter.After(latest) {
+			latest = st.NextRetryAfter
+		}
+	}
+	return latest
+}
+
+// alignCooldownEnd pulls the auth's next refresh deadline back to
+// cooldownEnd if that is sooner than the currently scheduled nextAt.
+// This implements the resets_at side of the "next_refresh = min(interval,
+// resets_at)" rule: when upstream told us the cooldown ends earlier than
+// our regular tick would fire, refresh exactly at the cooldown end so
+// the quota cache reflects the recovery moment. nextAt never moves
+// later from this call — backoff and the regular cadence still bound it
+// from above.
+func (r *Refresher) alignCooldownEnd(authID string, cooldownEnd time.Time) {
+	if cooldownEnd.IsZero() {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.backoffs[authID]
+	if state == nil {
+		state = &backoffState{}
+		r.backoffs[authID] = state
+	}
+	if state.nextAt.IsZero() || cooldownEnd.Before(state.nextAt) {
+		state.nextAt = cooldownEnd
+	}
+}
+
 // maxBackoffExponent caps the doubling factor so the delay calculation
 // stays in well-defined int64 territory regardless of how many
 // consecutive failures an auth racks up. With the default 30s interval
@@ -369,9 +443,19 @@ func (r *Refresher) recordFailure(authID string) {
 	state.nextAt = time.Now().Add(delay)
 }
 
-// recordSuccess clears any prior backoff for the auth.
+// recordSuccess clears any prior backoff for the auth and schedules the
+// next refresh one full interval ahead. With the per-auth cadence
+// enforced here rather than implicitly via the loop ticker, the loop
+// ticker can fire more often (and pick up cooldown-end alignments
+// promptly) without producing extra fetches against healthy auths.
 func (r *Refresher) recordSuccess(authID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.backoffs, authID)
+	state := r.backoffs[authID]
+	if state == nil {
+		state = &backoffState{}
+		r.backoffs[authID] = state
+	}
+	state.failures = 0
+	state.nextAt = time.Now().Add(r.interval)
 }
