@@ -57,6 +57,18 @@ type Entry struct {
 	InputTokens   int64     `json:"input_tokens,omitempty"`
 	OutputTokens  int64     `json:"output_tokens,omitempty"`
 	TotalTokens   int64     `json:"total_tokens,omitempty"`
+
+	// Window / conversation metadata extracted from request headers
+	// (currently X-Codex-Turn-Metadata for Codex clients, with fallbacks
+	// for Session-Id / Thread-Id / X-Client-Request-Id). All four are
+	// optional — non-Codex traffic leaves them empty. Used by the
+	// operator UI to correlate parallel requests within a single window
+	// (main thread + sub-agents) so it's visible when sub-agents
+	// accidentally split across credentials.
+	SessionID    string `json:"session_id,omitempty"`
+	ThreadID     string `json:"thread_id,omitempty"`
+	TurnID       string `json:"turn_id,omitempty"`
+	ThreadSource string `json:"thread_source,omitempty"`
 }
 
 // trackedRequest is the mutable runtime representation behind a registry entry.
@@ -79,16 +91,20 @@ type trackedRequest struct {
 	outputTokens  atomic.Int64
 	totalTokens   atomic.Int64
 
-	mu         sync.RWMutex
-	model      string
-	authID     string
-	authLabel  string
-	provider   string
-	authProxy  string
-	status     Status
-	cancel     context.CancelFunc
-	canceledBy string
-	canceledAt time.Time
+	mu           sync.RWMutex
+	model        string
+	authID       string
+	authLabel    string
+	provider     string
+	authProxy    string
+	status       Status
+	cancel       context.CancelFunc
+	canceledBy   string
+	canceledAt   time.Time
+	sessionID    string
+	threadID     string
+	turnID       string
+	threadSource string
 }
 
 func (t *trackedRequest) snapshot() Entry {
@@ -128,6 +144,10 @@ func (t *trackedRequest) snapshot() Entry {
 		InputTokens:   t.inputTokens.Load(),
 		OutputTokens:  t.outputTokens.Load(),
 		TotalTokens:   t.totalTokens.Load(),
+		SessionID:     t.sessionID,
+		ThreadID:      t.threadID,
+		TurnID:        t.turnID,
+		ThreadSource:  t.threadSource,
 	}
 }
 
@@ -147,6 +167,7 @@ type Registry struct {
 	settings *SettingsStore
 	history  *historyRing
 	histLog  *historyLog
+	errors   *errorsRing
 }
 
 // Event is the message broadcast to SSE subscribers.
@@ -177,6 +198,7 @@ func NewRegistry() *Registry {
 		entries:     make(map[string]*trackedRequest),
 		subscribers: make(map[chan Event]struct{}),
 		history:     newHistoryRing(200),
+		errors:      newErrorsRing(200),
 	}
 }
 
@@ -228,6 +250,21 @@ func (r *Registry) History(limit int) []CancelRecord {
 		return nil
 	}
 	return hist.recent(limit)
+}
+
+// RecentErrors returns the most recent non-2xx outcomes (newest first).
+// Records are captured at Finish time and survive after the entry's
+// terminal-linger window expires, so operators can investigate failures
+// that happened minutes earlier even if the live in-flight list has
+// since been cleared.
+func (r *Registry) RecentErrors(limit int) []ErrorRecord {
+	r.mu.RLock()
+	er := r.errors
+	r.mu.RUnlock()
+	if er == nil {
+		return nil
+	}
+	return er.recent(limit)
 }
 
 // SetAuthLookup installs (or replaces) the auth enrichment callback.
@@ -350,6 +387,62 @@ func (r *Registry) Cancel(id, by, reason string) bool {
 	return true
 }
 
+// maybeRecordError pushes the snapshot into the recent-errors ring if
+// the terminal outcome qualifies as a failure. We treat status codes
+// in [400, 600) as errors, plus the canceled/canceling states
+// (regardless of status), plus the "never wrote a status" case which
+// usually means the connection dropped or the executor returned
+// before any response could be written. Genuinely successful 2xx
+// outcomes — and the "no error and no status, but status set" edge
+// case via 304 — are ignored.
+func (r *Registry) maybeRecordError(snap Entry) {
+	reason := classifyErrorReason(snap)
+	if reason == "" {
+		return
+	}
+	r.mu.RLock()
+	er := r.errors
+	r.mu.RUnlock()
+	if er == nil {
+		return
+	}
+	er.add(ErrorRecord{
+		Entry:      snap,
+		StatusCode: snap.StatusCode,
+		Reason:     reason,
+		RecordedAt: time.Now(),
+	})
+}
+
+// classifyErrorReason returns a short tag describing why an entry is
+// considered an error, or "" if the outcome is normal.
+func classifyErrorReason(snap Entry) string {
+	switch snap.Status {
+	case StatusCanceled, StatusCanceling:
+		return "canceled"
+	}
+	code := snap.StatusCode
+	if code >= 400 && code < 600 {
+		switch {
+		case code == 401, code == 403:
+			return "auth"
+		case code == 429:
+			return "quota"
+		case code >= 500:
+			return "upstream_5xx"
+		default:
+			return "client_4xx"
+		}
+	}
+	if code == 0 && snap.Status == StatusFinished {
+		// Finished without ever writing a status line — typically a
+		// connection drop or an internal short-circuit before any
+		// response went out. Worth surfacing.
+		return "no_status"
+	}
+	return ""
+}
+
 func (r *Registry) recordCancel(snap Entry, reason, by string) {
 	if reason == "" {
 		reason = ReasonManual
@@ -370,6 +463,44 @@ func (r *Registry) recordCancel(snap Entry, reason, by string) {
 	if log != nil {
 		log.append(rec)
 	}
+}
+
+// SetTurnMetadata records the per-conversation identifiers extracted
+// from request headers. session_id is window-stable; thread_id changes
+// per /new and per sub-agent invocation; turn_id changes per message.
+// All inputs are optional — empty values do not overwrite existing
+// non-empty fields, so a malformed second header cannot erase context
+// that was successfully captured at registration. The same call also
+// touches the entry's last-activity timestamp and broadcasts an
+// update so live UI listeners see the metadata appear.
+func (r *Registry) SetTurnMetadata(t *trackedRequest, sessionID, threadID, turnID, threadSource string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	changed := false
+	if sessionID != "" && t.sessionID != sessionID {
+		t.sessionID = sessionID
+		changed = true
+	}
+	if threadID != "" && t.threadID != threadID {
+		t.threadID = threadID
+		changed = true
+	}
+	if turnID != "" && t.turnID != turnID {
+		t.turnID = turnID
+		changed = true
+	}
+	if threadSource != "" && t.threadSource != threadSource {
+		t.threadSource = threadSource
+		changed = true
+	}
+	t.mu.Unlock()
+	if !changed {
+		return
+	}
+	r.touch(t)
+	r.broadcast(Event{Type: "updated", Entry: t.snapshot()})
 }
 
 // SetModel updates the requested model identifier for an entry.
@@ -491,10 +622,20 @@ func (r *Registry) Finish(t *trackedRequest) {
 	id := t.id
 	t.mu.Unlock()
 
+	// Capture any non-2xx outcome in the recent-errors ring before
+	// broadcasting the terminal state. Done here (rather than at the
+	// remove timer) so the record exists as soon as the failure is
+	// visible to the UI, and so the operator can correlate the live
+	// entry with the persisted record. Status 0 means the response
+	// never produced a status line — typically a client cancel or a
+	// connection drop before any reply.
+	snap := t.snapshot()
+	r.maybeRecordError(snap)
+
 	// Push the terminal status so SSE subscribers see the final state. This
 	// transition must not be dropped under load — operators rely on it to
 	// know the request actually ended.
-	r.broadcast(Event{Type: "updated", Entry: t.snapshot(), Critical: true})
+	r.broadcast(Event{Type: "updated", Entry: snap, Critical: true})
 
 	// Linger before removing so operators can see the outcome. removeIfSame
 	// guards against the unlikely case where a new Register has overwritten
