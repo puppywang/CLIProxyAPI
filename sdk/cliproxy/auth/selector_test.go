@@ -1763,6 +1763,86 @@ func TestSessionAffinitySelector_SubagentInheritsParentBindingViaMirror(t *testi
 	}
 }
 
+// trackingFallback wraps another selector and counts how many times it
+// was consulted. Tests use it to PROVE that a particular Pick was
+// served from cache vs went through fallback selection — a property
+// the RoundRobin-only fixtures could not assert.
+type trackingFallback struct {
+	inner Selector
+	calls int
+}
+
+func (t *trackingFallback) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	t.calls++
+	return t.inner.Pick(ctx, provider, model, opts, auths)
+}
+
+// TestSessionAffinitySelector_MirrorWrittenOnFirstTurnTidEqualsSid is the
+// regression guard for the cross-account subagent split observed in
+// production on 2026-06-02: a Codex VSCode window's first user turn has
+// thread_id == session_id (Codex reuses the session UUID as the initial
+// thread UUID). The extractor MUST still populate the codex-window
+// mirror in that case so a subsequent subagent — which primary-keys on
+// "codex-window:<sid>" — finds the parent's binding instead of running
+// a fresh fallback Pick onto a different credential.
+//
+// The earlier "SubagentInheritsParentBindingViaMirror" test passed even
+// with the bug present because its RoundRobin fallback happened to
+// return the same auth on the subagent's separate cursor key. This test
+// uses a counter to assert the subagent never went through fallback at
+// all, which is the only way to prove the cache mirror is doing its job.
+func TestSessionAffinitySelector_MirrorWrittenOnFirstTurnTidEqualsSid(t *testing.T) {
+	t.Parallel()
+
+	tracker := &trackingFallback{inner: &RoundRobinSelector{}}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: tracker,
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "auth-a", Provider: "codex"},
+		{ID: "auth-b", Provider: "codex"},
+		{ID: "auth-c", Provider: "codex"},
+	}
+
+	// Parent: tid == sid (Codex first-turn case — the exact shape that
+	// triggered the production bug). Subagent: different tid, same sid.
+	parentHeaders := make(http.Header)
+	parentHeaders.Set("X-Codex-Turn-Metadata", codexTurnMetadataPrimary)
+	parentOpts := cliproxyexecutor.Options{Headers: parentHeaders}
+
+	subagentHeaders := make(http.Header)
+	subagentHeaders.Set("X-Codex-Turn-Metadata", codexTurnMetadataSubagent)
+	subagentOpts := cliproxyexecutor.Options{Headers: subagentHeaders}
+
+	parent, err := selector.Pick(context.Background(), "codex", "gpt-5.5", parentOpts, auths)
+	if err != nil {
+		t.Fatalf("parent Pick error = %v", err)
+	}
+	if tracker.calls != 1 {
+		t.Fatalf("parent Pick: tracker.calls = %d, want 1 (first turn must go through fallback)", tracker.calls)
+	}
+
+	subagent, err := selector.Pick(context.Background(), "codex", "codex-auto-review", subagentOpts, auths)
+	if err != nil {
+		t.Fatalf("subagent Pick error = %v", err)
+	}
+	// The decisive assertion: subagent MUST have hit the mirror cache,
+	// not gone through fallback. With the bug present, the parent's
+	// mirror write was skipped (because tid == sid), and the subagent
+	// would land here via fallback selection — possibly on the same
+	// auth, possibly on a different one, but always with tracker.calls
+	// having advanced.
+	if tracker.calls != 1 {
+		t.Fatalf("subagent Pick triggered %d fallback call(s) — must have hit the codex-window mirror instead (tid==sid bug)", tracker.calls-1)
+	}
+	if subagent.ID != parent.ID {
+		t.Fatalf("subagent landed on %q but parent is on %q (mirror write must keep them paired)", subagent.ID, parent.ID)
+	}
+}
+
 // TestSessionAffinitySelector_NewChatRebindsAndUpdatesMirror verifies the
 // /new flow: after the user opens a fresh conversation in the same VSCode
 // window, the session_id is unchanged but thread_id is fresh. That must
