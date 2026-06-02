@@ -62,6 +62,58 @@ func (h *historyRing) recent(limit int) []CancelRecord {
 	return out
 }
 
+// ErrorRecord captures a non-2xx outcome for the operator "recent
+// errors" view. The full Entry snapshot is preserved so the UI can
+// show the window/conversation context, chosen auth, model, and the
+// observed status code without keeping the entry itself in memory.
+type ErrorRecord struct {
+	Entry      Entry     `json:"entry"`
+	StatusCode int       `json:"status_code"`
+	Reason     string    `json:"reason"`
+	RecordedAt time.Time `json:"recorded_at"`
+}
+
+// errorsRing is a bounded in-memory ring of recent error outcomes.
+// Implementation mirrors historyRing — keeping them separate (rather
+// than refactoring) so a future divergence (different retention, an
+// errors-only on-disk log, etc.) does not have to disentangle two
+// callers from a shared abstraction.
+type errorsRing struct {
+	mu       sync.RWMutex
+	records  []ErrorRecord
+	capacity int
+}
+
+func newErrorsRing(capacity int) *errorsRing {
+	if capacity <= 0 {
+		capacity = 200
+	}
+	return &errorsRing{capacity: capacity}
+}
+
+func (e *errorsRing) add(rec ErrorRecord) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.records) >= e.capacity {
+		drop := len(e.records) - e.capacity + 1
+		e.records = append(e.records[:0:0], e.records[drop:]...)
+	}
+	e.records = append(e.records, rec)
+}
+
+func (e *errorsRing) recent(limit int) []ErrorRecord {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if limit <= 0 || limit > len(e.records) {
+		limit = len(e.records)
+	}
+	out := make([]ErrorRecord, limit)
+	for i := 0; i < limit; i++ {
+		out[i] = e.records[len(e.records)-1-i]
+	}
+	return out
+}
+
 // historyLog appends cancellation records to a JSONL file. Writes are
 // best-effort: failures are logged but never block the cancel flow.
 type historyLog struct {
