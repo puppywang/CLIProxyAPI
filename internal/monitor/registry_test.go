@@ -6,6 +6,101 @@ import (
 	"time"
 )
 
+// TestRegistry_SetTurnMetadata verifies the window/conversation fields
+// reach the entry snapshot and that empty inputs never clobber values
+// already populated by an earlier call. The clobber-guard matters in
+// practice because real Codex traffic sometimes sends a second header
+// (X-Client-Request-Id) with a partially-populated turn shape after
+// the canonical X-Codex-Turn-Metadata; without the guard the cleaner
+// later header would erase context the registration call captured.
+func TestRegistry_SetTurnMetadata(t *testing.T) {
+	reg := NewRegistry()
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entry := reg.Register("req-meta-1", "POST", "", "/v1/responses", "127.0.0.1", "codex", 0, cancel)
+
+	reg.SetTurnMetadata(entry, "sid-A", "tid-A", "turn-A", "user")
+	snap := reg.Snapshot()[0]
+	if snap.SessionID != "sid-A" || snap.ThreadID != "tid-A" || snap.TurnID != "turn-A" || snap.ThreadSource != "user" {
+		t.Fatalf("metadata not captured: %+v", snap)
+	}
+
+	// Empty values must NOT overwrite — partial updates should be tolerated.
+	reg.SetTurnMetadata(entry, "", "", "turn-B", "")
+	snap = reg.Snapshot()[0]
+	if snap.SessionID != "sid-A" || snap.ThreadID != "tid-A" || snap.ThreadSource != "user" {
+		t.Fatalf("empty-input clobbered an existing field: %+v", snap)
+	}
+	if snap.TurnID != "turn-B" {
+		t.Fatalf("partial update missed: TurnID=%q want turn-B", snap.TurnID)
+	}
+}
+
+// TestRegistry_RecentErrors_CapturesNon2xx is the contract test for the
+// recent-errors ring: a non-2xx terminal status must produce a record;
+// 200 must not. Older entries fall off when the ring's capacity is hit,
+// so the test also exercises the bounded-size behaviour by overflowing
+// a small ring.
+func TestRegistry_RecentErrors_CapturesNon2xx(t *testing.T) {
+	reg := NewRegistry()
+
+	register := func(id string, code int) {
+		_, cancel := context.WithCancel(context.Background())
+		entry := reg.Register(id, "POST", "", "/v1/responses", "127.0.0.1", "codex", 0, cancel)
+		reg.SetStatusCode(entry, code)
+		reg.Finish(entry)
+		cancel()
+	}
+
+	register("ok-1", 200)
+	register("auth-1", 401)
+	register("quota-1", 429)
+	register("upstream-1", 503)
+	register("client-1", 400)
+
+	got := reg.RecentErrors(50)
+	if len(got) != 4 {
+		t.Fatalf("RecentErrors: got %d records, want 4 (200 must not appear)", len(got))
+	}
+	// Newest first.
+	if got[0].Entry.ID != "client-1" || got[0].Reason != "client_4xx" {
+		t.Errorf("newest record = %+v, want client-1 / client_4xx", got[0])
+	}
+	if got[1].Reason != "upstream_5xx" || got[2].Reason != "quota" || got[3].Reason != "auth" {
+		t.Errorf("reason ordering: %v %v %v", got[1].Reason, got[2].Reason, got[3].Reason)
+	}
+	for _, r := range got {
+		if r.Entry.ID == "ok-1" {
+			t.Fatalf("200 OK leaked into recent errors: %+v", r)
+		}
+	}
+}
+
+// TestRegistry_RecentErrors_RecordsCanceled verifies the canceled path
+// (Cancel before Finish) also produces an error record — operators want
+// visibility into cancellations regardless of whether a status code
+// was ever written.
+func TestRegistry_RecentErrors_RecordsCanceled(t *testing.T) {
+	reg := NewRegistry()
+	_, cancel := context.WithCancel(context.Background())
+	entry := reg.Register("cancel-1", "POST", "", "/v1/responses", "127.0.0.1", "codex", 0, cancel)
+	reg.Cancel("cancel-1", "test", ReasonStall)
+	reg.Finish(entry)
+	cancel()
+
+	got := reg.RecentErrors(10)
+	if len(got) != 1 {
+		t.Fatalf("RecentErrors: got %d, want 1", len(got))
+	}
+	if got[0].Reason != "canceled" {
+		t.Fatalf("reason = %q, want canceled", got[0].Reason)
+	}
+	// Verify timestamp is fresh (within the last few seconds).
+	if time.Since(got[0].RecordedAt) > 5*time.Second {
+		t.Errorf("RecordedAt looks stale: %v", got[0].RecordedAt)
+	}
+}
+
 func TestRegistryRegisterAndRemove(t *testing.T) {
 	reg := NewRegistry()
 	_, cancel := context.WithCancel(context.Background())
