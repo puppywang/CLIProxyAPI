@@ -993,11 +993,21 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 					return "codex-window:" + sid, "", ""
 				}
 				if tid != "" {
-					mirror := ""
-					if tid != sid {
-						mirror = "codex-window:" + sid
-					}
-					return "codex-thread:" + tid, "", mirror
+					// Always write the codex-window mirror, even when
+					// tid == sid (the common case on the first turn of a
+					// Codex conversation — Codex reuses the session UUID
+					// as the initial thread UUID). The two cache keys
+					// "codex-thread:<uuid>" and "codex-window:<uuid>"
+					// share a UUID but live in DIFFERENT namespaces, so
+					// writing only the thread key leaves the window
+					// mirror empty — which means the sub-agent's later
+					// lookup (it primary-keys on "codex-window:<sid>")
+					// misses and the sub-agent gets a fresh fallback
+					// Pick on a different credential. That is exactly
+					// the cross-account split within one conversation
+					// that the anti-correlation work was built to
+					// prevent.
+					return "codex-thread:" + tid, "", "codex-window:" + sid
 				}
 				return "codex-window:" + sid, "", ""
 			}
