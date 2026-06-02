@@ -18,7 +18,6 @@ package quota
 
 import (
 	"context"
-	"math"
 	"math/rand/v2"
 	"strings"
 	"sync"
@@ -325,6 +324,19 @@ func (r *Refresher) allowed(authID string, now time.Time) bool {
 	return !now.Before(state.nextAt)
 }
 
+// maxBackoffExponent caps the doubling factor so the delay calculation
+// stays in well-defined int64 territory regardless of how many
+// consecutive failures an auth racks up. With the default 30s interval
+// 2^20 already exceeds any sane real-world wait, and the explicit
+// MaxBackoff cap below brings the result back to 5 minutes anyway.
+// Without this clamp, math.Pow would eventually return +Inf, the
+// float-to-time.Duration conversion is implementation-defined for
+// overflow, and on amd64 in practice the result wraps to a negative
+// duration — which makes nextAt land in the distant past on some
+// failures and the distant future on others, effectively silencing the
+// refresher for that auth indefinitely.
+const maxBackoffExponent = 20
+
 // recordFailure increments the auth's failure count and pushes the next
 // allowed time forward exponentially: 30s, 60s, 120s, 240s ... capped at
 // MaxBackoff. The first failure does not delay the next attempt — we let
@@ -342,9 +354,16 @@ func (r *Refresher) recordFailure(authID string) {
 		state.nextAt = time.Time{}
 		return
 	}
-	exp := math.Pow(2, float64(state.failures-2))
-	delay := time.Duration(float64(r.interval) * exp)
-	if delay > MaxBackoff {
+	// Use integer shifts rather than math.Pow on a growing float so the
+	// arithmetic stays exact and never overflows. n is clamped to
+	// maxBackoffExponent so we cannot reach the int64 limit even after
+	// thousands of consecutive failures.
+	n := state.failures - 2
+	if n > maxBackoffExponent {
+		n = maxBackoffExponent
+	}
+	delay := r.interval * time.Duration(uint64(1)<<uint(n))
+	if delay > MaxBackoff || delay < 0 {
 		delay = MaxBackoff
 	}
 	state.nextAt = time.Now().Add(delay)
