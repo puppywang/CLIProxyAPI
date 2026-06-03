@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
@@ -95,11 +96,19 @@ func Middleware(reg *Registry) gin.HandlerFunc {
 			cancel,
 		)
 
-		// Try to extract model from the JSON body without consuming it. The
-		// RequestLoggingMiddleware (if installed earlier) has already restored
-		// the body, so we can safely read and restore again.
-		if model := peekModelFromRequest(c); model != "" {
+		// Try to extract model and workspace cwd from the JSON body without
+		// consuming it. The RequestLoggingMiddleware (if installed earlier)
+		// has already restored the body, so we can safely read and restore
+		// again. Both values are pulled in the same read pass so we don't
+		// double-read the body — cwd is embedded inside the request's
+		// input_text content as a literal <cwd>…</cwd> tag and is therefore
+		// invisible to gjson at the top level.
+		model, workspace := peekModelAndWorkspaceFromRequest(c)
+		if model != "" {
 			reg.SetModel(entry, model)
+		}
+		if workspace != "" {
+			reg.SetWorkspace(entry, workspace)
 		}
 
 		// Extract Codex window/turn metadata from the request headers so
@@ -107,8 +116,28 @@ func Middleware(reg *Registry) gin.HandlerFunc {
 		// belongs to. This is the same source the session-affinity
 		// selector uses, so the two views agree on what "the same
 		// window" means.
+		var inflightSessionID, inflightThreadID string
 		if sid, tid, turn, source := peekTurnMetadata(c); sid != "" || tid != "" || turn != "" {
 			reg.SetTurnMetadata(entry, sid, tid, turn, source)
+			inflightSessionID = sid
+			inflightThreadID = tid
+		}
+
+		// Remember session_id → workspace outside the per-request entry
+		// lifetime so the bindings reverse-index endpoint can render the
+		// workspace path against each cached binding even after the
+		// request has long finished. We record under BOTH session_id and
+		// thread_id when both are known, because the session-affinity
+		// cache uses thread_id as its primary key and session_id only as
+		// a mirror — operators looking at a `codex-thread:<tid>` row
+		// expect to see the workspace by tid lookup.
+		if workspace != "" {
+			if inflightSessionID != "" {
+				reg.RecordSessionWorkspace(inflightSessionID, workspace)
+			}
+			if inflightThreadID != "" && inflightThreadID != inflightSessionID {
+				reg.RecordSessionWorkspace(inflightThreadID, workspace)
+			}
 		}
 
 		handle := &Handle{r: reg, t: entry}
@@ -187,27 +216,65 @@ func peekTurnMetadata(c *gin.Context) (sessionID, threadID, turnID, threadSource
 	return sessionID, threadID, turnID, threadSource
 }
 
-func peekModelFromRequest(c *gin.Context) string {
+// cwdPattern matches the <cwd>…</cwd> tag Codex CLI clients embed inside
+// their environment_context input_text block. The tag value contains a path
+// whose backslashes (Windows) appear in the JSON body as either literal
+// backslashes (when the body itself was already decoded) or as escaped
+// "\\" pairs (raw JSON on the wire). The pattern accepts any character that
+// is not the opening "<" of the closing tag, which covers both shapes.
+var cwdPattern = regexp.MustCompile(`<cwd>([^<]+)</cwd>`)
+
+// peekModelAndWorkspaceFromRequest reads the request body once, extracts the
+// model name and (when present) the workspace cwd embedded in a Codex
+// environment_context block, and restores the body for downstream handlers.
+// Returns empty strings on any failure or when the body is too large to peek.
+func peekModelAndWorkspaceFromRequest(c *gin.Context) (model, workspace string) {
 	if c == nil || c.Request == nil || c.Request.Body == nil {
-		return ""
+		return "", ""
 	}
 	const maxPeek = 1 << 20 // 1 MiB
 	if c.Request.ContentLength > 0 && c.Request.ContentLength > maxPeek {
 		// Skip peek on very large bodies; model will be filled by the executor
 		// callback path instead.
-		return ""
+		return "", ""
 	}
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxPeek+1))
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	// Restore body so downstream handlers can still read it.
 	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	if len(body) == 0 {
+		return "", ""
+	}
+	model = strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	workspace = extractWorkspaceFromBody(body)
+	return model, workspace
+}
+
+// extractWorkspaceFromBody pulls the first <cwd>…</cwd> tag value out of the
+// request body. JSON-escaped backslashes (e.g. "d:\\AISports") are normalised
+// to plain backslashes so the value can be displayed verbatim.
+func extractWorkspaceFromBody(body []byte) string {
+	if len(body) == 0 {
 		return ""
 	}
-	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
-	return model
+	m := cwdPattern.FindSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	raw := strings.TrimSpace(string(m[1]))
+	if raw == "" {
+		return ""
+	}
+	// Normalise JSON-escaped backslashes to single backslashes. The body is
+	// JSON on the wire so "d:\\AISports\\…" appears here as four bytes
+	// "d:\\A" — collapsing the pair to a single backslash gives the value
+	// the user actually typed.
+	if strings.Contains(raw, `\\`) {
+		raw = strings.ReplaceAll(raw, `\\`, `\`)
+	}
+	return raw
 }
 
 // countingWriter wraps gin.ResponseWriter to count outbound bytes and to
