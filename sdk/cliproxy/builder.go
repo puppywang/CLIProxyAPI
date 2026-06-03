@@ -254,17 +254,27 @@ func (b *Builder) Build() (*Service, error) {
 			}
 		}
 		var selector coreauth.Selector
+		// leastBound is the inner-most selector for codex traffic: under
+		// the session cache's write lock, it picks the candidate with
+		// the fewest current bindings. Outside the lock it has no shared
+		// state. Wired below for both fill-first and the default path so
+		// strategy choice still routes through the binding-aware pick.
+		var leastBound *coreauth.LeastBoundSelector
 		switch strategy {
 		case "fill-first", "fillfirst", "ff":
 			selector = &coreauth.FillFirstSelector{}
 		default:
-			selector = coreauth.NewRoundRobinSelectorWithPersistence(rrCursorPath(b.cfg))
+			leastBound = coreauth.NewLeastBoundSelector(nil, nil)
+			selector = leastBound
 		}
 
-		// Wrap RR with the quota-aware selector so that codex cache-miss
-		// picks land on whichever credential currently has the most
-		// remaining ChatGPT quota (sourced from /backend-api/wham/usage).
-		// Non-codex pools transparently fall through to the inner selector.
+		// Wrap LeastBoundSelector with the quota-aware filter so that
+		// codex cache-miss picks land on whichever credential currently
+		// has the most remaining ChatGPT quota AND the fewest existing
+		// session bindings. The quota selector pre-partitions candidates
+		// into healthy/stressed tiers and hands the slimmed list to the
+		// inner LeastBoundSelector; the binding-count ranking then
+		// distributes new sessions evenly across that tier.
 		//
 		// Async mode keeps Pick latency bounded to in-memory cache reads —
 		// the quota.Refresher started in Service.Run owns wham/usage
@@ -296,12 +306,35 @@ func (b *Builder) Build() (*Service, error) {
 			if b.cfg != nil {
 				strict = b.cfg.Routing.SessionAffinityStrict
 			}
-			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
+			affinity := coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
 				Fallback:        selector,
 				TTL:             sessionAffinityTTL,
 				PersistencePath: sessionAffinityCachePath(b.cfg),
 				Strict:          strict,
 			})
+			// Hook the LeastBoundSelector's secondary score into the quota
+			// cache so 0-binding ties prefer the freshest credential. The
+			// counter itself is supplied via WithBindingSnapshot on each
+			// Pick (the session affinity selector holds the cache lock and
+			// emits a snapshot before delegating).
+			if leastBound != nil {
+				qs := quotaSelector
+				// CombinedQuotaScore = primary*100 + secondary, so
+				// primary dominates the rank but secondary breaks
+				// ties cleanly (e.g. two accounts at 1% primary but
+				// 1% vs 63% weekly are no longer pure-ID tiebroken
+				// — the lighter-weekly one wins). Unknown / fresh
+				// accounts get the neutral midpoint applied to the
+				// primary axis only (no secondary bias).
+				leastBound.SetSecondaryScore(func(authID string) int {
+					score, ok := qs.CombinedQuotaScore(authID)
+					if !ok {
+						return coreauth.DefaultNeutralUsedPercent * 100
+					}
+					return score
+				})
+			}
+			selector = affinity
 		}
 
 		coreManager = coreauth.NewManager(tokenStore, selector, nil)
