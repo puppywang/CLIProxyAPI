@@ -214,11 +214,12 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 	return available
 }
 
-func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
+func collectAvailableByPriority(ctx context.Context, auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
-		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
+		checkModel := resolveModelForCheck(ctx, candidate, model)
+		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
 		if !blocked {
 			priority := authPriority(candidate)
 			available[priority] = append(available[priority], candidate)
@@ -234,12 +235,12 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 	return available, cooldownCount, earliest
 }
 
-func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+func getAvailableAuths(ctx context.Context, auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
+	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(ctx, auths, model, now)
 	if len(availableByPriority) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			providerForError := provider
@@ -278,7 +279,7 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getAvailableAuths(ctx, auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
@@ -520,7 +521,7 @@ func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getAvailableAuths(ctx, auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
@@ -588,13 +589,26 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 }
 
 // findCacheHitAuthForStrictBypass looks up a previously-bound auth by
-// ID in the full pool, returning it even when isAuthBlockedForModel
-// would currently filter it out (cooldown / 5xx / quota / 401 / etc.).
-// The strict session-affinity selector uses this to honour the binding
-// through a temporary upstream failure rather than amplifying a
-// 1-second network hiccup into a 60-second strict-reject storm.
+// ID in the full pool, returning it for any non-admin-disabled state
+// so the conductor can forward the request and let upstream surface
+// the real outcome to the client.
 //
-// What we still refuse to return:
+// We deliberately do NOT short-circuit on quota cooldowns / 5xx
+// cooldowns / NextRetryAfter timers here. The previous design tried
+// to predict "this auth will 429 again, don't bother" — but a
+// synthesized error from us is always a worse signal than the
+// upstream 429 itself: Codex CLI has no branch for our internal
+// "auth_bound_unavailable" code and just shows a generic "high
+// demand" toast that masks the actual cause. Trying through and
+// letting upstream return its real 429 with usage_limit_reached
+// gives the Codex CLI exactly the response shape it knows how to
+// render, and costs at most one extra RTT per user message. The
+// conductor's MarkResult will keep updating cooldown state so the
+// LAYER-2 quota filter (which acts on cache MISSES, not hits) still
+// excludes exhausted credentials from new bindings.
+//
+// What we still refuse to return (caller falls through to
+// strict-refuse and the selector raises usage_limit_reached 429):
 //
 //   - the auth is no longer in the pool (removed by admin / hot reload);
 //   - the auth has been administratively disabled (auth.Disabled or
@@ -602,12 +616,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 //   - the per-model state is administratively disabled
 //     (state.Status == StatusDisabled).
 //
-// Anything else — including a state currently in cooldown, marked
-// Unavailable, or with a non-zero NextRetryAfter — is returned so the
-// conductor can surface the real upstream response to the client. The
-// conductor's MarkResult path will re-record any persistent failure on
-// the next attempt, so we do not lose the eventual-consistency
-// signalling that a truly broken auth should be avoided.
+// These are the only states that genuinely cannot be served by
+// retrying upstream — every other failure mode resolves itself
+// through the natural request/response cycle.
 func findCacheHitAuthForStrictBypass(auths []*Auth, id, model string) *Auth {
 	if id == "" {
 		return nil
@@ -634,6 +645,93 @@ func findCacheHitAuthForStrictBypass(auths []*Auth, id, model string) *Auth {
 		return a
 	}
 	return nil
+}
+
+// ModelAliasResolver returns the per-auth model key for state lookups
+// when the route model differs from the auth's actual state key (the
+// OAuth alias case — antigravity / select codex models). The selector
+// uses this when filtering availability so an auth with state under
+// the alias target is checked against the right ModelState key.
+// Returning "" means no resolution available; the caller should treat
+// the route model as the lookup key.
+type ModelAliasResolver func(auth *Auth, routeModel string) string
+
+type aliasResolverKey struct{}
+
+// WithAliasResolver attaches a per-auth model alias resolver to ctx.
+// The conductor installs this when invoking the selector so the
+// selector's internal availability filter can resolve aliases the same
+// way as the conductor would. Without this the selector falls back to
+// using the route model directly, which is fine for the common
+// no-alias case but mishandles antigravity-style aliased state keys.
+func WithAliasResolver(ctx context.Context, fn ModelAliasResolver) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, aliasResolverKey{}, fn)
+}
+
+func aliasResolverFromContext(ctx context.Context) ModelAliasResolver {
+	if ctx == nil {
+		return nil
+	}
+	fn, _ := ctx.Value(aliasResolverKey{}).(ModelAliasResolver)
+	return fn
+}
+
+// strictBypassFlagKey carries a *bool the conductor sets before calling
+// Pick. The session-affinity selector flips it to true when it returns
+// an auth via the strict-bypass branch (cache hit on a bound auth that
+// is currently in cooldown). The conductor reads it back after Pick so
+// filterExecutionModels can decide whether to honour the binding all
+// the way down (skipping per-model cooldown filter) or apply the
+// normal "skip cooled-down upstream variants" behaviour. Without this
+// signal, filterExecutionModels has to either always-filter (breaks
+// strict-bypass — bound session loses every upstream model and the
+// caller silently 429s) or always-fallback (breaks openai-compat pool
+// — a bad auth with every variant cooled consumes the retry budget
+// instead of being skipped).
+type strictBypassFlagKey struct{}
+
+// WithStrictBypassFlag attaches a *bool flag that the selector will
+// flip to true when it returns an auth via strict-bypass. The caller
+// owns the storage; nil is treated as "caller doesn't care".
+func WithStrictBypassFlag(ctx context.Context, flag *bool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if flag == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, strictBypassFlagKey{}, flag)
+}
+
+func markStrictBypass(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	flag, _ := ctx.Value(strictBypassFlagKey{}).(*bool)
+	if flag != nil {
+		*flag = true
+	}
+}
+
+// resolveModelForCheck returns the model key to use when checking an
+// auth's per-model state. Falls back to routeModel when no resolver is
+// installed or the resolver returns blank.
+func resolveModelForCheck(ctx context.Context, auth *Auth, routeModel string) string {
+	resolver := aliasResolverFromContext(ctx)
+	if resolver == nil {
+		return routeModel
+	}
+	resolved := strings.TrimSpace(resolver(auth, routeModel))
+	if resolved == "" {
+		return routeModel
+	}
+	return resolved
 }
 
 // sessionPattern matches Claude Code user_id format:
@@ -734,6 +832,23 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return s.fallback.Pick(ctx, provider, model, opts, auths)
 	}
 
+	// Fork detection: when a Codex /new turn arrives, the new
+	// thread_id carries forked_from_thread_id pointing at the OLD
+	// thread. Mark that old binding closed in the cache so the
+	// operator-facing reverse-index can distinguish abandoned
+	// conversations from active ones. This is observe-only: the
+	// closed marker does NOT change Pick or LeastBound behaviour
+	// today — that's a follow-up release gated on confirming
+	// detection accuracy in production. Done BEFORE the cache hit
+	// short-circuit so the marker fires regardless of which path
+	// this Pick takes.
+	currentThreadID, forkedFromTid := extractCodexForkSignal(opts.Headers)
+	if forkedFromTid != "" {
+		forkedFromKey := provider + "::codex-thread:" + forkedFromTid
+		s.cache.MarkClosed(forkedFromKey, currentThreadID)
+		entry.Debugf("session-affinity: marked closed by fork | from=%s to=%s provider=%s model=%s", truncateSessionID(forkedFromTid), truncateSessionID(currentThreadID), provider, model)
+	}
+
 	now := time.Now()
 	cacheKey := provider + "::" + primaryID
 	mirrorKey := ""
@@ -770,9 +885,26 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		bound := findCacheHitAuthForStrictBypass(auths, cachedAuthID, model)
 		if bound == nil {
 			entry.Warnf("session-affinity: bound auth missing or disabled, refusing fallback (strict) | session=%s bound_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
+			// Return the upstream-shape 429 so Codex CLI recognises the
+			// outcome as a quota event and renders the right message to
+			// the user. Earlier we shipped an internal
+			// "auth_bound_unavailable" 500 here, but Codex CLI does not
+			// have a branch for that code — it falls through to a
+			// generic "high demand" toast, which hides the actual cause
+			// (the bound credential ran out of quota) and leaves the
+			// user with no idea why their conversation stopped working.
+			// 429 + usage_limit_reached matches the body shape OpenAI
+			// itself returns when a Plus account hits the 5h/weekly
+			// cap, so the Codex CLI's existing UI handles it natively.
+			// Message is emitted as already-valid JSON so the handler's
+			// BuildErrorResponseBody passes it through untouched
+			// instead of wrapping it in the generic rate_limit_error
+			// shape.
 			return nil, &Error{
-				Code:    "auth_bound_unavailable",
-				Message: "session-bound auth is currently unavailable; start a new conversation to pick a different credential",
+				Code:        "usage_limit_reached",
+				Message:     `{"error":{"type":"usage_limit_reached","message":"The bound credential for this conversation reached its usage limit. Start a new conversation to route to a different account."}}`,
+				HTTPStatus:  http.StatusTooManyRequests,
+				BoundAuthID: cachedAuthID,
 			}
 		}
 		if mirrorKey != "" {
@@ -785,13 +917,18 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		// non-strict cache-hit log to avoid alert noise.
 		if blocked, _, _ := isAuthBlockedForModel(bound, model, now); blocked {
 			entry.Infof("session-affinity: cache hit (strict, bypassing cooldown) | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), bound.ID, provider, model)
+			// Signal to the conductor that this auth came back through
+			// strict-bypass so filterExecutionModels skips per-model
+			// cooldown filtering on it (the binding's whole point is
+			// to keep using this credential through transient blips).
+			markStrictBypass(ctx)
 		} else {
 			entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), bound.ID, provider, model)
 		}
 		return bound, nil
 	}
 
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getAvailableAuths(ctx, auths, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
@@ -832,13 +969,64 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
-	if err != nil {
-		return nil, err
+	// Cache-miss path: hold the cache write lock across "count → fallback
+	// pick → bind" so concurrent first-turn requests for different sessions
+	// observe each other's claims. Without this, N simultaneous misses
+	// would all see the same "watanabe has 0 bindings" snapshot and all
+	// pick her, collapsing distribution. The lock-correctness primitive
+	// lives on the cache (WithSelectionLock); we surface the snapshot to
+	// the inner LeastBoundSelector via context so it ranks against the
+	// freshly-captured counts.
+	var (
+		picked    *Auth
+		pickErr   error
+		raced     bool
+		racedAuth string
+	)
+	s.cache.WithSelectionLock(func(bindings map[string]int, setLocked func(sessionID, authID string)) {
+		// Re-check under lock: another goroutine may have just bound this
+		// session between the GetAndRefresh above and now. If so, honour
+		// the existing binding without churning a fresh fallback pick.
+		if existing, ok := s.cache.peekLocked(cacheKey); ok {
+			for _, auth := range auths {
+				if auth == nil {
+					continue
+				}
+				if auth.ID == existing {
+					if blocked, _, _ := isAuthBlockedForModel(auth, model, now); !blocked {
+						picked = auth
+						raced = true
+						racedAuth = auth.ID
+						if mirrorKey != "" {
+							setLocked(mirrorKey, auth.ID)
+						}
+						return
+					}
+				}
+			}
+		}
+
+		childCtx := WithBindingSnapshot(ctx, bindings)
+		auth, err := s.fallback.Pick(childCtx, provider, model, opts, auths)
+		if err != nil {
+			pickErr = err
+			return
+		}
+		picked = auth
+		setLocked(cacheKey, auth.ID)
+		if mirrorKey != "" && mirrorKey != cacheKey {
+			setLocked(mirrorKey, auth.ID)
+		}
+	})
+	if pickErr != nil {
+		return nil, pickErr
 	}
-	writeBinding(auth.ID)
-	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-	return auth, nil
+	if raced {
+		entry.Infof("session-affinity: cache miss raced (adopted concurrent bind) | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), racedAuth, provider, model)
+		return picked, nil
+	}
+	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), picked.ID, provider, model)
+	return picked, nil
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {
@@ -909,6 +1097,52 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	if s.cache != nil {
 		s.cache.InvalidateAuth(authID)
 	}
+}
+
+// BindingsByAuthSnapshot returns the live session-cache contents
+// grouped by auth_id. Used by the management endpoint that renders
+// the bindings reverse-index panel. Nil-safe; returns nil when the
+// selector has no cache configured.
+func (s *SessionAffinitySelector) BindingsByAuthSnapshot() map[string][]BindingSnapshotEntry {
+	if s == nil || s.cache == nil {
+		return nil
+	}
+	return s.cache.SnapshotByAuth()
+}
+
+// extractCodexForkSignal returns (currentThreadID, forkedFromThreadID) from
+// the X-Codex-Turn-Metadata header when both fields are present and
+// non-empty. Real Codex VS Code emits `forked_from_thread_id` only on a
+// turn that comes from `/new` (or from a sub-agent that branched off a
+// parent thread); regular continuation turns leave the field unset.
+//
+// The pair is returned together because the selector needs both: the
+// forked-from id identifies the OLD binding to close, and the current
+// thread_id is recorded as the "forked_to" replacement on that closed
+// entry — operators reading the bindings panel can then trace which
+// new conversation supplanted each closed one.
+//
+// Defensive when self-referential or empty: returns ("", "") rather
+// than risk closing a thread on its own fresh first turn.
+func extractCodexForkSignal(headers http.Header) (string, string) {
+	if headers == nil {
+		return "", ""
+	}
+	meta := headers.Get("X-Codex-Turn-Metadata")
+	if meta == "" {
+		return "", ""
+	}
+	currentTid := strings.TrimSpace(gjson.Get(meta, "thread_id").String())
+	forkedFrom := strings.TrimSpace(gjson.Get(meta, "forked_from_thread_id").String())
+	if forkedFrom == "" {
+		return currentTid, ""
+	}
+	if forkedFrom == currentTid {
+		// A turn that claims to be forked from itself is malformed.
+		// Ignore the signal rather than close a still-active thread.
+		return currentTid, ""
+	}
+	return currentTid, forkedFrom
 }
 
 // ExtractSessionID extracts session identifier from multiple sources.
