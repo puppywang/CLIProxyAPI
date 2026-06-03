@@ -57,12 +57,13 @@ const (
 //
 // The zero value is not usable; call NewRefresher.
 type Refresher struct {
-	fetcher      coreauth.QuotaFetcher
-	lister       AuthLister
-	pusher       SnapshotPusher
-	staleCleaner StaleCooldownClearer
-	interval     time.Duration
-	concurrency  int
+	fetcher        coreauth.QuotaFetcher
+	lister         AuthLister
+	pusher         SnapshotPusher
+	staleCleaner   StaleCooldownClearer
+	limitReachedFn LimitReachedSetter
+	interval       time.Duration
+	concurrency    int
 
 	mu       sync.Mutex
 	backoffs map[string]*backoffState
@@ -92,6 +93,23 @@ type backoffState struct {
 // honour cancellation but not introduce their own timeouts beyond it.
 type StaleCooldownClearer func(ctx context.Context, authID string) error
 
+// LimitReachedSetter is the optional hook the refresher invokes when a
+// successful wham/usage fetch shows the auth's quota is exhausted —
+// either via the explicit limit_reached flag or the >=100% used_percent
+// saturation heuristic in parseWhamUsage. The cliproxy Service wires
+// this to coreauth.Manager.ForceCooldown so the auth gets pulled out
+// of rotation immediately, instead of waiting for the next user
+// request to hit an upstream 429 (which may not arrive at all — the
+// observed case was wham reporting secondary_used=100 while the
+// failure surfaced inside a model response body, not as a top-level
+// HTTP 429, so the conductor's existing 429 path never fired).
+//
+// Implementations should be idempotent: the hook fires on every
+// refresh tick while the auth is over the limit; a no-op when the
+// auth is already covered by an equivalent or longer cooldown is the
+// desired behaviour.
+type LimitReachedSetter func(ctx context.Context, authID string, snap coreauth.QuotaSnapshot) error
+
 // RefresherOption tunes a Refresher at construction. Use the WithX helpers
 // rather than poking the struct directly.
 type RefresherOption func(*Refresher)
@@ -103,6 +121,17 @@ type RefresherOption func(*Refresher)
 func WithStaleCooldownClearer(fn StaleCooldownClearer) RefresherOption {
 	return func(r *Refresher) {
 		r.staleCleaner = fn
+	}
+}
+
+// WithLimitReachedSetter registers the hook that auto-marks an auth as
+// cooled-down whenever a wham fetch reports limit_reached (including
+// the >=100% used_percent saturation case). Pass nil or omit the
+// option to disable this — the legacy behaviour was to wait for an
+// upstream 429 on the next user request to trigger the marker.
+func WithLimitReachedSetter(fn LimitReachedSetter) RefresherOption {
+	return func(r *Refresher) {
+		r.limitReachedFn = fn
 	}
 }
 
@@ -452,6 +481,21 @@ func (r *Refresher) refresh(ctx context.Context, a *coreauth.Auth, scheduleNext 
 		} else {
 			log.Infof("quota-refresher: cleared stale cooldown | auth=%s primary_used=%d%% secondary_used=%d%%",
 				a.ID, snap.UsedPercentPrimary, snap.UsedPercentSecondary)
+		}
+	}
+
+	// Auto-set: mirror of the above. When wham reports the auth is
+	// over its limit (explicit flag OR >=100% used_percent via the
+	// parseWhamUsage saturation heuristic), notify the manager so the
+	// auth gets a cooldown marker immediately — without this, the
+	// account stays in the candidate pool until a user request happens
+	// to hit it and the error surfaces as a top-level 429. In the
+	// observed wham-secondary=100% case the failure showed up inside
+	// a streamed response body, not as an HTTP 429, so the conductor's
+	// 429 path never fired and the account kept getting picked.
+	if snap.LimitReached && r.limitReachedFn != nil {
+		if errSet := r.limitReachedFn(ctx, a.ID, snap); errSet != nil {
+			log.WithError(errSet).Warnf("quota-refresher: limit-reached setter failed | auth=%s", a.ID)
 		}
 	}
 }
