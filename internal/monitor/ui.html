@@ -298,6 +298,17 @@
     color: var(--text-dim);
   }
   td.method-path { white-space: nowrap; }
+  .workspace-cell {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-dim);
+    display: inline-block;
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: middle;
+  }
   .proxy-line {
     font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 11px;
@@ -329,6 +340,296 @@
     font-size: 12px;
     color: var(--text-dim);
     letter-spacing: 0.02em;
+  }
+  .id-cell a.log-link {
+    color: inherit;
+    text-decoration: none;
+    border-bottom: 1px dotted rgba(255, 255, 255, 0.25);
+    cursor: pointer;
+  }
+  .id-cell a.log-link:hover {
+    color: #fff;
+    border-bottom-color: rgba(255, 255, 255, 0.6);
+  }
+  .id-cell a.log-link.log-link-active {
+    color: #fff;
+    border-bottom-style: solid;
+    border-bottom-color: rgba(255, 255, 255, 0.7);
+  }
+  .id-cell a.log-download {
+    /* Small download icon next to the ID. Inline-view is the
+       default click action on the ID itself; this icon is the
+       escape hatch for "I actually want the full file". */
+    color: rgba(255, 255, 255, 0.4);
+    text-decoration: none;
+    margin-left: 6px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .id-cell a.log-download:hover { color: #fff; }
+  /* Expanded log view row — appears beneath the error row when
+     the ID is clicked. */
+  tr.log-expand-row > td {
+    background: rgba(255, 255, 255, 0.02);
+    padding: 12px 16px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  .log-expand-block {
+    margin-bottom: 12px;
+  }
+  .log-expand-block:last-child { margin-bottom: 0; }
+  .log-expand-block .log-expand-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: rgba(255, 255, 255, 0.5);
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .log-expand-block .log-expand-title button {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    color: rgba(255, 255, 255, 0.6);
+    border-radius: 3px;
+    padding: 1px 6px;
+    font-size: 10px;
+    cursor: pointer;
+    line-height: 1.4;
+  }
+  .log-expand-block .log-expand-title button:hover {
+    color: #fff;
+    border-color: rgba(255, 255, 255, 0.35);
+  }
+  .log-expand-block pre {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin: 0;
+    max-height: 360px;
+    overflow: auto;
+    font-size: 11.5px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: rgba(255, 255, 255, 0.85);
+  }
+  .log-expand-empty {
+    color: rgba(255, 255, 255, 0.4);
+    font-style: italic;
+    font-size: 12px;
+  }
+  .binding-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 0;
+    font-size: 12px;
+  }
+  .binding-row code {
+    color: var(--text-dim);
+    font-size: 11px;
+  }
+  .kind-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border: 1px solid rgba(255,255,255,0.18);
+    color: rgba(255,255,255,0.6);
+  }
+  .kind-badge.kind-thread { color: #8fc6ff; border-color: rgba(143,198,255,0.35); }
+  .kind-badge.kind-window { color: #ffd66f; border-color: rgba(255,214,111,0.35); }
+  .kind-badge.kind-msg    { color: #c4a0ff; border-color: rgba(196,160,255,0.35); }
+  .kind-badge.closed      { color: #ff8a8a; border-color: rgba(255,138,138,0.35); }
+  .binding-row.binding-closed code { color: rgba(255,255,255,0.35); text-decoration: line-through; }
+  .binding-row.binding-closed .workspace-cell { color: rgba(255,255,255,0.35); }
+  .forked-arrow {
+    font-size: 11px;
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+  }
+  .windows-count {
+    font-weight: 500;
+  }
+  /* Codex account quota panel */
+  .quota-refresh-all {
+    margin-left: 12px;
+    padding: 2px 10px;
+    font-size: 11px;
+    background: rgba(143,198,255,0.12);
+    color: #8fc6ff;
+    border: 1px solid rgba(143,198,255,0.3);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .quota-refresh-all:hover { background: rgba(143,198,255,0.22); }
+  .quota-bar-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .quota-bar {
+    flex: 1;
+    height: 8px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .quota-bar-fill {
+    height: 100%;
+    transition: width 0.3s ease;
+  }
+  .quota-bar-healthy  { background: #6ad36a; }
+  .quota-bar-stressed { background: #f5c98a; }
+  .quota-bar-dead     { background: #ff8a8a; }
+  .quota-bar-label {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 12px;
+    color: rgba(255,255,255,0.7);
+    min-width: 38px;
+    text-align: right;
+  }
+  .status-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border: 1px solid;
+  }
+  .status-pill.active   { color: #6ad36a; border-color: rgba(106,211,106,0.35); background: rgba(106,211,106,0.08); }
+  .status-pill.limit    { color: #ff8a8a; border-color: rgba(255,138,138,0.35); background: rgba(255,138,138,0.08); }
+  .status-pill.unavail  { color: #f5c98a; border-color: rgba(245,201,138,0.35); background: rgba(245,201,138,0.08); }
+  .status-pill.disabled { color: rgba(255,255,255,0.4); border-color: rgba(255,255,255,0.15); background: rgba(255,255,255,0.03); }
+  .quota-refresh-btn,
+  .cooldown-force-btn {
+    background: transparent;
+    color: rgba(255,255,255,0.6);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 4px;
+    /* Override the global `button { padding: 7px 14px }` — without
+       this the icon button inflates to ~58px (28 width + 28 padding +
+       2 border) and overflows the 4% column, which is what made it
+       look like the buttons were drifting horizontally across rows. */
+    padding: 0;
+    box-sizing: border-box;
+    width: 28px;
+    height: 24px;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+  }
+  .cooldown-force-btn {
+    /* Visual cue: this is a destructive operator action, not just a
+       refresh. Reuse the same colour family as the cooldown-clear
+       button so the two manual cooldown controls feel related. */
+    color: #f5c98a;
+  }
+  .cooldown-force-btn:hover:not(:disabled) {
+    background: rgba(245,201,138,0.08);
+    border-color: rgba(245,201,138,0.35);
+  }
+  /* Cooldown panel */
+  #cooldownsSection table { table-layout: fixed; width: 100%; }
+  #cooldownsSection col.cc-account  { width: 22%; }
+  #cooldownsSection col.cc-status   { width: 16%; }
+  #cooldownsSection col.cc-auth     { width: 18%; }
+  #cooldownsSection col.cc-models   { width: 22%; }
+  #cooldownsSection col.cc-registry { width: 14%; }
+  #cooldownsSection col.cc-actions  { width: 8%; }
+  #cooldownsSection th:last-child,
+  #cooldownsSection td:last-child {
+    text-align: center;
+    padding-left: 0;
+    padding-right: 0;
+  }
+  .cooldown-msg {
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+  }
+  .cooldown-model-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    padding: 2px 0;
+    font-size: 12px;
+  }
+  .cooldown-model-row code {
+    color: rgba(255,255,255,0.85);
+    font-size: 11px;
+  }
+  .cooldown-clear-btn {
+    background: transparent;
+    color: #ff8a8a;
+    border: 1px solid rgba(255,138,138,0.35);
+    border-radius: 4px;
+    /* Same global-button-override story as .quota-refresh-btn. */
+    padding: 0 10px;
+    box-sizing: border-box;
+    height: 24px;
+    cursor: pointer;
+    font-size: 11px;
+    line-height: 22px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .cooldown-clear-btn:hover:not(:disabled) {
+    background: rgba(255,138,138,0.1);
+    color: #ffafaf;
+  }
+  .cooldown-clear-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+  /* Fixed-layout table with <colgroup> widths summing to exactly 100%.
+     Using <col> elements is more reliable than nth-child rules because
+     they apply at the column level, not per-cell — and they survive
+     subtle browser differences in how column widths get reconciled
+     when row content varies. The earlier 94%+56px scheme left 6% of
+     unallocated space that browsers distributed inconsistently across
+     rows, dragging the refresh button column horizontally by a few
+     pixels per row (visible on the first row with a wider STATUS pill
+     because that row "wins" the leftover-space allocation).
+     The accompanying .quota-bar-wrap loses its min-width so the bar
+     never forces its column wider than the colgroup says. */
+  #quotaSection table { table-layout: fixed; width: 100%; }
+  #quotaSection col.qc-account  { width: 28%; }
+  #quotaSection col.qc-status   { width: 12%; }
+  #quotaSection col.qc-bar      { width: 16%; }
+  #quotaSection col.qc-resets   { width: 14%; }
+  #quotaSection col.qc-fetched  { width: 10%; }
+  #quotaSection col.qc-actions  { width: 4%; }
+  #quotaSection th:last-child,
+  #quotaSection td:last-child {
+    text-align: center;
+    padding-left: 0;
+    padding-right: 0;
+  }
+  /* Account/email column needs ellipsis when content is wider than
+     the fixed column width — otherwise the cell visually overflows
+     and looks misaligned even though the column is correct. */
+  #quotaSection td:first-child,
+  #quotaSection td:first-child .muted {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .quota-refresh-btn:hover:not(:disabled) {
+    color: #fff;
+    border-color: rgba(255,255,255,0.4);
+  }
+  .quota-refresh-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
   }
   .duration, .bytes { font-variant-numeric: tabular-nums; color: var(--text-dim); }
   .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
@@ -412,6 +713,7 @@
           <th>Method / Path</th>
           <th>Model</th>
           <th>Window</th>
+          <th>Workspace</th>
           <th>Account</th>
           <th>Req → Resp</th>
           <th>Tokens</th>
@@ -425,8 +727,8 @@
   </div>
   <div id="empty" class="empty" hidden>No in-flight requests right now.</div>
 
-  <details class="history" id="errorsSection" hidden>
-    <summary>Recent errors (<span id="errorsCount">0</span>)</summary>
+  <details class="history" id="errorsSection">
+    <summary>Errors (<span id="errorsCount">0</span>)</summary>
     <div class="table-wrap">
       <table>
         <thead>
@@ -438,11 +740,90 @@
             <th>Path</th>
             <th>Model</th>
             <th>Window</th>
+            <th>Workspace</th>
             <th>Account</th>
             <th>Duration</th>
           </tr>
         </thead>
         <tbody id="errorsBody"></tbody>
+      </table>
+    </div>
+  </details>
+
+  <details class="history" id="cooldownsSection">
+    <summary>
+      Auth cooldowns (<span id="cooldownsCount">0</span>)
+      <button type="button" id="cooldownsRefreshBtn" class="quota-refresh-all" title="Refresh cooldown snapshot">Refresh</button>
+    </summary>
+    <div class="table-wrap">
+      <table>
+        <colgroup>
+          <col class="cc-account">
+          <col class="cc-status">
+          <col class="cc-auth">
+          <col class="cc-models">
+          <col class="cc-registry">
+          <col class="cc-actions">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>Account</th>
+            <th>Status</th>
+            <th>Auth cooldown</th>
+            <th>Model cooldowns</th>
+            <th>Registry suspended</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="cooldownsBody"></tbody>
+      </table>
+    </div>
+  </details>
+
+  <details class="history" id="quotaSection">
+    <summary>
+      Codex account quota (<span id="quotaCount">0</span>)
+      <button type="button" id="quotaRefreshAllBtn" class="quota-refresh-all" title="Refresh every codex account's wham/usage snapshot now">Refresh all</button>
+    </summary>
+    <div class="table-wrap">
+      <table>
+        <colgroup>
+          <col class="qc-account">
+          <col class="qc-status">
+          <col class="qc-bar">
+          <col class="qc-bar">
+          <col class="qc-resets">
+          <col class="qc-fetched">
+          <col class="qc-actions">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>Account</th>
+            <th>Status</th>
+            <th>5h window</th>
+            <th>Weekly window</th>
+            <th>Resets</th>
+            <th>Last fetched</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="quotaBody"></tbody>
+      </table>
+    </div>
+  </details>
+
+  <details class="history" id="bindingsSection">
+    <summary>Active bindings by account (<span id="bindingsCount">0</span>)</summary>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Account</th>
+            <th>Windows</th>
+            <th>Sessions</th>
+          </tr>
+        </thead>
+        <tbody id="bindingsBody"></tbody>
       </table>
     </div>
   </details>
@@ -566,6 +947,30 @@
     return sidLine + tidLine;
   }
 
+  // workspaceCell renders the trailing path segment(s) of the client's
+  // reported cwd with the full path on hover. The path can be long
+  // ("d:\AISports\sport-all-in-one\rtsp-h264-stitch") so we display only
+  // the last segment by default and fall back to the last two segments
+  // for very short trailing names (≤6 chars) so the cell still carries
+  // some signal. A wrapping title attribute exposes the full path.
+  function workspaceCell(e) {
+    const raw = e.workspace || '';
+    if (!raw) return '<span class="muted">—</span>';
+    const path = String(raw);
+    // Split on whichever separator the client used. Windows paths use
+    // backslash, POSIX uses forward slash; some clients mix both.
+    const parts = path.split(/[\\/]+/).filter(Boolean);
+    if (parts.length === 0) {
+      return '<span title="' + escapeAttr(path) + '">' + escapeHtml(path) + '</span>';
+    }
+    let label = parts[parts.length - 1];
+    if (label.length <= 6 && parts.length >= 2) {
+      label = parts[parts.length - 2] + '/' + label;
+    }
+    return '<span class="workspace-cell" title="' + escapeAttr(path) + '">' +
+      escapeHtml(label) + '</span>';
+  }
+
   function methodCell(e) {
     let pill;
     if (e.transport === 'ws') {
@@ -638,6 +1043,7 @@
       <td class="cell-method method-path"></td>
       <td class="cell-model"></td>
       <td class="cell-window"></td>
+      <td class="cell-workspace"></td>
       <td class="cell-account"></td>
       <td class="cell-bytes bytes"></td>
       <td class="cell-tokens bytes"></td>
@@ -648,18 +1054,19 @@
     const row = {
       tr,
       cells: {
-        id:       tr.querySelector('.cell-id'),
-        started:  tr.querySelector('.cell-started'),
-        duration: tr.querySelector('.cell-duration'),
-        method:   tr.querySelector('.cell-method'),
-        model:    tr.querySelector('.cell-model'),
-        window:   tr.querySelector('.cell-window'),
-        account:  tr.querySelector('.cell-account'),
-        bytes:    tr.querySelector('.cell-bytes'),
-        tokens:   tr.querySelector('.cell-tokens'),
-        status:   tr.querySelector('.cell-status'),
-        client:   tr.querySelector('.cell-client'),
-        action:   tr.querySelector('.cell-action'),
+        id:        tr.querySelector('.cell-id'),
+        started:   tr.querySelector('.cell-started'),
+        duration:  tr.querySelector('.cell-duration'),
+        method:    tr.querySelector('.cell-method'),
+        model:     tr.querySelector('.cell-model'),
+        window:    tr.querySelector('.cell-window'),
+        workspace: tr.querySelector('.cell-workspace'),
+        account:   tr.querySelector('.cell-account'),
+        bytes:     tr.querySelector('.cell-bytes'),
+        tokens:    tr.querySelector('.cell-tokens'),
+        status:    tr.querySelector('.cell-status'),
+        client:    tr.querySelector('.cell-client'),
+        action:    tr.querySelector('.cell-action'),
       },
       // Per-cell last-rendered cache, so we skip DOM writes when content
       // hasn't changed. Keeps the duration tick (every 1s) cheap and
@@ -714,6 +1121,7 @@
     setHTML(row.cells.method, methodCell(e), cache, 'method');
     setHTML(row.cells.model,  escapeHtml(e.model || ''), cache, 'model');
     setHTML(row.cells.window, windowCell(e), cache, 'window');
+    setHTML(row.cells.workspace, workspaceCell(e), cache, 'workspace');
     const providerLine = escapeHtml(e.provider || '');
     const proxyLine = e.auth_proxy ? '<div class="muted proxy-line">' + escapeHtml(e.auth_proxy) + '</div>' : '';
     setHTML(row.cells.account,
@@ -820,6 +1228,171 @@
     }
     return res;
   }
+
+  // downloadLog fetches the full request log file for a tracked request and
+  // triggers a browser download. We cannot use a plain <a download href=...>
+  // because the management endpoint requires the Authorization header that
+  // apiFetch attaches; an <a> click would skip that header. So we pull the
+  // file through fetch, build an object-URL blob, and click a synthetic <a>.
+  async function downloadLog(id) {
+    if (!id) return;
+    try {
+      const res = await apiFetch('/v0/management/request-log-by-id/' + encodeURIComponent(id));
+      const blob = await res.blob();
+      const cd = res.headers.get('content-disposition') || '';
+      const m = cd.match(/filename="?([^";]+)"?/);
+      const filename = (m && m[1]) || ('request-log-' + id + '.log');
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Free the blob URL after the click handler returns. setTimeout
+      // gives the download dialog enough time to grab the source.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      setStatus('log download failed: ' + (err && err.message ? err.message : err), true);
+    }
+  }
+
+  // Cache of parsed log content per request ID, so re-expanding the
+  // same row doesn't re-fetch. Cleared when the row is removed from
+  // the DOM (caller's responsibility); for our errors table the rows
+  // are recycled by key so this map can grow up to ~50 entries.
+  const logExtractCache = new Map();
+
+  // extractLogSections splits a request log file into the
+  // `=== SECTION NAME ===` blocks the request logger writes. Returns
+  // an object keyed by section name (e.g. "API RESPONSE", "RESPONSE")
+  // with each value being the section body (trailing newline trimmed).
+  // Used to surface just the "what did upstream say" + "what did we
+  // forward to the client" sections in the errors panel without
+  // requiring the operator to download and open the whole file.
+  function extractLogSections(text) {
+    const out = Object.create(null);
+    if (!text) return out;
+    const lines = String(text).split('\n');
+    let currentName = null;
+    let buf = [];
+    const flush = () => {
+      if (currentName === null) return;
+      // Drop trailing blanks so the rendered <pre> doesn't have a
+      // big gap before the next section header.
+      while (buf.length && buf[buf.length - 1] === '') buf.pop();
+      out[currentName] = buf.join('\n');
+    };
+    for (const line of lines) {
+      const m = /^=== (.+?) ===\s*$/.exec(line);
+      if (m) {
+        flush();
+        currentName = m[1];
+        buf = [];
+      } else if (currentName !== null) {
+        buf.push(line);
+      }
+    }
+    flush();
+    return out;
+  }
+
+  // toggleLogView fetches (or reuses) the log and shows the API
+  // RESPONSE + RESPONSE sections in an expander row beneath the
+  // clicked one. Clicking the same ID again collapses the row.
+  async function toggleLogView(id, linkEl) {
+    if (!id || !linkEl) return;
+    const parentRow = linkEl.closest('tr');
+    if (!parentRow) return;
+    const existing = parentRow.nextElementSibling;
+    if (existing && existing.classList && existing.classList.contains('log-expand-row') && existing.dataset.forId === id) {
+      existing.remove();
+      linkEl.classList.remove('log-link-active');
+      return;
+    }
+    // Close any other open expanders so we don't accumulate them.
+    document.querySelectorAll('tr.log-expand-row').forEach(r => r.remove());
+    document.querySelectorAll('.log-link-active').forEach(a => a.classList.remove('log-link-active'));
+
+    const colSpan = parentRow.children.length || 10;
+    const row = document.createElement('tr');
+    row.className = 'log-expand-row';
+    row.dataset.forId = id;
+    const cell = document.createElement('td');
+    cell.colSpan = colSpan;
+    cell.innerHTML = '<span class="log-expand-empty">loading…</span>';
+    row.appendChild(cell);
+    parentRow.parentNode.insertBefore(row, parentRow.nextSibling);
+    linkEl.classList.add('log-link-active');
+
+    let sections;
+    if (logExtractCache.has(id)) {
+      sections = logExtractCache.get(id);
+    } else {
+      try {
+        const res = await apiFetch('/v0/management/request-log-by-id/' + encodeURIComponent(id));
+        const text = await res.text();
+        sections = extractLogSections(text);
+        logExtractCache.set(id, sections);
+      } catch (err) {
+        cell.innerHTML = '<span class="log-expand-empty">failed to load: ' + escapeHtml(String(err && err.message ? err.message : err)) + '</span>';
+        return;
+      }
+    }
+    // Render the two sections the operator actually cares about.
+    // Show empty placeholders for missing sections so the layout
+    // doesn't shift when one is present and the other isn't.
+    const wanted = ['API RESPONSE', 'RESPONSE'];
+    cell.innerHTML = '';
+    for (const name of wanted) {
+      const body = sections[name];
+      const block = document.createElement('div');
+      block.className = 'log-expand-block';
+      const title = document.createElement('div');
+      title.className = 'log-expand-title';
+      title.appendChild(document.createTextNode('=== ' + name + ' ==='));
+      if (body) {
+        const copyBtn = document.createElement('button');
+        copyBtn.type = 'button';
+        copyBtn.textContent = 'Copy';
+        copyBtn.addEventListener('click', () => {
+          navigator.clipboard.writeText(body).then(
+            () => { copyBtn.textContent = 'Copied'; setTimeout(() => copyBtn.textContent = 'Copy', 1200); },
+            () => { copyBtn.textContent = 'failed'; }
+          );
+        });
+        title.appendChild(copyBtn);
+      }
+      block.appendChild(title);
+      if (body) {
+        const pre = document.createElement('pre');
+        pre.textContent = body;
+        block.appendChild(pre);
+      } else {
+        const placeholder = document.createElement('div');
+        placeholder.className = 'log-expand-empty';
+        placeholder.textContent = '(section not present in log)';
+        block.appendChild(placeholder);
+      }
+      cell.appendChild(block);
+    }
+  }
+
+  // One document-level delegation handles every .log-link and
+  // .log-download, including ones we inject later via innerHTML
+  // rebuilds of the errors table.
+  document.addEventListener('click', (ev) => {
+    const download = ev.target.closest('a.log-download');
+    if (download) {
+      ev.preventDefault();
+      downloadLog(download.dataset.id);
+      return;
+    }
+    const link = ev.target.closest('a.log-link');
+    if (!link) return;
+    ev.preventDefault();
+    toggleLogView(link.dataset.id, link);
+  });
 
   async function refresh() {
     try {
@@ -967,7 +1540,11 @@
       noteServerNow(data.now);
       const records = data.records || [];
       $('errorsCount').textContent = records.length;
-      $('errorsSection').hidden = records.length === 0;
+      // Always keep the Recent Errors panel visible — matches Recent
+      // cancellations' behaviour and gives operators a stable anchor
+      // even when there are zero errors right now. The collapse/expand
+      // is via <details>, controlled by the user, not by record count.
+      $('errorsSection').hidden = false;
       const body = $('errorsBody');
       const seen = new Set();
 
@@ -985,12 +1562,13 @@
         tr.classList.add('transport-' + (e.transport === 'ws' ? 'ws' : 'http'));
         tr.innerHTML = `
           <td><div class="hist-ago"></div><div class="muted">${fmtStarted(r.recorded_at)}</div></td>
-          <td class="id-cell">${escapeHtml(e.id || '')}</td>
+          <td class="id-cell">${e.id ? `<a href="#" class="log-link" data-id="${escapeAttr(e.id)}" title="Click to view API RESPONSE and RESPONSE sections inline">${escapeHtml(e.id)}</a><a href="#" class="log-download" data-id="${escapeAttr(e.id)}" title="Download full request/response log file">⬇</a>` : ''}</td>
           <td><span class="reason-pill ${escapeAttr(reasonClass)}">${escapeHtml(r.reason || '')}</span></td>
           <td>${r.status_code ? escapeHtml(String(r.status_code)) : '<span class="muted">—</span>'}</td>
           <td class="method-path">${methodCell(e)}</td>
           <td>${escapeHtml(e.model || '')}</td>
           <td>${windowCell(e)}</td>
+          <td>${workspaceCell(e)}</td>
           <td>${escapeHtml(e.auth_label || e.auth_id || '')}<div class="muted">${escapeHtml(e.provider || '')}</div></td>
           <td class="duration">${fmtDuration(durMs)}</td>
         `;
@@ -1000,6 +1578,13 @@
 
       for (const [key, h] of errorRows) {
         if (!seen.has(key)) {
+          // Also drop the inline log-view expander row (if any) so
+          // it doesn't get orphaned in the DOM after its parent row
+          // disappears.
+          const expander = h.tr.nextElementSibling;
+          if (expander && expander.classList && expander.classList.contains('log-expand-row')) {
+            expander.remove();
+          }
           h.tr.remove();
           errorRows.delete(key);
           continue;
@@ -1014,6 +1599,480 @@
     } catch (err) {
       // best-effort; don't override main status line
     }
+  }
+
+  // Bindings reverse-index panel. Each row groups all cache entries
+  // bound to one auth, with thread+window pairs of the same UUID
+  // folded into a single Sessions sub-entry (kind="both"). The view
+  // is server-side sorted: most-loaded accounts first, sessions by
+  // most-recent expires_at.
+  async function loadBindings() {
+    try {
+      const res = await apiFetch('/v0/management/session-affinity/bindings');
+      const data = await res.json();
+      noteServerNow(data.now);
+      const accounts = data.accounts || [];
+      const activeTotal = accounts.reduce((s, a) => s + (a.active_count || 0), 0);
+      const closedTotal = accounts.reduce((s, a) => s + (a.closed_count || 0), 0);
+      // Always render "N active" so the label is visible from a cold
+      // start; append the closed breakdown only when at least one
+      // fork-close has been recorded.
+      $('bindingsCount').textContent = closedTotal > 0
+        ? activeTotal + ' active + ' + closedTotal + ' closed'
+        : activeTotal + ' active';
+      const body = $('bindingsBody');
+      body.innerHTML = '';
+      for (const a of accounts) {
+        const tr = document.createElement('tr');
+        const accountLabel = escapeHtml(a.auth_label || a.auth_id);
+        const provider = a.provider ? '<div class="muted">' + escapeHtml(a.provider) + '</div>' : '';
+        const sessionsHtml = (a.windows || []).map(w => {
+          const wsCell = w.workspace
+            ? '<span class="workspace-cell" title="' + escapeAttr(w.workspace) + '">' + escapeHtml(shortWorkspace(w.workspace)) + '</span>'
+            : '<span class="muted">—</span>';
+          const uuidShort = (w.uuid || '').slice(0, 13);
+          const kindBadge = w.kind === 'both'
+            ? ''
+            : '<span class="kind-badge kind-' + escapeAttr(w.kind || 'other') + '">' + escapeHtml(w.kind || '') + '</span>';
+          const closedSuffix = w.closed
+            ? '<span class="kind-badge closed">closed</span>' +
+              (w.forked_to ? '<span class="muted forked-arrow">→ ' + escapeHtml((w.forked_to || '').slice(0, 13)) + '…</span>' : '')
+            : '';
+          const rowClass = w.closed ? 'binding-row binding-closed' : 'binding-row';
+          return '<div class="' + rowClass + '" title="' + escapeAttr(w.uuid) + '"><code>' + escapeHtml(uuidShort) + '…</code>' + kindBadge + closedSuffix + ' ' + wsCell + '</div>';
+        }).join('');
+        // Always show "X active" so operators can see the field name even
+        // when no closed bindings exist yet — appending "+ Y closed" only
+        // when at least one fork has been observed. Earlier this column
+        // collapsed to a plain number when closed_count==0, which read as
+        // "where is the active/closed split" until a fork actually fired.
+        const activeCount = a.active_count != null ? a.active_count : (a.windows_count || 0);
+        const closedCount = a.closed_count || 0;
+        let windowsCell = '<span class="windows-count">' + activeCount + ' active</span>';
+        if (closedCount > 0) {
+          windowsCell += ' <span class="muted">+ ' + closedCount + ' closed</span>';
+        }
+        tr.innerHTML =
+          '<td>' + accountLabel + provider + '</td>' +
+          '<td>' + windowsCell + '</td>' +
+          '<td>' + (sessionsHtml || '<span class="muted">—</span>') + '</td>';
+        body.appendChild(tr);
+      }
+    } catch (err) {
+      // best-effort
+    }
+  }
+
+  // Auth cooldowns panel. Reads /v0/management/auth-cooldowns and
+  // shows only accounts that currently have a cooldown marker (either
+  // on the Auth-level Quota / NextRetryAfter / Unavailable, on any
+  // per-model state, or in the model_registry's suspended-clients
+  // map). The Clear button calls /v0/management/auth-cooldowns/:id/clear
+  // which wipes every transient marker on the auth — used when the
+  // operator knows upstream has recovered and the cached cooldown is
+  // just stale.
+  let cooldownsInflight = false;
+  async function loadCooldowns() {
+    if (cooldownsInflight) return;
+    cooldownsInflight = true;
+    try {
+      const res = await apiFetch('/v0/management/auth-cooldowns');
+      const data = await res.json();
+      noteServerNow(data.now);
+      const accounts = data.accounts || [];
+      $('cooldownsCount').textContent = String(accounts.length);
+      const body = $('cooldownsBody');
+      body.innerHTML = '';
+      for (const a of accounts) {
+        body.appendChild(renderCooldownRow(a));
+      }
+    } catch (err) {
+      // best-effort
+    } finally {
+      cooldownsInflight = false;
+    }
+  }
+
+  function renderCooldownRow(a) {
+    const tr = document.createElement('tr');
+    tr.dataset.authId = a.auth_id;
+    const label = escapeHtml(a.auth_label || a.email || a.auth_id);
+    const sub = a.email ? '<div class="muted">' + escapeHtml(a.email) + '</div>' : '';
+
+    let statusPill;
+    if (a.disabled) statusPill = '<span class="status-pill disabled">disabled</span>';
+    else if (a.status === 'error') statusPill = '<span class="status-pill unavail">error</span>';
+    else statusPill = '<span class="status-pill active">' + escapeHtml(a.status || 'active') + '</span>';
+    const statusMsg = a.status_message ? '<div class="muted cooldown-msg" title="' + escapeAttr(a.status_message) + '">' + escapeHtml(truncate(a.status_message, 60)) + '</div>' : '';
+
+    const auth = a.auth || {};
+    const authParts = [];
+    if (auth.unavailable) authParts.push('<span class="kind-badge closed">unavail</span>');
+    if (auth.quota_exceeded) {
+      const recover = validTime(auth.quota_recover_at) ? ' until ' + fmtResetWhen(auth.quota_recover_at) : '';
+      authParts.push('<div>quota' + (auth.quota_reason ? ' (' + escapeHtml(auth.quota_reason) + ')' : '') + recover + '</div>');
+    }
+    if (validTime(auth.next_retry_after) && !auth.quota_exceeded) {
+      authParts.push('<div>retry ' + fmtResetWhen(auth.next_retry_after) + '</div>');
+    }
+    if (auth.quota_backoff_level) authParts.push('<div class="muted">backoff lvl ' + auth.quota_backoff_level + '</div>');
+    const authCell = authParts.length ? authParts.join('') : '<span class="muted">—</span>';
+
+    const models = a.models || [];
+    let modelsCell;
+    if (models.length === 0) {
+      modelsCell = '<span class="muted">—</span>';
+    } else {
+      modelsCell = models.map(m => {
+        const bits = [];
+        bits.push('<code>' + escapeHtml(m.model) + '</code>');
+        if (m.quota_exceeded) {
+          const recover = validTime(m.quota_recover_at) ? ' until ' + fmtResetWhen(m.quota_recover_at) : '';
+          bits.push('<span class="kind-badge closed">quota</span>' + recover);
+        } else if (validTime(m.next_retry_after)) {
+          bits.push('<span class="muted">retry ' + fmtResetWhen(m.next_retry_after) + '</span>');
+        } else if (m.unavailable) {
+          bits.push('<span class="kind-badge closed">unavail</span>');
+        }
+        return '<div class="cooldown-model-row">' + bits.join(' ') + '</div>';
+      }).join('');
+    }
+
+    const regSuspended = a.registry_suspended_models || [];
+    const regCell = regSuspended.length
+      ? regSuspended.map(m => '<code>' + escapeHtml(m) + '</code>').join(' ')
+      : '<span class="muted">—</span>';
+
+    const clearBtn = a.disabled
+      ? '<button type="button" class="quota-refresh-btn" disabled title="account disabled — un-disable via auth-files API first">×</button>'
+      : '<button type="button" class="cooldown-clear-btn" data-cooldown-clear="' + escapeAttr(a.auth_id) + '" title="Clear all cooldown markers for this account">Clear</button>';
+
+    tr.innerHTML =
+      '<td>' + label + sub + '</td>' +
+      '<td>' + statusPill + statusMsg + '</td>' +
+      '<td>' + authCell + '</td>' +
+      '<td>' + modelsCell + '</td>' +
+      '<td>' + regCell + '</td>' +
+      '<td>' + clearBtn + '</td>';
+    return tr;
+  }
+
+  function truncate(s, max) {
+    s = String(s || '');
+    return s.length <= max ? s : s.slice(0, max - 1) + '…';
+  }
+
+  async function clearOneCooldown(authID, btnEl) {
+    if (!authID) return;
+    const original = btnEl ? btnEl.textContent : '';
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = '…'; }
+    try {
+      await apiFetch('/v0/management/auth-cooldowns/' + encodeURIComponent(authID) + '/clear', { method: 'POST' });
+      // Re-render the whole panel so cleared rows that no longer have
+      // any cooldown markers fall off the list naturally.
+      await loadCooldowns();
+      setStatus('cleared cooldown for ' + authID);
+    } catch (err) {
+      setStatus('cooldown clear failed: ' + (err && err.message ? err.message : err), true);
+    } finally {
+      if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = original || 'Clear'; }
+    }
+  }
+
+  document.addEventListener('click', (ev) => {
+    const refreshBtn = ev.target.closest('#cooldownsRefreshBtn');
+    if (refreshBtn) { ev.preventDefault(); loadCooldowns(); return; }
+    const clearBtn = ev.target.closest('button[data-cooldown-clear]');
+    if (clearBtn) {
+      ev.preventDefault();
+      clearOneCooldown(clearBtn.getAttribute('data-cooldown-clear'), clearBtn);
+    }
+  });
+
+  // Codex account quota panel. Reads /v0/management/auth-files which
+  // now ships a `quota` field populated by the LeastRemainingQuotaSelector
+  // cache — the same data the refresher writes every 10 min. Per-row
+  // Refresh button calls /v0/management/quota-refresh/:id to drive an
+  // immediate wham/usage fetch without waiting for the next periodic
+  // tick. Row-keyed cache so partial updates don't flash the entire
+  // table on every poll.
+  const quotaRows = new Map();
+  let quotaInflight = false;
+
+  async function loadAccountQuota() {
+    if (quotaInflight) return;
+    quotaInflight = true;
+    try {
+      const res = await apiFetch('/v0/management/auth-files');
+      const data = await res.json();
+      noteServerNow(data.now);
+      const files = (data.files || []).filter(a => (a.type || a.provider || '').toLowerCase() === 'codex');
+      $('quotaCount').textContent = String(files.length);
+      const body = $('quotaBody');
+      const seen = new Set();
+      // Ordering buckets, top to bottom:
+      //   1. ACTIVE + limit_reached   (needs attention NOW)
+      //   2. ACTIVE + other           (sorted by used_percent desc so
+      //                                close-to-cap accounts surface
+      //                                before fresh 0% ones)
+      //   3. DISABLED                 (always at the bottom — admin
+      //                                action, never relevant for live
+      //                                routing)
+      // The earlier sort didn't separate disabled from active, so a
+      // healthy 0%-used ACTIVE account would land below DISABLED
+      // accounts that happened to have alphabetically-earlier IDs —
+      // the user reported watanabe.rei (ACTIVE, just re-logged in)
+      // showing up below puppywang/suzuki_kenji (both DISABLED). The
+      // disabled-bucket rule fixes that regardless of quota numbers.
+      files.sort((x, y) => {
+        if (x.disabled !== y.disabled) return x.disabled ? 1 : -1;
+        const xq = x.quota || {}, yq = y.quota || {};
+        const xLimit = !!xq.limit_reached, yLimit = !!yq.limit_reached;
+        if (xLimit !== yLimit) return xLimit ? -1 : 1;
+        const xp = xq.used_percent_primary || 0;
+        const yp = yq.used_percent_primary || 0;
+        if (xp !== yp) return yp - xp;
+        return String(x.id).localeCompare(String(y.id));
+      });
+      body.innerHTML = '';
+      for (const a of files) {
+        seen.add(a.id);
+        const tr = renderQuotaRow(a);
+        body.appendChild(tr);
+        quotaRows.set(a.id, tr);
+      }
+      for (const id of [...quotaRows.keys()]) {
+        if (!seen.has(id)) quotaRows.delete(id);
+      }
+    } catch (err) {
+      // best-effort
+    } finally {
+      quotaInflight = false;
+    }
+  }
+
+  function renderQuotaRow(a) {
+    const tr = document.createElement('tr');
+    tr.dataset.authId = a.id;
+    const label = escapeHtml(a.label || a.email || a.name || a.id);
+    const sub = a.email ? '<div class="muted">' + escapeHtml(a.email) + '</div>' : '';
+    const q = a.quota || null;
+
+    let statusPill;
+    if (a.disabled) statusPill = '<span class="status-pill disabled">disabled</span>';
+    else if (q && q.limit_reached) statusPill = '<span class="status-pill limit">limit_reached</span>';
+    else if (a.unavailable) statusPill = '<span class="status-pill unavail">unavailable</span>';
+    else statusPill = '<span class="status-pill active">active</span>';
+
+    const primaryCell = q ? quotaBarCell(q.used_percent_primary) : '<span class="muted">—</span>';
+    const secondaryCell = q ? quotaBarCell(q.used_percent_secondary) : '<span class="muted">—</span>';
+
+    let resetsCell = '<span class="muted">—</span>';
+    if (q && (validTime(q.reset_at_primary) || validTime(q.reset_at_secondary))) {
+      const parts = [];
+      if (validTime(q.reset_at_primary)) parts.push('5h ' + fmtResetWhen(q.reset_at_primary));
+      if (validTime(q.reset_at_secondary)) parts.push('7d ' + fmtResetWhen(q.reset_at_secondary));
+      resetsCell = parts.join('<br>');
+    }
+    const fetchedCell = q && validTime(q.fetched_at)
+      ? '<span title="' + escapeAttr(q.fetched_at) + '">' + escapeHtml(fmtAgo(q.fetched_at)) + '</span>'
+      : '<span class="muted">—</span>';
+    let actions;
+    if (a.disabled) {
+      actions =
+        '<button type="button" class="quota-refresh-btn" disabled title="auth disabled">↻</button>' +
+        '<button type="button" class="cooldown-force-btn" disabled title="auth disabled">⏸</button>';
+    } else {
+      actions =
+        '<button type="button" class="quota-refresh-btn" data-quota-refresh="' + escapeAttr(a.id) + '" title="Refresh wham/usage for this account">↻</button>' +
+        ' ' +
+        '<button type="button" class="cooldown-force-btn" data-cooldown-force="' + escapeAttr(a.id) + '" title="Force this account into cooldown (use when wham/usage is returning wrong data)">⏸</button>';
+    }
+
+    tr.innerHTML =
+      '<td>' + label + sub + '</td>' +
+      '<td>' + statusPill + '</td>' +
+      '<td>' + primaryCell + '</td>' +
+      '<td>' + secondaryCell + '</td>' +
+      '<td>' + resetsCell + '</td>' +
+      '<td>' + fetchedCell + '</td>' +
+      '<td>' + actions + '</td>';
+    return tr;
+  }
+
+  // Render a used% as a small horizontal bar + numeric label. Colour
+  // thresholds match the LeastRemainingQuotaSelector tier boundaries
+  // (healthy < 50, stressed < 90, dead >= 90) so the bar visually maps
+  // to selector behaviour.
+  function quotaBarCell(percent) {
+    const p = Math.max(0, Math.min(100, Number(percent) || 0));
+    let tier = 'healthy';
+    if (p >= 90) tier = 'dead';
+    else if (p >= 50) tier = 'stressed';
+    return '<div class="quota-bar-wrap">' +
+      '<div class="quota-bar"><div class="quota-bar-fill quota-bar-' + tier + '" style="width:' + p + '%"></div></div>' +
+      '<span class="quota-bar-label">' + p + '%</span>' +
+      '</div>';
+  }
+
+  // True only for ISO timestamps that represent a real moment. Go's
+  // json.Marshal serialises the zero time.Time as "0001-01-01T00:00:00Z"
+  // — that string is truthy in JS but mathematically meaningless. We
+  // already moved the cooldown handler to *time.Time pointers so the
+  // field is omitted from JSON when zero, but this helper is the
+  // belt-and-suspenders for any other endpoint that hasn't migrated
+  // yet (and for defensive coding when the field can be reused via
+  // copy/paste).
+  function validTime(iso) {
+    if (!iso) return false;
+    if (iso === '0001-01-01T00:00:00Z') return false;
+    if (typeof iso === 'string' && iso.startsWith('0001-')) return false;
+    return true;
+  }
+
+  // Compact "in X" / "X ago" label for a reset timestamp.
+  function fmtResetWhen(iso) {
+    const t = new Date(iso).getTime();
+    if (!isFinite(t)) return escapeHtml(iso);
+    const now = Date.now();
+    const delta = t - now;
+    const abs = Math.abs(delta);
+    let label;
+    if (abs < 60_000) label = '<1 min';
+    else if (abs < 3600_000) label = Math.round(abs / 60_000) + 'm';
+    else if (abs < 86400_000) label = Math.floor(abs / 3600_000) + 'h ' + Math.round((abs % 3600_000) / 60_000) + 'm';
+    else label = Math.floor(abs / 86400_000) + 'd';
+    return delta >= 0 ? 'in ' + label : label + ' ago';
+  }
+
+  // Per-row refresh — drives one wham/usage fetch synchronously, then
+  // reloads the WHOLE panel so the row settles into the right sort
+  // bucket if its disabled / limit_reached / used_percent changed.
+  // The earlier "patch only this row" path could leave an account
+  // visually mis-sorted (e.g., refreshing a row whose state flipped
+  // disabled → active wouldn't move it out of the bottom bucket
+  // until the next 10s tick). Always-reload is the simpler invariant
+  // and the wham round-trip already cost ~400ms; one extra
+  // /auth-files request is negligible on top.
+  async function refreshOneQuota(authID, btnEl) {
+    if (!authID) return;
+    const originalText = btnEl ? btnEl.textContent : '';
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = '…'; }
+    try {
+      await apiFetch('/v0/management/quota-refresh/' + encodeURIComponent(authID), { method: 'POST' });
+      await loadAccountQuota();
+    } catch (err) {
+      setStatus('quota refresh failed: ' + (err && err.message ? err.message : err), true);
+    } finally {
+      if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || '↻'; }
+    }
+  }
+
+  // Manual cooldown — operator-driven entry point for the case where
+  // wham/usage returns wrong data (claims 100% available on an
+  // account that has actually exhausted its quota) and the auth
+  // needs to be taken out of rotation by hand. Prompts for either an
+  // hour count ("5", "5h", "2.5h") or a datetime-local string, then
+  // POSTs to /auth-cooldowns/:id/force. The backend marks the
+  // cooldown with reason="manual" so the refresher's auto-recovery
+  // refuses to clear it until the chosen deadline has passed.
+  async function forceCooldownOne(authID, btnEl) {
+    if (!authID) return;
+    const raw = window.prompt(
+      'Force cooldown ' + authID + ' until:\n' +
+      '  • a duration like "5h" or "90m" (relative)\n' +
+      '  • a datetime like "2026-06-03T22:00" (absolute, local time)',
+      '5h'
+    );
+    if (raw === null) return;
+    const trimmed = String(raw).trim();
+    if (!trimmed) return;
+    const payload = parseForceCooldownInput(trimmed);
+    if (!payload) {
+      setStatus('force cooldown: could not parse "' + trimmed + '" (expected "5h" / "90m" / "2026-06-03T22:00")', true);
+      return;
+    }
+    const originalText = btnEl ? btnEl.textContent : '';
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = '…'; }
+    try {
+      await apiFetch('/v0/management/auth-cooldowns/' + encodeURIComponent(authID) + '/force', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      setStatus('forced cooldown for ' + authID);
+      // Refresh both panels — quota panel for the new status, cooldowns
+      // panel so the new row shows up immediately.
+      await loadAccountQuota();
+      if (typeof loadCooldowns === 'function') await loadCooldowns();
+    } catch (err) {
+      setStatus('force cooldown failed: ' + (err && err.message ? err.message : err), true);
+    } finally {
+      if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || '⏸'; }
+    }
+  }
+
+  // parseForceCooldownInput accepts the same strings the prompt
+  // suggests. Returns null when the input is unparseable.
+  function parseForceCooldownInput(s) {
+    // Relative: "5h", "90m", "2.5h", "3600s", or bare number (= hours).
+    const rel = /^(\d+(?:\.\d+)?)\s*(h|hr|hour|hours|m|min|minutes|s|sec|seconds)?$/i.exec(s);
+    if (rel) {
+      const n = parseFloat(rel[1]);
+      const unit = (rel[2] || 'h').toLowerCase();
+      let seconds;
+      if (unit.startsWith('h')) seconds = Math.round(n * 3600);
+      else if (unit.startsWith('m')) seconds = Math.round(n * 60);
+      else seconds = Math.round(n);
+      if (!isFinite(seconds) || seconds <= 0) return null;
+      return { duration_seconds: seconds };
+    }
+    // Absolute: anything Date can parse. datetime-local (no zone) is
+    // treated as the operator's local time, which Date() handles.
+    const parsed = Date.parse(s);
+    if (!isNaN(parsed)) {
+      if (parsed <= Date.now()) return null;
+      return { until: new Date(parsed).toISOString() };
+    }
+    return null;
+  }
+
+  // Delegated click handlers for the quota panel.
+  document.addEventListener('click', (ev) => {
+    const refreshAll = ev.target.closest('#quotaRefreshAllBtn');
+    if (refreshAll) {
+      ev.preventDefault();
+      // Pull the latest snapshot — the periodic refresher already does
+      // wham/usage in the background, so "refresh all" just re-fetches
+      // /auth-files. Per-row refresh is the one that actually triggers
+      // an inline fetch.
+      loadAccountQuota();
+      return;
+    }
+    const oneBtn = ev.target.closest('button[data-quota-refresh]');
+    if (oneBtn) {
+      ev.preventDefault();
+      refreshOneQuota(oneBtn.getAttribute('data-quota-refresh'), oneBtn);
+      return;
+    }
+    const forceBtn = ev.target.closest('button[data-cooldown-force]');
+    if (forceBtn) {
+      ev.preventDefault();
+      forceCooldownOne(forceBtn.getAttribute('data-cooldown-force'), forceBtn);
+    }
+  });
+
+  // Reused trailing-segment formatter so the bindings panel shows the
+  // same short workspace label the active-row workspace column uses.
+  function shortWorkspace(raw) {
+    if (!raw) return '';
+    const parts = String(raw).split(/[\\/]+/).filter(Boolean);
+    if (parts.length === 0) return raw;
+    let label = parts[parts.length - 1];
+    if (label.length <= 6 && parts.length >= 2) {
+      label = parts[parts.length - 2] + '/' + label;
+    }
+    return label;
   }
 
   function connect() {
@@ -1051,10 +2110,13 @@
     loadSettings();
     loadHistory();
     loadRecentErrors();
+    loadBindings();
+    loadAccountQuota();
+    loadCooldowns();
   }
 
   $('connectBtn').addEventListener('click', connect);
-  $('refreshBtn').addEventListener('click', () => { refresh(); loadHistory(); loadRecentErrors(); });
+  $('refreshBtn').addEventListener('click', () => { refresh(); loadHistory(); loadRecentErrors(); loadBindings(); loadAccountQuota(); loadCooldowns(); });
   $('saveSettingsBtn').addEventListener('click', saveSettings);
   tbody.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-cancel]');
@@ -1083,6 +2145,9 @@
     refresh();
     loadHistory();
     loadRecentErrors();
+    loadBindings();
+    loadAccountQuota();
+    loadCooldowns();
   }, 10000);
 
   // Live-update the duration column even when no events arrive.
