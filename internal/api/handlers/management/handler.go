@@ -56,7 +56,48 @@ type Handler struct {
 	pluginStoreHTTPClient  pluginstore.HTTPDoer
 	pluginReleaseCacheMu   sync.Mutex
 	pluginReleaseCache     map[string]pluginReleaseCacheEntry
+
+	// Quota observation hooks injected by the cliproxy Service. quotaSnapshot
+	// returns the latest cached wham/usage snapshot for an auth (or ok=false
+	// when no fresh snapshot is available). quotaRefreshNow performs a
+	// synchronous out-of-cycle fetch — wired to the background refresher's
+	// RefreshNow so the management UI can drive an immediate re-check for one
+	// account. Both fields are optional: setups without the codex quota
+	// subsystem leave them nil and the corresponding endpoints respond 503.
+	quotaSnapshot    QuotaSnapshotFunc
+	quotaRefreshNow  QuotaRefreshNowFunc
+	quotaProvidersMu sync.RWMutex
 }
+
+// QuotaSnapshotData mirrors the fields the management API exposes from the
+// LeastRemainingQuotaSelector's cache. UsedPercentPrimary / Secondary are
+// 0-100 ints; LimitReached mirrors upstream rate_limit.limit_reached; the
+// reset times are absolute timestamps from upstream's `resets_at` /
+// `resets_in_seconds`. FetchedAt records when the snapshot was last
+// captured.
+// Times use *time.Time so a zero value omits cleanly from JSON. Go's
+// encoder does NOT honour omitempty for a non-pointer time.Time zero
+// value — it serialises to "0001-01-01T00:00:00Z" which the UI then
+// renders as the absurd "739768d ago" (delta from year 1 to now).
+// Pointer-omit is the standard fix and the cooldowns endpoint applies
+// it for the same reason.
+type QuotaSnapshotData struct {
+	UsedPercentPrimary   int        `json:"used_percent_primary"`
+	UsedPercentSecondary int        `json:"used_percent_secondary"`
+	LimitReached         bool       `json:"limit_reached"`
+	ResetAtPrimary       *time.Time `json:"reset_at_primary,omitempty"`
+	ResetAtSecondary     *time.Time `json:"reset_at_secondary,omitempty"`
+	FetchedAt            *time.Time `json:"fetched_at,omitempty"`
+}
+
+// QuotaSnapshotFunc returns the cached snapshot for authID. ok=false when
+// no fresh entry exists (cache miss or stale).
+type QuotaSnapshotFunc func(authID string) (QuotaSnapshotData, bool)
+
+// QuotaRefreshNowFunc performs a synchronous fetch via the refresher.
+// ok=false means the auth is not eligible (disabled / non-codex / missing).
+// err covers transient network/parse failures.
+type QuotaRefreshNowFunc func(ctx context.Context, authID string) (QuotaSnapshotData, bool, error)
 
 // NewHandler creates a new management handler instance.
 func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
@@ -192,6 +233,39 @@ func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 // SetPostAuthPersistHook registers a hook to be called after auth persistence.
 func (h *Handler) SetPostAuthPersistHook(hook coreauth.PostAuthHook) {
 	h.postAuthPersistHook = hook
+}
+
+// SetQuotaProviders wires the cached-snapshot reader and synchronous
+// refresh trigger to the LeastRemainingQuotaSelector + Refresher pair
+// that the cliproxy Service owns. Either argument can be nil to leave
+// the corresponding endpoint disabled; callers that don't use the
+// codex quota subsystem simply skip this call.
+func (h *Handler) SetQuotaProviders(snapshot QuotaSnapshotFunc, refreshNow QuotaRefreshNowFunc) {
+	if h == nil {
+		return
+	}
+	h.quotaProvidersMu.Lock()
+	h.quotaSnapshot = snapshot
+	h.quotaRefreshNow = refreshNow
+	h.quotaProvidersMu.Unlock()
+}
+
+func (h *Handler) getQuotaSnapshotFunc() QuotaSnapshotFunc {
+	if h == nil {
+		return nil
+	}
+	h.quotaProvidersMu.RLock()
+	defer h.quotaProvidersMu.RUnlock()
+	return h.quotaSnapshot
+}
+
+func (h *Handler) getQuotaRefreshFunc() QuotaRefreshNowFunc {
+	if h == nil {
+		return nil
+	}
+	h.quotaProvidersMu.RLock()
+	defer h.quotaProvidersMu.RUnlock()
+	return h.quotaRefreshNow
 }
 
 // Middleware enforces access control for management endpoints.
