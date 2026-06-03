@@ -43,10 +43,13 @@ func (f *fakeQuotaFetcher) Fetch(_ context.Context, auth *Auth) (QuotaSnapshot, 
 	return snap, true, nil
 }
 
-// TestLeastRemainingQuotaSelector_PicksLowestUsedPercent verifies the core
-// selection rule: among codex candidates with cached quota, the one whose
-// primary window used_percent is smallest wins.
-func TestLeastRemainingQuotaSelector_PicksLowestUsedPercent(t *testing.T) {
+// TestLeastRemainingQuotaSelector_DropsStressedFromHealthyPool verifies the
+// tiered-filter behaviour: candidates with UsedPercentPrimary in the
+// healthy band (< HealthyTierUsedPercent) form the preferred pool that the
+// inner selector is asked to choose from. Stressed and unhealthy candidates
+// must not appear in that pool — even when one of them happens to be the
+// alphabetically-first input. The actual within-pool order is RR's job.
+func TestLeastRemainingQuotaSelector_DropsStressedFromHealthyPool(t *testing.T) {
 	t.Parallel()
 
 	auths := []*Auth{
@@ -55,9 +58,9 @@ func TestLeastRemainingQuotaSelector_PicksLowestUsedPercent(t *testing.T) {
 		{ID: "auth-c", Provider: "codex"},
 	}
 	fetcher := newFakeQuotaFetcher(map[string]QuotaSnapshot{
-		"auth-a": {UsedPercentPrimary: 75},
-		"auth-b": {UsedPercentPrimary: 12},
-		"auth-c": {UsedPercentPrimary: 40},
+		"auth-a": {UsedPercentPrimary: 75}, // stressed (50-90)
+		"auth-b": {UsedPercentPrimary: 12}, // healthy (<50)
+		"auth-c": {UsedPercentPrimary: 40}, // healthy (<50)
 	})
 	selector := NewLeastRemainingQuotaSelector(LeastRemainingQuotaConfig{
 		Inner:   &RoundRobinSelector{cursors: map[string]int{"codex:gpt-5.5": 0}},
@@ -69,14 +72,22 @@ func TestLeastRemainingQuotaSelector_PicksLowestUsedPercent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pick error = %v", err)
 	}
+	// auth-a is stressed → must be excluded from the healthy pool the
+	// inner selector sees. The RR cursor pins index 0, so the pool is
+	// [auth-b, auth-c] and we land on auth-b.
+	if got.ID == "auth-a" {
+		t.Fatalf("picked %q, but auth-a is stressed and should not appear in the healthy pool", got.ID)
+	}
 	if got.ID != "auth-b" {
-		t.Fatalf("picked %q, want auth-b (lowest primary used_percent)", got.ID)
+		t.Fatalf("picked %q, want auth-b (RR cursor=0 against healthy pool [auth-b, auth-c])", got.ID)
 	}
 }
 
 // TestLeastRemainingQuotaSelector_LimitReachedSkipsAuth verifies that an auth
-// whose snapshot says limit_reached=true is excluded from selection even if
-// its used_percent would otherwise rank it first.
+// whose snapshot says limit_reached=true is excluded from selection even
+// when its used_percent would otherwise look attractive. The remaining
+// candidate is in the stressed tier (70%) — still usable, so the filter
+// keeps her and the inner RR returns her.
 func TestLeastRemainingQuotaSelector_LimitReachedSkipsAuth(t *testing.T) {
 	t.Parallel()
 
@@ -85,8 +96,8 @@ func TestLeastRemainingQuotaSelector_LimitReachedSkipsAuth(t *testing.T) {
 		{ID: "auth-b", Provider: "codex"},
 	}
 	fetcher := newFakeQuotaFetcher(map[string]QuotaSnapshot{
-		"auth-a": {UsedPercentPrimary: 0, LimitReached: true}, // would win on used_percent
-		"auth-b": {UsedPercentPrimary: 90},
+		"auth-a": {UsedPercentPrimary: 0, LimitReached: true},
+		"auth-b": {UsedPercentPrimary: 70}, // stressed but usable (< UnhealthyUsedPercent)
 	})
 	selector := NewLeastRemainingQuotaSelector(LeastRemainingQuotaConfig{
 		Inner:   &RoundRobinSelector{cursors: map[string]int{"codex:gpt-5.5": 0}},
