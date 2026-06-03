@@ -344,6 +344,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	configDir := filepath.Dir(configFilePath)
 	s.monitorRegistry.AttachSettings(monitor.NewSettingsStore(filepath.Join(configDir, "monitor-settings.json")))
 	s.monitorRegistry.AttachHistoryLog(filepath.Join(logging.ResolveLogDirectory(cfg), "monitor-cancels.jsonl"))
+	s.monitorRegistry.AttachErrorsLog(filepath.Join(logging.ResolveLogDirectory(cfg), "monitor-errors.jsonl"))
 	s.monitorStop = make(chan struct{})
 	s.monitorRegistry.StartWatcher(s.monitorStop)
 	// Install monitor middleware after request logging so it can rely on the
@@ -599,6 +600,30 @@ func (s *Server) setupRoutes() {
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
 
+// SetQuotaProviders forwards the wham/usage snapshot reader and the
+// synchronous refresh trigger to the embedded management handler. The
+// cliproxy Service calls this once the quota refresher and selector
+// are constructed so the management API can render and refresh quota
+// state per-account.
+func (s *Server) SetQuotaProviders(snapshot managementHandlers.QuotaSnapshotFunc, refreshNow managementHandlers.QuotaRefreshNowFunc) {
+	if s == nil || s.mgmt == nil {
+		return
+	}
+	s.mgmt.SetQuotaProviders(snapshot, refreshNow)
+}
+
+// SetMonitorBytesRecorder hooks the in-flight monitor's per-auth bytes
+// recorder so each request body size is forwarded to the
+// LeastRemainingQuotaSelector's local accumulator (see
+// CombinedQuotaScore). Called by cliproxy.Service after the quota
+// subsystem is built.
+func (s *Server) SetMonitorBytesRecorder(rec monitor.AuthBytesRecorder) {
+	if s == nil || s.monitorRegistry == nil {
+		return
+	}
+	s.monitorRegistry.SetBytesRecorder(rec)
+}
+
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.
 // The handler is served as-is without additional middleware beyond the standard stack already configured.
 func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
@@ -788,6 +813,26 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
+		// Per-auth synchronous quota refresh. Accepts id via path param
+		// (`:id`) and via ?id= / ?name= query fallback. Hooks into the
+		// background refresher's RefreshNow so the management UI sees
+		// fresh wham/usage data without waiting for the periodic tick.
+		mgmt.POST("/quota-refresh/:id", s.mgmt.RefreshAuthQuota)
+		mgmt.POST("/quota-refresh", s.mgmt.RefreshAuthQuota)
+		// Cooldown observability + manual reset. The cooldown state lives
+		// on the Auth record (auth.NextRetryAfter, auth.Quota, per-model
+		// states) and in the model registry (SuspendClientModel /
+		// SetModelQuotaExceeded). ClearAuthCooldown wipes BOTH so a
+		// stuck account can be re-admitted to the candidate pool without
+		// editing files or restarting the service.
+		mgmt.GET("/auth-cooldowns", s.mgmt.ListAuthCooldowns)
+		mgmt.POST("/auth-cooldowns/:id/clear", s.mgmt.ClearAuthCooldown)
+		// Manual cooldown — used when wham/usage returns wrong data
+		// (e.g. claims 100% available on an auth that has actually
+		// exhausted its quota) and the operator needs to take the
+		// auth out of rotation by hand. See
+		// coreauth.Manager.ForceCooldown for semantics.
+		mgmt.POST("/auth-cooldowns/:id/force", s.mgmt.ForceAuthCooldown)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
 		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
@@ -815,7 +860,54 @@ func (s *Server) registerManagementRoutes() {
 		monitor.QueryKeyToAuthHeader(),
 		s.mgmt.Middleware(),
 	)
-	monitor.RegisterRoutes(monitorGroup, s.monitorRegistry)
+	// Build the bindings snapshot callback if the configured selector
+	// chain top-level is a SessionAffinitySelector — that is the layer
+	// that owns the cache the operator UI wants to expose. Pools
+	// configured without session affinity skip the bindings endpoint
+	// entirely (RegisterRoutes treats nil as "don't expose").
+	var bindingsFunc monitor.BindingsByAuthFunc
+	if s.handlers != nil && s.handlers.AuthManager != nil {
+		mgr := s.handlers.AuthManager
+		bindingsFunc = func() map[string][]monitor.CachedBinding {
+			sel, ok := mgr.Selector().(*auth.SessionAffinitySelector)
+			if !ok || sel == nil {
+				return nil
+			}
+			raw := sel.BindingsByAuthSnapshot()
+			out := make(map[string][]monitor.CachedBinding, len(raw))
+			for authID, entries := range raw {
+				converted := make([]monitor.CachedBinding, 0, len(entries))
+				for _, e := range entries {
+					converted = append(converted, monitor.CachedBinding{
+						SessionKey: e.SessionKey,
+						AuthID:     e.AuthID,
+						ExpiresAt:  e.ExpiresAt,
+						Closed:     e.Closed,
+						ClosedAt:   e.ClosedAt,
+						ForkedTo:   e.ForkedTo,
+					})
+				}
+				out[authID] = converted
+			}
+			return out
+		}
+	}
+	var authLookup monitor.AuthLabelLookup
+	if s.handlers != nil && s.handlers.AuthManager != nil {
+		mgr := s.handlers.AuthManager
+		authLookup = func(authID string) (string, string, string, bool) {
+			a, ok := mgr.GetByID(authID)
+			if !ok || a == nil {
+				return "", "", "", false
+			}
+			label := a.Label
+			if label == "" {
+				label = a.ID
+			}
+			return label, a.Provider, displayProxyURL(a.ProxyURL), true
+		}
+	}
+	monitor.RegisterRoutes(monitorGroup, s.monitorRegistry, bindingsFunc, authLookup)
 }
 
 func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
