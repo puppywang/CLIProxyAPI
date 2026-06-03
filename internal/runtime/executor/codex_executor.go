@@ -1593,17 +1593,44 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		ginHeaders = ginCtx.Request.Header
 	}
 
-	if ginHeaders.Get("X-Codex-Beta-Features") != "" {
-		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
+	// When the inbound client did not impersonate Codex CLI, synthesize a
+	// COMPLETE fingerprint that matches what a real codex_vscode / codex-tui
+	// install ships. The synth covers four cooperating layers, all required
+	// to make upstream see "this is Codex":
+	//   1. X-Codex-Turn-Metadata JSON blob with the full field set the real
+	//      client sends (session/thread/turn IDs, thread_source, sandbox,
+	//      turn_started_at_unix_ms, workspace_kind, request_kind, window_id)
+	//   2. The plain Session-Id / Thread-Id / X-Codex-Window-Id /
+	//      X-Client-Request-Id headers that mirror values from the blob —
+	//      older Codex code paths and OpenAI's risk-control read these
+	//      independently of the JSON.
+	//   3. X-Codex-Beta-Features that recent codex_vscode installs always
+	//      ship with.
+	//   4. The Codex-shaped User-Agent and Originator (already handled
+	//      below).
+	// EnsureHeader's source-first precedence still applies: when the inbound
+	// client DID send Codex headers (real codex_vscode / codex-tui), the
+	// synthesized values are ignored and the originals pass through. The
+	// downstream identity-confuse layer will then rewrite turn_id with a
+	// per-auth stable UUID, so even synthesized turn IDs remain deterministic
+	// per credential.
+	fp := codexFingerprint{}
+	if strings.TrimSpace(ginHeaders.Get("X-Codex-Turn-Metadata")) == "" &&
+		strings.TrimSpace(r.Header.Get("X-Codex-Turn-Metadata")) == "" {
+		fp = synthesizeCodexFingerprint()
 	}
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", fp.turnMetadata)
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", fp.clientRequestID)
+	misc.EnsureHeader(r.Header, ginHeaders, "Session-Id", fp.sessionID)
+	misc.EnsureHeader(r.Header, ginHeaders, "Thread-Id", fp.threadID)
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Window-Id", fp.windowID)
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Beta-Features", fp.betaFeatures)
 	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
 
 	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
-		misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
+		misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.Must(uuid.NewV7()).String())
 	}
 
 	if stream {
@@ -1636,6 +1663,66 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
+}
+
+// codexFingerprint bundles the synthesized headers that mimic a real
+// codex_vscode / codex-tui request on /v1/responses. All fields are
+// pre-derived together so they stay internally consistent — the plain
+// Session-Id / Thread-Id headers and the window_id suffix must match the
+// IDs embedded inside the X-Codex-Turn-Metadata JSON blob, otherwise
+// upstream risk control flags the mismatch.
+type codexFingerprint struct {
+	sessionID       string // UUID, also reused as thread_id on a first turn
+	threadID        string
+	turnID          string
+	clientRequestID string // equal to turnID (matches real client behavior)
+	windowID        string // "<sessionID>:0" — VS Code increments the suffix per turn
+	turnMetadata    string // full JSON blob mirroring the fields above
+	betaFeatures    string // "terminal_resize_reflow" — what current codex_vscode ships
+}
+
+// synthesizeCodexFingerprint builds a complete Codex fingerprint that
+// matches a real codex_vscode/0.136.x request as captured from production:
+//
+//	{
+//	  "session_id":              <uuidv7>,
+//	  "thread_id":               <uuidv7>,          // == session_id on first turn
+//	  "turn_id":                 <uuidv7>,          // fresh per call
+//	  "thread_source":           "user",
+//	  "sandbox":                 "macos-seatbelt",  // matches the codex-tui UA default
+//	  "turn_started_at_unix_ms": <now>,
+//	  "workspace_kind":          "project",
+//	  "request_kind":            "turn",
+//	  "window_id":               "<session_id>:0"
+//	}
+//
+// The plain headers (Session-Id, Thread-Id, X-Codex-Window-Id,
+// X-Client-Request-Id) carry the same IDs verbatim. Upstream sees a
+// fingerprint that is byte-shape indistinguishable from a real Codex
+// install. All interpolated values are UUIDs or millis, so no JSON
+// escaping is required.
+//
+// IDs must be UUID v7 (time-ordered). Real codex_vscode uses v7 — e.g.
+// 019e84d2-601e-7f20-9b21-d0243523f4aa (version digit "7" in the third
+// group). Risk control on the wham/usage endpoints checks the version
+// nibble; a v4 here gets the token invalidated within ~15min and the
+// upstream account auto-disabled. Do not "simplify" to uuid.NewString().
+func synthesizeCodexFingerprint() codexFingerprint {
+	sid := uuid.Must(uuid.NewV7()).String()
+	turn := uuid.Must(uuid.NewV7()).String()
+	windowID := sid + ":0"
+	return codexFingerprint{
+		sessionID:       sid,
+		threadID:        sid,
+		turnID:          turn,
+		clientRequestID: turn,
+		windowID:        windowID,
+		betaFeatures:    "terminal_resize_reflow",
+		turnMetadata: fmt.Sprintf(
+			`{"session_id":"%s","thread_id":"%s","turn_id":"%s","thread_source":"user","sandbox":"macos-seatbelt","turn_started_at_unix_ms":%d,"workspace_kind":"project","request_kind":"turn","window_id":"%s"}`,
+			sid, sid, turn, time.Now().UnixMilli(), windowID,
+		),
+	}
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {

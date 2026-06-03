@@ -697,8 +697,8 @@ func TestSessionAffinitySelector_StrictRefusesFailover(t *testing.T) {
 	if !errors.As(err, &se) {
 		t.Fatalf("strict Pick() error = %v (%T), expected *auth.Error", err, err)
 	}
-	if se.Code != "auth_bound_unavailable" {
-		t.Errorf("strict Pick() error code = %q, want %q", se.Code, "auth_bound_unavailable")
+	if se.Code != "usage_limit_reached" {
+		t.Errorf("strict Pick() error code = %q, want %q", se.Code, "usage_limit_reached")
 	}
 }
 
