@@ -461,6 +461,42 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 			_, err := mgr.ClearCooldown(ctx, authID)
 			return err
 		}),
+		// Auto-mark cooldown when wham reports limit_reached (including
+		// the >=100% saturation case parseWhamUsage now flips to true).
+		// Picks a deadline from the saturated window's reset_at — wham
+		// returns absolute timestamps, so the cooldown lasts exactly as
+		// long as upstream says it should. Idempotent: if the auth
+		// already has a cooldown covering this deadline, skip.
+		quota.WithLimitReachedSetter(func(ctx context.Context, authID string, snap coreauth.QuotaSnapshot) error {
+			now := time.Now()
+			var deadline time.Time
+			if snap.UsedPercentPrimary >= 100 && !snap.ResetAtPrimary.IsZero() && snap.ResetAtPrimary.After(now) {
+				deadline = snap.ResetAtPrimary
+			}
+			if snap.UsedPercentSecondary >= 100 && !snap.ResetAtSecondary.IsZero() && snap.ResetAtSecondary.After(now) {
+				if deadline.IsZero() || snap.ResetAtSecondary.After(deadline) {
+					deadline = snap.ResetAtSecondary
+				}
+			}
+			if deadline.IsZero() {
+				// No reset_at info from wham — fall back to a short
+				// holding window so the auth comes back in time for
+				// operator review without locking indefinitely.
+				deadline = now.Add(15 * time.Minute)
+			}
+			if existing, ok := mgr.GetByID(authID); ok && existing != nil {
+				if existing.Quota.Exceeded && !existing.Quota.NextRecoverAt.Before(deadline) {
+					// Already covered by an equal-or-longer cooldown.
+					return nil
+				}
+			}
+			_, err := mgr.ForceCooldown(ctx, authID, deadline, "wham quota limit reached")
+			if err == nil {
+				log.Infof("quota-refresher: marked cooldown from wham | auth=%s primary_used=%d%% secondary_used=%d%% until=%s",
+					authID, snap.UsedPercentPrimary, snap.UsedPercentSecondary, deadline.Format(time.RFC3339))
+			}
+			return err
+		}),
 	)
 	refresher.Start(ctx)
 	s.quotaRefresher = refresher
