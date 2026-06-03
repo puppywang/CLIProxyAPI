@@ -18,6 +18,7 @@ package quota
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"strings"
 	"sync"
@@ -56,11 +57,12 @@ const (
 //
 // The zero value is not usable; call NewRefresher.
 type Refresher struct {
-	fetcher     coreauth.QuotaFetcher
-	lister      AuthLister
-	pusher      SnapshotPusher
-	interval    time.Duration
-	concurrency int
+	fetcher      coreauth.QuotaFetcher
+	lister       AuthLister
+	pusher       SnapshotPusher
+	staleCleaner StaleCooldownClearer
+	interval     time.Duration
+	concurrency  int
 
 	mu       sync.Mutex
 	backoffs map[string]*backoffState
@@ -75,9 +77,34 @@ type backoffState struct {
 	failures int
 }
 
+// StaleCooldownClearer is the optional hook the refresher invokes when a
+// successful wham/usage fetch shows the auth is healthy upstream (no
+// limit_reached). The cliproxy Service wires this to
+// coreauth.Manager.ClearCooldown so an account that's stuck on a stale
+// in-memory cooldown (NextRetryAfter in the past, never cleared because
+// the next-success-call path could not fire — see the
+// t.yamada.takashi case where model_registry.SuspendedClients kept her
+// out of the candidate pool, blocking any chance of a successful call
+// that would auto-clear it) gets re-admitted.
+//
+// Returning an error is logged but does not stop the next refresh
+// cycle. ctx is the refresh tick's context — implementations should
+// honour cancellation but not introduce their own timeouts beyond it.
+type StaleCooldownClearer func(ctx context.Context, authID string) error
+
 // RefresherOption tunes a Refresher at construction. Use the WithX helpers
 // rather than poking the struct directly.
 type RefresherOption func(*Refresher)
+
+// WithStaleCooldownClearer registers the hook that auto-recovers an auth
+// stuck on stale cooldown markers once wham reports it healthy. Pass nil
+// or omit the option to disable auto-recovery (the legacy behaviour: an
+// admin must click the Clear button in the cooldowns panel).
+func WithStaleCooldownClearer(fn StaleCooldownClearer) RefresherOption {
+	return func(r *Refresher) {
+		r.staleCleaner = fn
+	}
+}
 
 // WithInterval overrides the periodic refresh interval. Non-positive
 // values are ignored so callers can pass through optional config without
@@ -175,6 +202,64 @@ func (r *Refresher) Stop() {
 	if done != nil {
 		<-done
 	}
+}
+
+// RefreshNow performs a SYNCHRONOUS out-of-cycle fetch for the named auth
+// and returns the resulting snapshot. Used by the management API's
+// per-auth "manual refresh" button so operators get immediate feedback
+// instead of waiting for the next periodic tick.
+//
+// Unlike Trigger (which fire-and-forgets to the trigger channel), this
+// call performs the wham/usage HTTP round-trip inline and pushes the
+// result through the same r.pusher path that the periodic loop uses,
+// so the selector cache and recorded backoff state stay consistent.
+//
+// ok=false means the auth is not eligible (nil, missing, disabled, or
+// non-codex). err covers transient failures (network, parse, 5xx); the
+// caller should display these to the operator rather than silently
+// retrying.
+func (r *Refresher) RefreshNow(ctx context.Context, authID string) (coreauth.QuotaSnapshot, bool, error) {
+	if r == nil {
+		return coreauth.QuotaSnapshot{}, false, fmt.Errorf("refresher: nil receiver")
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return coreauth.QuotaSnapshot{}, false, fmt.Errorf("refresher: empty auth ID")
+	}
+	auths := r.lister()
+	var target *coreauth.Auth
+	for _, a := range auths {
+		if a != nil && a.ID == authID {
+			target = a
+			break
+		}
+	}
+	if target == nil {
+		return coreauth.QuotaSnapshot{}, false, fmt.Errorf("refresher: auth %q not found", authID)
+	}
+	if target.Disabled {
+		return coreauth.QuotaSnapshot{}, false, fmt.Errorf("refresher: auth %q is disabled", authID)
+	}
+	if !strings.EqualFold(strings.TrimSpace(target.Provider), "codex") {
+		return coreauth.QuotaSnapshot{}, false, fmt.Errorf("refresher: auth %q is not a codex provider", authID)
+	}
+	snap, ok, err := r.fetcher.Fetch(ctx, target)
+	if err != nil {
+		r.recordFailure(authID)
+		return coreauth.QuotaSnapshot{}, false, err
+	}
+	if !ok {
+		return coreauth.QuotaSnapshot{}, false, nil
+	}
+	if snap.FetchedAt.IsZero() {
+		snap.FetchedAt = time.Now()
+	}
+	r.pusher(authID, snap)
+	// Out-of-cycle: clear failure count but do not push the regular
+	// cadence forward. The next scheduled tick handles long-term
+	// scheduling.
+	r.recordSuccessKeepingSchedule(authID)
+	return snap, true, nil
 }
 
 // Trigger requests an out-of-cycle refresh for a single auth. Use this
@@ -286,7 +371,7 @@ func (r *Refresher) runOnce(ctx context.Context) {
 		go func(a *coreauth.Auth) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			r.refresh(ctx, a)
+			r.refresh(ctx, a, true)
 		}(target)
 	}
 	wg.Wait()
@@ -294,7 +379,9 @@ func (r *Refresher) runOnce(ctx context.Context) {
 
 // refreshByID looks up the named auth in the current pool and refreshes it.
 // Used by Trigger to honour out-of-cycle requests without touching the
-// rest of the pool.
+// rest of the pool. Scheduled=false so an event-driven Trigger does
+// not bump the cycle cadence forward (see recordSuccessKeepingSchedule
+// for the motivating bug).
 func (r *Refresher) refreshByID(ctx context.Context, authID string) {
 	auths := r.lister()
 	for _, a := range auths {
@@ -307,7 +394,7 @@ func (r *Refresher) refreshByID(ctx context.Context, authID string) {
 		if !strings.EqualFold(strings.TrimSpace(a.Provider), "codex") {
 			return
 		}
-		r.refresh(ctx, a)
+		r.refresh(ctx, a, false)
 		return
 	}
 }
@@ -323,7 +410,12 @@ func (r *Refresher) refreshByID(ctx context.Context, authID string) {
 // "all healthy" or "refresher quietly broken" (we hit the latter once
 // when a backoff overflow parked an auth, and again when a stale-cache
 // gap made every Pick fall back to neutral 50%).
-func (r *Refresher) refresh(ctx context.Context, a *coreauth.Auth) {
+// refresh performs the fetch and pushes the snapshot. scheduleNext=true
+// means this is the regular cycle path and the per-auth nextAt should
+// advance by one interval on success; scheduleNext=false is the
+// out-of-cycle path (Trigger / manual refresh) where the cadence is
+// owned by the cycle and should not be perturbed.
+func (r *Refresher) refresh(ctx context.Context, a *coreauth.Auth, scheduleNext bool) {
 	snap, ok, err := r.fetcher.Fetch(ctx, a)
 	if err != nil {
 		r.recordFailure(a.ID)
@@ -337,9 +429,55 @@ func (r *Refresher) refresh(ctx context.Context, a *coreauth.Auth) {
 		snap.FetchedAt = time.Now()
 	}
 	r.pusher(a.ID, snap)
-	r.recordSuccess(a.ID)
+	if scheduleNext {
+		r.recordSuccess(a.ID)
+	} else {
+		r.recordSuccessKeepingSchedule(a.ID)
+	}
 	log.Debugf("quota-refresher: fetch ok | auth=%s primary_used=%d%% secondary_used=%d%% limit_reached=%t",
 		a.ID, snap.UsedPercentPrimary, snap.UsedPercentSecondary, snap.LimitReached)
+
+	// Auto-recovery: when wham reports the auth is healthy
+	// (limit_reached=false) AND the in-memory state still carries an
+	// error marker, drop the stale cooldown so the next pick can use
+	// this credential. Without this guard a stuck auth can stay
+	// excluded forever — the existing recovery path only fires on a
+	// successful API call, but a stuck auth often gets filtered out
+	// of the candidate pool so the success never happens. The pre-
+	// check (Status / Unavailable / per-model error) keeps healthy
+	// auths from being needlessly hit by ClearCooldown every cycle.
+	if !snap.LimitReached && r.staleCleaner != nil && hasErrorMarker(a) {
+		if errClean := r.staleCleaner(ctx, a.ID); errClean != nil {
+			log.WithError(errClean).Warnf("quota-refresher: stale cooldown cleanup failed | auth=%s", a.ID)
+		} else {
+			log.Infof("quota-refresher: cleared stale cooldown | auth=%s primary_used=%d%% secondary_used=%d%%",
+				a.ID, snap.UsedPercentPrimary, snap.UsedPercentSecondary)
+		}
+	}
+}
+
+// hasErrorMarker reports whether the auth (or any of its per-model
+// states) is in a non-healthy state worth clearing — saves a no-op
+// ClearCooldown round-trip on every healthy auth every cycle.
+func hasErrorMarker(a *coreauth.Auth) bool {
+	if a == nil {
+		return false
+	}
+	if a.Status == coreauth.StatusError || a.Unavailable {
+		return true
+	}
+	if a.Quota.Exceeded {
+		return true
+	}
+	for _, state := range a.ModelStates {
+		if state == nil {
+			continue
+		}
+		if state.Status == coreauth.StatusError || state.Unavailable || state.Quota.Exceeded {
+			return true
+		}
+	}
+	return false
 }
 
 // allowed reports whether the auth is currently outside its backoff window.
@@ -468,4 +606,27 @@ func (r *Refresher) recordSuccess(authID string) {
 	}
 	state.failures = 0
 	state.nextAt = time.Now().Add(r.interval)
+}
+
+// recordSuccessKeepingSchedule clears backoff failures without touching
+// the next scheduled fetch time. Used by trigger / manual-refresh paths
+// so an out-of-cycle fetch does not push the regular cadence forward.
+// Without this, a flood of Trigger() calls at startup (one per
+// applyCoreAuthUpdate) overlapping with the initial runOnce would set
+// every auth's nextAt to ~startup+10min — barely after the first
+// ticker fire, causing the entire next-cycle runOnce to skip every
+// auth with "len(targets)==0" and silently return. Net effect: the
+// cycle after a restart fires 20min later instead of 10min later,
+// and a flaky auth (like tanaka under wham backend stress) sits with
+// no fresh quota data for the entire UI-visible TTL.
+func (r *Refresher) recordSuccessKeepingSchedule(authID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.backoffs[authID]
+	if state == nil {
+		// Nothing to reset; out-of-cycle fetch on a healthy auth that
+		// has never been touched by recordFailure / recordSuccess.
+		return
+	}
+	state.failures = 0
 }
