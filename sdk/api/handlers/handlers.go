@@ -612,6 +612,7 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
+		notifyBoundAuthFromError(ctx, err)
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
@@ -662,6 +663,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
 	if err != nil {
+		notifyBoundAuthFromError(ctx, err)
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
@@ -725,6 +727,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 	opts.Metadata = reqMeta
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
+		notifyBoundAuthFromError(ctx, err)
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		status := http.StatusInternalServerError
@@ -835,6 +838,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 								chunks = retryResult.Chunks
 								continue outer
 							}
+							notifyBoundAuthFromError(ctx, retryErr)
 							streamErr = enrichAuthSelectionError(retryErr, providers, normalizedModel)
 						}
 					}
@@ -1006,6 +1010,31 @@ func replaceHeader(dst http.Header, src http.Header) {
 	}
 	for key, values := range src {
 		dst[key] = append([]string(nil), values...)
+	}
+}
+
+// notifyBoundAuthFromError forwards the session-bound auth ID (recorded by
+// the selector on a strict-refuse) to the monitor via the
+// selectedAuthIDCallback installed on ctx. Without this hook the in-flight
+// registry would show an empty Account column for auth_bound_unavailable
+// errors, because the conductor never actually picked an auth — it only
+// observed that the previously bound one became unavailable. Surfacing
+// BoundAuthID makes the operator UI's Recent Errors panel point at the
+// credential that was responsible instead of leaving the operator to guess.
+func notifyBoundAuthFromError(ctx context.Context, err error) {
+	if err == nil {
+		return
+	}
+	var authErr *coreauth.Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		return
+	}
+	id := strings.TrimSpace(authErr.BoundAuthID)
+	if id == "" {
+		return
+	}
+	if cb := selectedAuthIDCallbackFromContext(ctx); cb != nil {
+		cb(id)
 	}
 }
 
