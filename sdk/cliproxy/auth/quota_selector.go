@@ -49,16 +49,44 @@ type QuotaFetcher interface {
 type quotaCache struct {
 	mu      sync.RWMutex
 	entries map[string]QuotaSnapshot
-	ttl     time.Duration
+	// recordedBytes accumulates request body bytes per auth between
+	// wham/usage snapshots. Wham has ~10-min latency from request to
+	// updated counter, so two accounts both reporting "1% used" can
+	// actually differ by tens of MBs of in-flight traffic invisible
+	// to the latest snapshot. Local bytes accounting projects the
+	// real "effective used %" so the selector's pick reflects what
+	// upstream WILL see at the next refresh, not what it last saw.
+	// Reset to zero on every PushSnapshot (the wham value is the
+	// new ground truth and supersedes whatever we accumulated since
+	// the previous snapshot).
+	recordedBytes map[string]int64
+	ttl           time.Duration
 }
+
+// BytesPerPercentPrimary maps request body bytes to projected 5h
+// used-percent units. Calibrated from empirical observation of
+// watanabe.rei on 2026-06-02: ~15 MB of request volume corresponded
+// to ~9 percentage points of primary growth → roughly 1.5 MB per
+// 1% primary. Coarse, but precise enough for tie-breaking among
+// similar-quota accounts. Override callers can tune via package
+// var assignment in tests / config wiring.
+//
+// BytesPerPercentSecondary is the same idea for the weekly window.
+// Weekly aggregates ~5-7x more traffic before saturating, hence
+// the higher constant.
+var (
+	BytesPerPercentPrimary   int64 = 1_500_000  // 1.5 MB
+	BytesPerPercentSecondary int64 = 10_000_000 // 10 MB
+)
 
 func newQuotaCache(ttl time.Duration) *quotaCache {
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
 	return &quotaCache{
-		entries: make(map[string]QuotaSnapshot),
-		ttl:     ttl,
+		entries:       make(map[string]QuotaSnapshot),
+		recordedBytes: make(map[string]int64),
+		ttl:           ttl,
 	}
 }
 
@@ -78,7 +106,36 @@ func (c *quotaCache) get(authID string, now time.Time) (QuotaSnapshot, bool) {
 func (c *quotaCache) set(authID string, snap QuotaSnapshot) {
 	c.mu.Lock()
 	c.entries[authID] = snap
+	// Wham is ground truth — reset the local accumulator so the
+	// next CombinedQuotaScore reflects ONLY post-snapshot traffic.
+	if c.recordedBytes != nil {
+		delete(c.recordedBytes, authID)
+	}
 	c.mu.Unlock()
+}
+
+func (c *quotaCache) recordBytes(authID string, n int64) {
+	if c == nil || authID == "" || n <= 0 {
+		return
+	}
+	c.mu.Lock()
+	if c.recordedBytes == nil {
+		c.recordedBytes = make(map[string]int64)
+	}
+	c.recordedBytes[authID] += n
+	c.mu.Unlock()
+}
+
+func (c *quotaCache) getBytes(authID string) int64 {
+	if c == nil || authID == "" {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.recordedBytes == nil {
+		return 0
+	}
+	return c.recordedBytes[authID]
 }
 
 // quotaFetchTimeout caps the time we will block a single Pick on outstanding
@@ -86,6 +143,27 @@ func (c *quotaCache) set(authID string, snap QuotaSnapshot) {
 // SOCKS5 proxy while still keeping the request hot path well under one
 // second.
 const quotaFetchTimeout = 1500 * time.Millisecond
+
+// UnhealthyUsedPercent is the upper bound for the "healthy" tier the filter
+// keeps in the candidate pool. Anything at or above this is dropped so the
+// inner round-robin selector cannot land a fresh binding on a credential
+// that is one or two messages away from a 429. 90 leaves a small headroom
+// for the wham/usage snapshot being slightly stale relative to actual
+// upstream enforcement (we have seen accounts that wham says are at 95%
+// successfully serve a few more turns, but at 100% they always 429).
+const UnhealthyUsedPercent = 90
+
+// HealthyTierUsedPercent separates the preferred tier from the merely-
+// usable tier when the filter buckets candidates for distribution. Picks
+// drain the preferred tier first and only fall through to the stressed
+// tier when no healthy candidates remain. Set at 50 because a Plus
+// account that is past the half-way mark of its 5h window has materially
+// less remaining capacity to absorb a long conversation than a fresh
+// one — keeping new bindings off the half-spent accounts both
+// distributes load more evenly across the pool and reduces the rate at
+// which we accidentally lock long conversations onto credentials that
+// will exhaust mid-session.
+const HealthyTierUsedPercent = 50
 
 // DefaultNeutralUsedPercent is the score assigned to a candidate that has
 // no fresh cache entry while the selector is in Async mode. 50 is a
@@ -167,6 +245,96 @@ func NewLeastRemainingQuotaSelector(cfg LeastRemainingQuotaConfig) *LeastRemaini
 	}
 }
 
+// PrimaryUsedPercent returns the cached UsedPercentPrimary for an auth,
+// or (0, false) when no fresh snapshot is available. Used by sibling
+// selectors that want a secondary score for tie-breaks without holding
+// a reference to the cache directly.
+func (s *LeastRemainingQuotaSelector) PrimaryUsedPercent(authID string) (int, bool) {
+	if s == nil || s.cache == nil || authID == "" {
+		return 0, false
+	}
+	snap, fresh := s.cache.get(authID, time.Now())
+	if !fresh {
+		return 0, false
+	}
+	return snap.UsedPercentPrimary, true
+}
+
+// CombinedQuotaScore returns a single comparable score that orders auths
+// by EFFECTIVE used % across both windows. Smaller score = more headroom
+// = preferred for the next binding.
+//
+// Encoding: `effective_primary * 100 + effective_secondary` where
+//
+//	effective_primary   = wham.UsedPercentPrimary   + recorded_bytes / BytesPerPercentPrimary
+//	effective_secondary = wham.UsedPercentSecondary + recorded_bytes / BytesPerPercentSecondary
+//
+// Primary dominates the rank (×100 weight); secondary breaks ties cleanly
+// — two accounts both at 1% primary but at 1% vs 63% weekly are correctly
+// ranked. The recorded-bytes augmentation is the wham-delay compensator:
+// wham updates every ~10 min but in-flight traffic accumulates faster.
+// Two accounts both reporting "1% used" can differ by tens of MB of
+// post-snapshot traffic; the projection makes the score reflect what the
+// NEXT snapshot will likely show, not what the last one already showed.
+// On every PushSnapshot the bytes counter resets so we don't double-count
+// volume that wham has now absorbed into its real value.
+//
+// Returns (0, false) when no fresh snapshot is available — caller treats
+// a missing score as neutral (fresh accounts rank with no penalty).
+func (s *LeastRemainingQuotaSelector) CombinedQuotaScore(authID string) (int, bool) {
+	if s == nil || s.cache == nil || authID == "" {
+		return 0, false
+	}
+	snap, fresh := s.cache.get(authID, time.Now())
+	if !fresh {
+		return 0, false
+	}
+	bytes := s.cache.getBytes(authID)
+	primaryProj := 0
+	secondaryProj := 0
+	if bytes > 0 {
+		if BytesPerPercentPrimary > 0 {
+			primaryProj = int(bytes / BytesPerPercentPrimary)
+		}
+		if BytesPerPercentSecondary > 0 {
+			secondaryProj = int(bytes / BytesPerPercentSecondary)
+		}
+	}
+	effectivePrimary := snap.UsedPercentPrimary + primaryProj
+	effectiveSecondary := snap.UsedPercentSecondary + secondaryProj
+	return effectivePrimary*100 + effectiveSecondary, true
+}
+
+// RecordRequestBytes accumulates the inbound request body size against
+// the named auth's local quota counter. Called by the monitor middleware
+// once an auth is picked and the request body size is known. The
+// accumulated total is added to the next CombinedQuotaScore call (as a
+// projected used-% delta on top of the wham snapshot) and is reset by
+// PushSnapshot when wham next reflects the consumption.
+//
+// No-op when n is zero or negative, when the selector has no cache, or
+// when authID is empty.
+func (s *LeastRemainingQuotaSelector) RecordRequestBytes(authID string, n int64) {
+	if s == nil || s.cache == nil {
+		return
+	}
+	s.cache.recordBytes(authID, n)
+}
+
+// Snapshot returns the FULL cached QuotaSnapshot for the named auth and
+// whether the entry is still within the cache TTL. Used by the
+// management auth-files endpoint to surface the refresher's wham/usage
+// data (used percent, limit_reached, reset times) so operators can read
+// quota state from the same panel they use to manage credentials. Returns
+// (zero, false) when the auth has no cache entry or its entry has aged
+// past the TTL.
+func (s *LeastRemainingQuotaSelector) Snapshot(authID string) (QuotaSnapshot, bool) {
+	if s == nil || s.cache == nil || authID == "" {
+		return QuotaSnapshot{}, false
+	}
+	return s.cache.get(authID, time.Now())
+}
+
 // PushSnapshot inserts an externally-fetched QuotaSnapshot into the
 // selector's cache. The Refresher uses this to keep the cache populated
 // without going through the Pick path. FetchedAt is auto-populated when
@@ -181,14 +349,30 @@ func (s *LeastRemainingQuotaSelector) PushSnapshot(authID string, snap QuotaSnap
 	s.cache.set(authID, snap)
 }
 
-// Pick implements Selector. See the type comment for the policy summary.
+// Pick implements Selector as a *filter* over the candidate pool: it
+// removes credentials that have no remaining headroom (limit_reached
+// upstream, or used_percent at/above UnhealthyUsedPercent), buckets
+// the rest into a preferred and a stressed tier, and delegates the
+// actual pick to the inner selector with the slimmed-down list.
+//
+// The previous "rank by lowest used_percent and pick the single
+// minimum" policy concentrated every new binding onto whichever
+// credential happened to be at 1% at the moment of the cache miss —
+// the random tie-break only fired when two snapshots reported
+// identical percentages, which essentially never happens with real
+// wham/usage data. Across a few hours of traffic that produced 3-6
+// session bindings on the freshest account while every other healthy
+// credential sat idle. Returning a slimmed candidate list and letting
+// the inner round-robin selector cycle through it restores actual
+// load distribution while still keeping exhausted credentials out of
+// rotation.
 func (s *LeastRemainingQuotaSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	if s == nil || s.inner == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "quota selector not initialized"}
 	}
 	entry := selectorLogEntry(ctx)
 
-	available, err := getAvailableAuths(auths, provider, model, time.Now())
+	available, err := getAvailableAuths(ctx, auths, provider, model, time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -201,8 +385,8 @@ func (s *LeastRemainingQuotaSelector) Pick(ctx context.Context, provider, model 
 
 	// Inline warming only happens in sync mode. In async mode the caller
 	// (typically a quota.Refresher) owns cache population and we never
-	// block Pick on a network round-trip — cache misses participate at
-	// the neutral score instead.
+	// block Pick on a network round-trip — cache misses are treated as
+	// "unknown, presume healthy" and stay in the pool.
 	if !s.async {
 		now := time.Now()
 		stale := make([]*Auth, 0, len(codexCandidates))
@@ -217,24 +401,101 @@ func (s *LeastRemainingQuotaSelector) Pick(ctx context.Context, provider, model 
 	}
 
 	now := time.Now()
-	picked, pickedSnap, _ := s.pickLowest(codexCandidates, now)
-	if picked == nil {
-		// Cold cache or all fetches failed — let the inner selector decide.
-		// The async path will populate the cache for the next Pick.
+	healthy, stressed, excluded := s.partitionByQuota(auths, now)
+
+	// Pick from the healthiest tier that has any candidates. Falling
+	// back to the stressed tier (50-89% used) before draining the
+	// healthy tier matches the operator intent: prefer the freshest
+	// credentials for new bindings, only reach into the half-spent
+	// ones when no fresh accounts remain.
+	pool := healthy
+	tier := "healthy"
+	if len(pool) == 0 {
+		pool = stressed
+		tier = "stressed"
+	}
+	if len(pool) == 0 {
+		// Every codex credential is at or above UnhealthyUsedPercent
+		// (or limit_reached). Let the inner selector pick from the
+		// original list anyway — at least one of these accounts may
+		// still serve a turn, and refusing here would force a 503
+		// when the request could still succeed.
+		entry.Warnf("quota-selector: no healthy candidates | excluded=%d provider=%s model=%s", excluded, provider, model)
 		return s.inner.Pick(ctx, provider, model, opts, auths)
 	}
 
-	// Only return the quota-picked auth when it is part of the original
-	// `available` list (it always is by construction here, but check guards
-	// against a future refactor that filters codexCandidates further).
-	for _, candidate := range available {
-		if candidate.ID == picked.ID {
-			entry.Infof("quota-selector: picked | auth=%s primary_used=%d%% secondary_used=%d%% provider=%s model=%s",
-				picked.ID, pickedSnap.UsedPercentPrimary, pickedSnap.UsedPercentSecondary, provider, model)
-			return picked, nil
-		}
+	picked, errInner := s.inner.Pick(ctx, provider, model, opts, pool)
+	if errInner != nil {
+		return nil, errInner
 	}
-	return s.inner.Pick(ctx, provider, model, opts, auths)
+	if picked == nil {
+		return nil, &Error{Code: "auth_not_found", Message: "inner selector returned no auth"}
+	}
+	pickedSnap, hasSnap := s.cache.get(picked.ID, now)
+	if hasSnap {
+		entry.Infof("quota-selector: picked | auth=%s tier=%s primary_used=%d%% secondary_used=%d%% pool_size=%d excluded=%d provider=%s model=%s",
+			picked.ID, tier, pickedSnap.UsedPercentPrimary, pickedSnap.UsedPercentSecondary, len(pool), excluded, provider, model)
+	} else {
+		entry.Infof("quota-selector: picked | auth=%s tier=%s primary_used=unknown pool_size=%d excluded=%d provider=%s model=%s",
+			picked.ID, tier, len(pool), excluded, provider, model)
+	}
+	return picked, nil
+}
+
+// partitionByQuota splits the inbound auth list into three groups based
+// on cached wham/usage data:
+//
+//   - healthy:  non-codex auths AND codex auths with UsedPercentPrimary
+//     below HealthyTierUsedPercent. Codex auths with no cache entry
+//     (in async mode) also land here so a fresh account is not
+//     penalised while the refresher is still warming up.
+//   - stressed: codex auths with UsedPercentPrimary in
+//     [HealthyTierUsedPercent, UnhealthyUsedPercent). Usable but not
+//     preferred for new bindings.
+//   - excluded count: how many candidates were dropped because the
+//     credential is at or above UnhealthyUsedPercent or because
+//     wham/usage reported LimitReached=true.
+//
+// Non-codex auths always land in healthy — quota policy does not apply
+// outside the Codex pool.
+func (s *LeastRemainingQuotaSelector) partitionByQuota(auths []*Auth, now time.Time) (healthy []*Auth, stressed []*Auth, excluded int) {
+	for _, a := range auths {
+		if a == nil {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(a.Provider), "codex") {
+			healthy = append(healthy, a)
+			continue
+		}
+		snap, fresh := s.cache.get(a.ID, now)
+		if !fresh {
+			if s.async {
+				// Async: no fresh data ≠ unhealthy. The refresher will
+				// eventually report and re-tier her on a later Pick.
+				healthy = append(healthy, a)
+				continue
+			}
+			// Sync warm-path attempted before this call. Still no
+			// data → drop from selection (consistent with the prior
+			// behaviour for sync mode).
+			excluded++
+			continue
+		}
+		if snap.LimitReached {
+			excluded++
+			continue
+		}
+		if snap.UsedPercentPrimary >= UnhealthyUsedPercent {
+			excluded++
+			continue
+		}
+		if snap.UsedPercentPrimary < HealthyTierUsedPercent {
+			healthy = append(healthy, a)
+			continue
+		}
+		stressed = append(stressed, a)
+	}
+	return healthy, stressed, excluded
 }
 
 // warmCache fetches snapshots for the given auths concurrently with a
