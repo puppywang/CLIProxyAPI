@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -403,6 +404,19 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 	}
 }
 
+// Selector returns the currently configured top-level selector. Callers
+// that need to introspect the selector chain (e.g. the monitor's
+// bindings reverse-index handler probing for a SessionAffinitySelector
+// to pull a cache snapshot) can type-assert on the returned value.
+func (m *Manager) Selector() Selector {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.selector
+}
+
 func (m *Manager) SetSelector(selector Selector) {
 	if m == nil {
 		return
@@ -669,7 +683,7 @@ func executionResultModel(routeModel, upstreamModel string, pooled bool) string 
 	return strings.TrimSpace(upstreamModel)
 }
 
-func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidates []string, pooled bool) []string {
+func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidates []string, pooled bool, viaStrictBypass bool) []string {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -677,79 +691,51 @@ func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidate
 	out := make([]string, 0, len(candidates))
 	for _, upstreamModel := range candidates {
 		stateModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
-		blocked, _, _ := isAuthBlockedForModel(auth, stateModel, now)
+		blocked, reason, _ := isAuthBlockedForModel(auth, stateModel, now)
 		if blocked {
-			continue
+			// Admin-disabled per-model entries are always filtered —
+			// no upstream call can recover them.
+			if reason == blockReasonDisabled {
+				continue
+			}
+			// Cooldown / other transient blocks: skip the variant in
+			// the normal case (so the openai-compat alias pool can
+			// fall back to a healthy upstream model variant or to a
+			// different auth). Strict-bypass keeps the variant: the
+			// selector deliberately handed us this cooldown'd bound
+			// auth and the design wants the request to reach upstream
+			// so the real outcome surfaces to the client. Filtering
+			// it here would leave len(models)==0, the caller would
+			// silently `continue` into a strict-refuse 429, and a
+			// session that took one transient 5xx would be 429'd on
+			// every subsequent request for the next minute.
+			if !viaStrictBypass {
+				continue
+			}
 		}
 		out = append(out, upstreamModel)
 	}
 	return out
 }
 
-func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]string, bool) {
+// preparedExecutionModelsForPick wraps preparedExecutionModels with the
+// strict-bypass signal the SessionAffinitySelector sets via
+// WithStrictBypassFlag. Use this in the execute-loop path; the no-pick
+// callers (refresher / scheduler helpers) continue to use the simpler
+// preparedExecutionModels.
+func (m *Manager) preparedExecutionModelsForPick(auth *Auth, routeModel string, viaStrictBypass bool) ([]string, bool) {
 	candidates := m.executionModelCandidates(auth, routeModel)
 	pooled := len(candidates) > 1
-	return m.filterExecutionModels(auth, routeModel, candidates, pooled), pooled
+	return m.filterExecutionModels(auth, routeModel, candidates, pooled, viaStrictBypass), pooled
+}
+
+func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]string, bool) {
+	return m.preparedExecutionModelsForPick(auth, routeModel, false)
 }
 
 func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string) []string {
 	models, _ := m.preparedExecutionModels(auth, routeModel)
 	return models
-}
-
-func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
-	if len(auths) == 0 {
-		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
-	}
-
-	availableByPriority := make(map[int][]*Auth)
-	cooldownCount := 0
-	var earliest time.Time
-	for _, candidate := range auths {
-		checkModel := m.selectionModelForAuth(candidate, routeModel)
-		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
-		if !blocked {
-			priority := authPriority(candidate)
-			availableByPriority[priority] = append(availableByPriority[priority], candidate)
-			continue
-		}
-		if reason == blockReasonCooldown {
-			cooldownCount++
-			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
-				earliest = next
-			}
-		}
-	}
-
-	if len(availableByPriority) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
-			providerForError := provider
-			if providerForError == "mixed" {
-				providerForError = ""
-			}
-			resetIn := earliest.Sub(now)
-			if resetIn < 0 {
-				resetIn = 0
-			}
-			return nil, newModelCooldownError(routeModel, providerForError, resetIn)
-		}
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
-	}
-
-	bestPriority := 0
-	found := false
-	for priority := range availableByPriority {
-		if !found || priority > bestPriority {
-			bestPriority = priority
-			found = true
-		}
-	}
-
-	available := availableByPriority[bestPriority]
-	if len(available) > 1 {
-		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
-	}
-	return available, nil
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {
@@ -1772,7 +1758,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		var viaStrictBypass bool
+		pickCtx := WithStrictBypassFlag(ctx, &viaStrictBypass)
+		auth, executor, provider, errPick := m.pickNextMixed(pickCtx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
@@ -1792,8 +1780,23 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.preparedExecutionModelsForPick(auth, routeModel, viaStrictBypass)
 		if len(models) == 0 {
+			// Seed lastErr so the next pick-failure path
+			// (e.g. strict-affinity refusing fallback) surfaces a
+			// real reason instead of the synthesised 429 that
+			// shouldReturnLastErrorOnPickFailure(nil, errPick)
+			// would otherwise return. Without this seed, a strict-
+			// bound session whose auth has every upstream variant
+			// admin-disabled would `continue` silently, the next
+			// Pick would strict-refuse, and the client gets a
+			// 429 "usage_limit_reached" for what is actually a
+			// configuration problem.
+			lastErr = &Error{
+				Code:       "auth_no_models",
+				Message:    fmt.Sprintf("auth %q has no enabled upstream models for %q", auth.ID, routeModel),
+				HTTPStatus: http.StatusServiceUnavailable,
+			}
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -1873,7 +1876,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		var viaStrictBypass bool
+		pickCtx := WithStrictBypassFlag(ctx, &viaStrictBypass)
+		auth, executor, provider, errPick := m.pickNextMixed(pickCtx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
@@ -1893,8 +1898,23 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.preparedExecutionModelsForPick(auth, routeModel, viaStrictBypass)
 		if len(models) == 0 {
+			// Seed lastErr so the next pick-failure path
+			// (e.g. strict-affinity refusing fallback) surfaces a
+			// real reason instead of the synthesised 429 that
+			// shouldReturnLastErrorOnPickFailure(nil, errPick)
+			// would otherwise return. Without this seed, a strict-
+			// bound session whose auth has every upstream variant
+			// admin-disabled would `continue` silently, the next
+			// Pick would strict-refuse, and the client gets a
+			// 429 "usage_limit_reached" for what is actually a
+			// configuration problem.
+			lastErr = &Error{
+				Code:       "auth_no_models",
+				Message:    fmt.Sprintf("auth %q has no enabled upstream models for %q", auth.ID, routeModel),
+				HTTPStatus: http.StatusServiceUnavailable,
+			}
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -1974,7 +1994,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if homeMode {
 			pickOpts = withHomeAuthCount(opts, homeAuthCount)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		var viaStrictBypass bool
+		pickCtx := WithStrictBypassFlag(ctx, &viaStrictBypass)
+		auth, executor, provider, errPick := m.pickNextMixed(pickCtx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return nil, lastErr
@@ -1992,8 +2014,23 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled := m.preparedExecutionModelsForPick(auth, routeModel, viaStrictBypass)
 		if len(models) == 0 {
+			// Seed lastErr so the next pick-failure path
+			// (e.g. strict-affinity refusing fallback) surfaces a
+			// real reason instead of the synthesised 429 that
+			// shouldReturnLastErrorOnPickFailure(nil, errPick)
+			// would otherwise return. Without this seed, a strict-
+			// bound session whose auth has every upstream variant
+			// admin-disabled would `continue` silently, the next
+			// Pick would strict-refuse, and the client gets a
+			// 429 "usage_limit_reached" for what is actually a
+			// configuration problem.
+			lastErr = &Error{
+				Code:       "auth_no_models",
+				Message:    fmt.Sprintf("auth %q has no enabled upstream models for %q", auth.ID, routeModel),
+				HTTPStatus: http.StatusServiceUnavailable,
+			}
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -3407,6 +3444,228 @@ func (m *Manager) GetByID(id string) (*Auth, bool) {
 	return auth.Clone(), true
 }
 
+// ClearCooldown wipes every cooldown / failure marker on the named auth
+// so it becomes immediately eligible for selection again. Operators use
+// this from the management panel when they know an auth has actually
+// recovered upstream and the cached cooldown state is just stale.
+//
+// What gets reset:
+//
+//   - auth.Unavailable, auth.NextRetryAfter, auth.Quota → zeroed
+//   - auth.LastError → cleared
+//   - auth.Status → StatusActive when it was StatusError
+//   - auth.StatusMessage → cleared when it had been a transient
+//     "usage_limit_reached" / "unauthorized" marker (Disabled stays
+//     intact — admins clear that explicitly via the existing PATCH
+//     /auth-files/status endpoint)
+//   - every ModelState entry → resetModelState
+//   - model_registry quota-suspended flags for every model under this
+//     auth → ClearModelQuotaExceeded (so LeastRemainingQuotaSelector's
+//     filter re-admits the auth on its next Pick)
+//
+// What does NOT get reset:
+//
+//   - auth.Disabled (an explicit admin action; clearing it from here
+//     would conflate "I cleared a transient cooldown" with "I want to
+//     un-disable a credential I previously took offline")
+//   - Persistence is best-effort; the in-memory state is the source
+//     of truth for the next Pick regardless of disk-write outcome
+func (m *Manager) ClearCooldown(ctx context.Context, id string) (*Auth, error) {
+	id = strings.TrimSpace(id)
+	if m == nil {
+		return nil, fmt.Errorf("auth manager: nil receiver")
+	}
+	if id == "" {
+		return nil, fmt.Errorf("auth manager: missing auth id")
+	}
+	m.mu.Lock()
+	auth, ok := m.auths[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("auth manager: auth %q not found", id)
+	}
+	now := time.Now()
+	auth.Unavailable = false
+	auth.NextRetryAfter = time.Time{}
+	auth.Quota = QuotaState{}
+	auth.LastError = nil
+	if auth.Status == StatusError {
+		auth.Status = StatusActive
+	}
+	// Clearing the status message only when it looks like a transient
+	// upstream-driven marker, NOT an admin-set note. The conductor sets
+	// these specific patterns on quota / auth failures; an operator who
+	// typed something custom into status_message via /auth-files/fields
+	// is preserved. The list is broad on purpose — operator notes are
+	// typically short well-formed prose, and missing a conductor pattern
+	// here means the operator can never clear the row from the cooldowns
+	// panel (the Envoy "upstream connect error / disconnect" boilerplate
+	// hit this exactly: it didn't match any of the original five patterns
+	// and survived every Clear click).
+	if msg := strings.TrimSpace(auth.StatusMessage); msg != "" {
+		lower := strings.ToLower(msg)
+		if strings.Contains(lower, "usage_limit_reached") ||
+			strings.Contains(lower, "unauthorized") ||
+			strings.Contains(lower, "rate_limit") ||
+			strings.Contains(lower, "quota") ||
+			strings.Contains(lower, "payment_required") ||
+			strings.Contains(lower, "not_found") ||
+			strings.Contains(lower, "request failed") ||
+			strings.Contains(lower, "upstream connect error") ||
+			strings.Contains(lower, "transient upstream error") ||
+			strings.Contains(lower, "disconnect/reset before headers") ||
+			strings.HasPrefix(lower, "{\"error\"") {
+			auth.StatusMessage = ""
+		}
+	}
+	modelNames := make([]string, 0, len(auth.ModelStates))
+	for modelName, state := range auth.ModelStates {
+		modelNames = append(modelNames, modelName)
+		resetModelState(state, now)
+	}
+	auth.UpdatedAt = now
+	authSnapshot := auth.Clone()
+	m.mu.Unlock()
+	// Persist outside the lock so a slow store does not stall pickers.
+	if errPersist := m.persist(ctx, authSnapshot); errPersist != nil {
+		log.WithError(errPersist).Warnf("auth manager: ClearCooldown persist failed for %s", id)
+	}
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(authSnapshot)
+	}
+	// model_registry tracks "this client is quota-suspended for model X"
+	// separately from the per-model state on the auth. The selector's
+	// availability filter consults the registry, so a cleared auth would
+	// still get filtered out without this loop.
+	reg := registry.GetGlobalRegistry()
+	for _, modelName := range modelNames {
+		reg.ClearModelQuotaExceeded(id, modelName)
+		// ResumeClientModel covers the OTHER per-model registry flag
+		// (SuspendClientModel — set by the conductor's 401/403/404
+		// paths). Two independent maps in the registry, both can leave
+		// an auth filtered out; ClearCooldown is explicitly the
+		// "remove every transient marker" action, so reset both.
+		reg.ResumeClientModel(id, modelName)
+	}
+	// Some suspensions can outlast the auth.ModelStates map (e.g. an
+	// auth was reloaded after disk update, dropping ModelStates, while
+	// the registry retained the suspension). Catch those too by
+	// resuming every model the client is registered for.
+	for _, info := range reg.GetModelsForClient(id) {
+		if info == nil {
+			continue
+		}
+		reg.ResumeClientModel(id, info.ID)
+	}
+	return authSnapshot, nil
+}
+
+// ManualCooldownReason marks a cooldown that was set by an operator,
+// not by the conductor in response to an upstream signal. The refresher's
+// stale-cleanup path (see refresher.go) checks for this reason and
+// refuses to auto-clear the marker until NextRecoverAt has passed —
+// so an operator can hold an auth out of rotation even when wham is
+// returning bogus 100%-available data for it (the exact reason this
+// entry point exists).
+const ManualCooldownReason = "manual"
+
+// ForceCooldown marks an auth as quota-exceeded until `until`, regardless
+// of what upstream wham/usage thinks. Used when wham returns stale or
+// wrong data (e.g. claims 100% available on an account that has
+// actually exhausted its quota) and the operator needs to take the
+// auth out of rotation manually. Mirrors the per-model + registry
+// suspension that an upstream 429 would trigger so the selector and
+// every downstream filter treat this auth as exhausted until `until`.
+//
+// If `until` is zero or already in the past, returns an error without
+// changing state — a zero/expired cooldown is the same as Clear, which
+// the operator should use instead so the auto-recovery semantics are
+// honoured (Clear nukes the manual marker too).
+func (m *Manager) ForceCooldown(ctx context.Context, id string, until time.Time) (*Auth, error) {
+	id = strings.TrimSpace(id)
+	if m == nil {
+		return nil, fmt.Errorf("auth manager: nil receiver")
+	}
+	if id == "" {
+		return nil, fmt.Errorf("auth manager: missing auth id")
+	}
+	now := time.Now()
+	if until.IsZero() || !until.After(now) {
+		return nil, fmt.Errorf("auth manager: cooldown deadline must be in the future")
+	}
+	m.mu.Lock()
+	auth, ok := m.auths[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("auth manager: auth %q not found", id)
+	}
+	auth.Unavailable = true
+	auth.Status = StatusError
+	auth.StatusMessage = "manual cooldown"
+	auth.NextRetryAfter = until
+	auth.Quota = QuotaState{
+		Exceeded:      true,
+		Reason:        ManualCooldownReason,
+		NextRecoverAt: until,
+		BackoffLevel:  auth.Quota.BackoffLevel,
+	}
+	auth.UpdatedAt = now
+	// Propagate to every known per-model state so the selector's
+	// per-model availability filter blocks this auth across all
+	// models. Auths with no ModelStates map still get the auth-level
+	// fields above, which is enough on its own.
+	modelNames := make([]string, 0, len(auth.ModelStates))
+	for modelName, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		state.Unavailable = true
+		state.Status = StatusError
+		state.StatusMessage = "manual cooldown"
+		state.NextRetryAfter = until
+		state.Quota = QuotaState{
+			Exceeded:      true,
+			Reason:        ManualCooldownReason,
+			NextRecoverAt: until,
+		}
+		state.UpdatedAt = now
+		modelNames = append(modelNames, modelName)
+	}
+	authSnapshot := auth.Clone()
+	m.mu.Unlock()
+	if errPersist := m.persist(ctx, authSnapshot); errPersist != nil {
+		log.WithError(errPersist).Warnf("auth manager: ForceCooldown persist failed for %s", id)
+	}
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(authSnapshot)
+	}
+	// Also bump model_registry's quota-suspended map for every model
+	// this client supports there — the selector consults it
+	// independently of auth.ModelStates, so without this loop a
+	// freshly-loaded auth with an empty ModelStates map would still
+	// be picked.
+	reg := registry.GetGlobalRegistry()
+	seen := make(map[string]struct{}, len(modelNames))
+	for _, modelName := range modelNames {
+		seen[modelName] = struct{}{}
+		reg.SetModelQuotaExceeded(id, modelName)
+		reg.SuspendClientModel(id, modelName, ManualCooldownReason)
+	}
+	for _, info := range reg.GetModelsForClient(id) {
+		if info == nil {
+			continue
+		}
+		modelName := info.ID
+		if _, ok := seen[modelName]; ok {
+			continue
+		}
+		reg.SetModelQuotaExceeded(id, modelName)
+		reg.SuspendClientModel(id, modelName, ManualCooldownReason)
+	}
+	log.Infof("auth manager: ForceCooldown applied | auth=%s until=%s", id, until.Format(time.RFC3339))
+	return authSnapshot, nil
+}
+
 // GetExecutionSessionAuthByID retrieves a Home runtime auth scoped to an execution session.
 func (m *Manager) GetExecutionSessionAuthByID(sessionID string, authID string) (*Auth, bool) {
 	sessionID = strings.TrimSpace(sessionID)
@@ -3554,20 +3813,25 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
-	if errAvailable != nil {
-		m.mu.RUnlock()
-		return nil, nil, errAvailable
-	}
-	available = cloneAuthSlice(available)
+	// Skip upstream's m.availableAuthsForRouteModel pre-filter (we deleted
+	// that function in the strict-bypass refactor) and hand the full
+	// admin-filtered candidates straight to the selectors. Cooldown
+	// filtering lives inside the selectors (getAvailableAuths) so the
+	// affinity selector's strict-bypass branch can honour a session
+	// binding even when the bound auth is currently in a transient
+	// cooldown — that's the whole point of strict-bypass. Per-auth OAuth
+	// alias resolution travels via ctx so the selector's filter uses the
+	// same model-key resolution the pre-filter used to do inline.
+	candidates = cloneAuthSlice(candidates)
 	m.mu.RUnlock()
 
-	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
+	pickCtx := WithAliasResolver(ctx, m.selectionModelForAuth)
+	selected, handled, errPick := m.pickViaPluginScheduler(pickCtx, pluginScheduler, provider, []string{provider}, model, opts, tried, candidates)
 	if errPick != nil {
 		return nil, nil, errPick
 	}
 	if !handled {
-		selected, errPick = selector.Pick(ctx, provider, selectionArgForSelector(selector, model), opts, available)
+		selected, errPick = selector.Pick(pickCtx, provider, selectionArgForSelector(selector, model), opts, candidates)
 		if errPick != nil {
 			return nil, nil, errPick
 		}
@@ -3714,20 +3978,19 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
-	if errAvailable != nil {
-		m.mu.RUnlock()
-		return nil, nil, "", errAvailable
-	}
-	available = cloneAuthSlice(available)
+	// See the single-provider path above: skip the killed
+	// availableAuthsForRouteModel pre-filter, hand candidates to the
+	// selector with alias resolver in ctx so strict-bypass survives.
+	candidates = cloneAuthSlice(candidates)
 	m.mu.RUnlock()
 
-	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
+	pickCtx := WithAliasResolver(ctx, m.selectionModelForAuth)
+	selected, handled, errPick := m.pickViaPluginScheduler(pickCtx, pluginScheduler, "mixed", providers, model, opts, tried, candidates)
 	if errPick != nil {
 		return nil, nil, "", errPick
 	}
 	if !handled {
-		selected, errPick = selector.Pick(ctx, "mixed", selectionArgForSelector(selector, model), opts, available)
+		selected, errPick = selector.Pick(pickCtx, "mixed", selectionArgForSelector(selector, model), opts, candidates)
 		if errPick != nil {
 			return nil, nil, "", errPick
 		}

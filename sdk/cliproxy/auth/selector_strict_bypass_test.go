@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
@@ -148,8 +149,11 @@ func TestSessionAffinitySelector_StrictRefusesWhenBoundAuthDisabled(t *testing.T
 		t.Fatal("strict Pick on Disabled bound auth: expected refuse, got success")
 	}
 	var se *Error
-	if !errors.As(err, &se) || se.Code != "auth_bound_unavailable" {
-		t.Fatalf("strict Pick error = %v (%T), want auth_bound_unavailable", err, err)
+	if !errors.As(err, &se) || se.Code != "usage_limit_reached" {
+		t.Fatalf("strict Pick error = %v (%T), want usage_limit_reached", err, err)
+	}
+	if se.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("strict Pick HTTPStatus = %d, want 429", se.HTTPStatus)
 	}
 }
 
@@ -184,8 +188,11 @@ func TestSessionAffinitySelector_StrictRefusesWhenBoundModelDisabled(t *testing.
 		t.Fatal("strict Pick on model-Disabled bound auth: expected refuse, got success")
 	}
 	var se *Error
-	if !errors.As(err, &se) || se.Code != "auth_bound_unavailable" {
-		t.Fatalf("strict Pick error = %v (%T), want auth_bound_unavailable", err, err)
+	if !errors.As(err, &se) || se.Code != "usage_limit_reached" {
+		t.Fatalf("strict Pick error = %v (%T), want usage_limit_reached", err, err)
+	}
+	if se.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("strict Pick HTTPStatus = %d, want 429", se.HTTPStatus)
 	}
 }
 
