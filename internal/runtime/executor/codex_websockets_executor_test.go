@@ -668,8 +668,12 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	if got := req.Header.Get("User-Agent"); got != "config-ua" {
 		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
 	}
-	if got := req.Header.Get("x-codex-beta-features"); got != "" {
-		t.Fatalf("x-codex-beta-features = %q, want empty", got)
+	// X-Codex-Beta-Features is now part of the synthesized Codex CLI
+	// fingerprint that fills in when the inbound client did not send a
+	// Turn-Metadata blob. The default matches what current codex_vscode
+	// installs ship with — see synthesizeCodexFingerprint.
+	if got := req.Header.Get("X-Codex-Beta-Features"); got != "terminal_resize_reflow" {
+		t.Fatalf("X-Codex-Beta-Features = %q, want %q", got, "terminal_resize_reflow")
 	}
 }
 
@@ -713,14 +717,69 @@ func TestApplyCodexHeadersDoesNotInjectClientOnlyHeadersByDefault(t *testing.T) 
 
 	applyCodexHeaders(req, nil, "oauth-token", true, nil)
 
+	// Version remains untouched when no client value is supplied.
 	if got := req.Header.Get("Version"); got != "" {
 		t.Fatalf("Version = %q, want empty", got)
 	}
-	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != "" {
-		t.Fatalf("X-Codex-Turn-Metadata = %q, want empty", got)
+	// All Codex CLI fingerprint headers are now synthesized when the
+	// inbound client did not impersonate Codex. This is what a real
+	// codex_vscode install ships, captured from production traffic:
+	// the full Turn-Metadata blob plus the plain Session-Id / Thread-Id
+	// / X-Codex-Window-Id / X-Client-Request-Id / X-Codex-Beta-Features
+	// headers that mirror its fields.
+	turnMeta := req.Header.Get("X-Codex-Turn-Metadata")
+	if turnMeta == "" {
+		t.Fatalf("X-Codex-Turn-Metadata = %q, want synthesized JSON", turnMeta)
 	}
-	if got := req.Header.Get("X-Client-Request-Id"); got != "" {
-		t.Fatalf("X-Client-Request-Id = %q, want empty", got)
+	for _, field := range []string{"session_id", "thread_id", "turn_id", "window_id"} {
+		if v := gjson.Get(turnMeta, field).String(); v == "" {
+			t.Fatalf("X-Codex-Turn-Metadata.%s missing in synthesized blob: %s", field, turnMeta)
+		}
+	}
+	if v := gjson.Get(turnMeta, "thread_source").String(); v != "user" {
+		t.Fatalf("X-Codex-Turn-Metadata.thread_source = %q, want %q", v, "user")
+	}
+	if v := gjson.Get(turnMeta, "workspace_kind").String(); v != "project" {
+		t.Fatalf("X-Codex-Turn-Metadata.workspace_kind = %q, want %q", v, "project")
+	}
+	if v := gjson.Get(turnMeta, "request_kind").String(); v != "turn" {
+		t.Fatalf("X-Codex-Turn-Metadata.request_kind = %q, want %q", v, "turn")
+	}
+
+	sessionID := gjson.Get(turnMeta, "session_id").String()
+	threadID := gjson.Get(turnMeta, "thread_id").String()
+	turnID := gjson.Get(turnMeta, "turn_id").String()
+	wantWindowID := sessionID + ":0"
+
+	// Risk control on the wham/usage endpoints sniffs the UUID version
+	// nibble (position 14, the first char of the 3rd group). Real
+	// codex_vscode emits UUID v7 — e.g. 019e84d2-601e-7f20-9b21-d0243523f4aa.
+	// A v4 here gets the token invalidated within ~15min and the upstream
+	// account auto-disabled. Production evidence: 2026-06-02 19:35 a synthesized
+	// v4 request returned 200, then 19:50 wham/usage flipped to 401.
+	for name, id := range map[string]string{"session_id": sessionID, "thread_id": threadID, "turn_id": turnID} {
+		if len(id) < 15 {
+			t.Fatalf("%s = %q is too short to be a UUID", name, id)
+		}
+		if id[14] != '7' {
+			t.Fatalf("%s = %q, version digit = %c, want '7' (real codex_vscode uses UUID v7)", name, id, id[14])
+		}
+	}
+
+	checks := map[string]string{
+		"X-Client-Request-Id":   turnID,
+		"Session-Id":            sessionID,
+		"Thread-Id":             threadID,
+		"X-Codex-Window-Id":     wantWindowID,
+		"X-Codex-Beta-Features": "terminal_resize_reflow",
+	}
+	for header, want := range checks {
+		if got := req.Header.Get(header); got != want {
+			t.Fatalf("%s = %q, want %q (must match the synthesized fingerprint)", header, got, want)
+		}
+	}
+	if got := gjson.Get(turnMeta, "window_id").String(); got != wantWindowID {
+		t.Fatalf("X-Codex-Turn-Metadata.window_id = %q, want %q", got, wantWindowID)
 	}
 }
 
