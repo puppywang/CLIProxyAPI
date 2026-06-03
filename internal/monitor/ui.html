@@ -1152,6 +1152,7 @@
     const list = Array.from(entries.values())
       .sort((a, b) => new Date(b.started_at) - new Date(a.started_at));
     metaCount.textContent = list.length + ' active';
+    updateTitle();
     if (list.length === 0) {
       tableEl.hidden = true;
       emptyEl.hidden = false;
@@ -1213,6 +1214,53 @@
   function setStatus(msg, isError) {
     statusEl.textContent = msg;
     statusEl.classList.toggle('error', !!isError);
+  }
+
+  // Document title broadcasts the core state so a backgrounded tab
+  // still tells the operator at a glance whether anything's going on.
+  // Format (non-zero parts only): "⊘ ▶3 ⏸2 ⚠5 · CPA In-Flight Monitor"
+  //   ⊘   SSE disconnected — the numbers behind it are stale
+  //   ▶N  N requests in flight right now (live activity heartbeat)
+  //   ⏸M  M auths currently in cooldown (degradations that need attention)
+  //   ⚠K  K errors in the last 5 min (recent trouble window — the
+  //       50-entry ring also holds old errors but those rarely matter
+  //       as a live signal, so we filter by time here)
+  // All-clear collapses to just the base title so a healthy tab looks
+  // the same as any other.
+  const BASE_TITLE = 'CPA In-Flight Monitor';
+  const RECENT_ERROR_WINDOW_MS = 5 * 60 * 1000;
+  let titleConnected = false;
+  let titleRecentErrors = 0;
+
+  function updateTitle() {
+    const inFlight = entries.size;
+    let cooldowns = 0;
+    const cooldownsEl = document.getElementById('cooldownsCount');
+    if (cooldownsEl) {
+      cooldowns = parseInt(cooldownsEl.textContent, 10) || 0;
+    }
+    const parts = [];
+    if (!titleConnected) parts.push('⊘');
+    if (inFlight > 0) parts.push('▶' + inFlight);
+    if (cooldowns > 0) parts.push('⏸' + cooldowns);
+    if (titleRecentErrors > 0) parts.push('⚠' + titleRecentErrors);
+    document.title = parts.length ? parts.join(' ') + ' · ' + BASE_TITLE : BASE_TITLE;
+  }
+
+  // Mark the SSE channel up. Called on EventSource open and on every
+  // event that arrives — the latter gives us a free heartbeat even
+  // when the browser auto-reconnects without firing onopen.
+  function markTitleConnected() {
+    if (!titleConnected) {
+      titleConnected = true;
+      updateTitle();
+    }
+  }
+  function markTitleDisconnected() {
+    if (titleConnected) {
+      titleConnected = false;
+      updateTitle();
+    }
   }
 
   async function apiFetch(path, opts) {
@@ -1540,6 +1588,18 @@
       noteServerNow(data.now);
       const records = data.records || [];
       $('errorsCount').textContent = records.length;
+      // Title indicator counts only errors in the recent window so a
+      // long-stale panel (e.g. the operator left it open overnight)
+      // doesn't show a permanent ⚠ alarm. The panel itself still shows
+      // every record up to the API's limit so the operator can scroll
+      // back when they want.
+      const cutoff = Date.now() - RECENT_ERROR_WINDOW_MS;
+      titleRecentErrors = 0;
+      for (const r of records) {
+        const t = r.recorded_at ? new Date(r.recorded_at).getTime() : 0;
+        if (t >= cutoff) titleRecentErrors++;
+      }
+      updateTitle();
       // Always keep the Recent Errors panel visible — matches Recent
       // cancellations' behaviour and gives operators a stable anchor
       // even when there are zero errors right now. The collapse/expand
@@ -1681,6 +1741,7 @@
       noteServerNow(data.now);
       const accounts = data.accounts || [];
       $('cooldownsCount').textContent = String(accounts.length);
+      updateTitle();
       const body = $('cooldownsBody');
       body.innerHTML = '';
       for (const a of accounts) {
@@ -2087,13 +2148,18 @@
     const url = '/v0/management/in-flight/stream?key=' + encodeURIComponent(key);
     evt = new EventSource(url);
     let opened = false;
-    evt.onopen = () => { opened = true; setStatus('Connected. Streaming live updates.'); };
+    evt.onopen = () => { opened = true; markTitleConnected(); setStatus('Connected. Streaming live updates.'); };
     evt.onerror = (err) => {
+      markTitleDisconnected();
       if (!opened) setStatus('Connection failed. Check the management key.', true);
       else setStatus('Connection interrupted; retrying.', true);
     };
     const handle = (ev) => {
       try {
+        // Each event arrival is a heartbeat — the browser auto-
+        // reconnects on its own without re-firing onopen, so we rely
+        // on the event flow itself to confirm the channel is alive.
+        markTitleConnected();
         const payload = JSON.parse(ev.data);
         const entry = payload.entry;
         if (!entry) return;
