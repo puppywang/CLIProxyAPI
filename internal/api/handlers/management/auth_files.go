@@ -563,6 +563,18 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}
+	// Surface the cached wham/usage snapshot so the management UI can
+	// render quota state directly next to each credential. Empty when no
+	// quota subsystem is wired (non-codex pools) or the cache has no
+	// fresh entry for this auth — the panel renders an em-dash in that
+	// case. Operators get one-click "refresh now" via the per-auth
+	// `/v0/management/quota-refresh` endpoint which re-populates this
+	// field on success.
+	if snapshotFn := h.getQuotaSnapshotFunc(); snapshotFn != nil {
+		if snap, ok := snapshotFn(auth.ID); ok {
+			entry["quota"] = snap
+		}
+	}
 	return entry
 }
 
