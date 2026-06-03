@@ -702,6 +702,30 @@ func (r *ModelRegistry) SuspendClientModel(clientID, modelID, reason string) {
 	}
 }
 
+// SuspendedModelsForClient returns the list of models the named client
+// is currently suspended on. Used by the management cooldown panel so
+// operators see which model_registry suspensions still apply — these
+// are tracked SEPARATELY from the per-ModelState fields on the Auth
+// (a clean ModelState can coexist with a stale registry suspension).
+// Returns nil when the client has no active suspensions.
+func (r *ModelRegistry) SuspendedModelsForClient(clientID string) []string {
+	if clientID == "" {
+		return nil
+	}
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	var out []string
+	for modelID, registration := range r.models {
+		if registration == nil || registration.SuspendedClients == nil {
+			continue
+		}
+		if _, ok := registration.SuspendedClients[clientID]; ok {
+			out = append(out, modelID)
+		}
+	}
+	return out
+}
+
 // ResumeClientModel clears a previous suspension so the client counts toward availability again.
 // Parameters:
 //   - clientID: The client to resume

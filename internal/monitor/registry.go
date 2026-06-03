@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,6 +70,14 @@ type Entry struct {
 	ThreadID     string `json:"thread_id,omitempty"`
 	TurnID       string `json:"turn_id,omitempty"`
 	ThreadSource string `json:"thread_source,omitempty"`
+
+	// Workspace is the client's reported current working directory,
+	// extracted from the Codex CLI environment_context block in the
+	// request body (<cwd>…</cwd>). Optional — empty for non-Codex
+	// clients or for requests without an environment_context payload.
+	// The UI ellipsis-truncates the path to its trailing segment(s)
+	// and shows the full value on hover.
+	Workspace string `json:"workspace,omitempty"`
 }
 
 // trackedRequest is the mutable runtime representation behind a registry entry.
@@ -105,6 +114,7 @@ type trackedRequest struct {
 	threadID     string
 	turnID       string
 	threadSource string
+	workspace    string
 }
 
 func (t *trackedRequest) snapshot() Entry {
@@ -148,6 +158,7 @@ func (t *trackedRequest) snapshot() Entry {
 		ThreadID:      t.threadID,
 		TurnID:        t.turnID,
 		ThreadSource:  t.threadSource,
+		Workspace:     t.workspace,
 	}
 }
 
@@ -157,18 +168,47 @@ func (t *trackedRequest) snapshot() Entry {
 // Registry tolerates a nil lookup.
 type AuthLookup func(authID string) (label string, provider string, proxy string, ok bool)
 
+// AuthBytesRecorder reports the request body size against the named auth.
+// The cliproxy Service wires this to LeastRemainingQuotaSelector's
+// RecordRequestBytes so the next CombinedQuotaScore reflects in-flight
+// volume that wham/usage has not yet absorbed. Optional — pools without
+// the codex quota subsystem skip the hookup. Invoked exactly once per
+// request (at SetAuth time), so callers must NOT call it again for the
+// same request on byte-count updates.
+type AuthBytesRecorder func(authID string, bytes int64)
+
 // Registry is the central in-memory tracker of all in-flight requests.
 type Registry struct {
-	mu          sync.RWMutex
-	entries     map[string]*trackedRequest
-	subscribers map[chan Event]struct{}
-	authLookup  AuthLookup
+	mu            sync.RWMutex
+	entries       map[string]*trackedRequest
+	subscribers   map[chan Event]struct{}
+	authLookup    AuthLookup
+	bytesRecorder AuthBytesRecorder
 
-	settings *SettingsStore
-	history  *historyRing
-	histLog  *historyLog
-	errors   *errorsRing
+	settings  *SettingsStore
+	history   *historyRing
+	histLog   *historyLog
+	errors    *errorsRing
+	errorsLog *errorsLog
+
+	// sessionWorkspaces remembers the last observed `<cwd>` value per
+	// session_id, independent of any tracked request lifetime. In-flight
+	// entries are removed 5 seconds after Finish, so a panel that wants
+	// to display "binding X belongs to workspace Y" would otherwise lose
+	// the link as soon as the conversation goes idle. Capping prevents
+	// unbounded growth — the session cache enforces a TTL too, so any
+	// entry past `sessionWorkspaceMax` is FIFO-evicted at insertion
+	// time.
+	sessionWorkspacesMu sync.RWMutex
+	sessionWorkspaces   map[string]string
+	sessionWorkspaceOrd []string
 }
+
+// sessionWorkspaceMax caps the in-memory session-id → workspace map.
+// Sized comfortably above any plausible session-affinity cache TTL
+// throughput (a few thousand bindings per 6h is the upper bound for
+// the current production pool).
+const sessionWorkspaceMax = 4096
 
 // Event is the message broadcast to SSE subscribers.
 type Event struct {
@@ -195,10 +235,11 @@ const criticalBroadcastTimeout = 250 * time.Millisecond
 // NewRegistry constructs an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{
-		entries:     make(map[string]*trackedRequest),
-		subscribers: make(map[chan Event]struct{}),
-		history:     newHistoryRing(200),
-		errors:      newErrorsRing(200),
+		entries:           make(map[string]*trackedRequest),
+		subscribers:       make(map[chan Event]struct{}),
+		sessionWorkspaces: make(map[string]string),
+		history:           newHistoryRing(200),
+		errors:            newErrorsRing(200),
 	}
 }
 
@@ -214,6 +255,27 @@ func (r *Registry) AttachHistoryLog(path string) {
 	r.mu.Lock()
 	r.histLog = newHistoryLog(path)
 	r.mu.Unlock()
+}
+
+// AttachErrorsLog wires a JSONL writer that persists every non-2xx
+// outcome captured by maybeRecordError. On attach, the most recent
+// `errors.capacity` lines are streamed back into the ring buffer so
+// the "Errors" panel survives CPA restarts. Writes are best-effort —
+// a failed append never blocks the request lifecycle.
+func (r *Registry) AttachErrorsLog(path string) {
+	r.mu.Lock()
+	r.errorsLog = newErrorsLog(path)
+	ring := r.errors
+	r.mu.Unlock()
+	if ring == nil {
+		return
+	}
+	// Replay the on-disk tail into the in-memory ring so the panel is
+	// populated before the first request lands.
+	replay := r.errorsLog.loadRecent(ring.capacity)
+	for _, rec := range replay {
+		ring.add(rec)
+	}
 }
 
 // Settings returns the live settings snapshot or zero values when no store is attached.
@@ -271,6 +333,17 @@ func (r *Registry) RecentErrors(limit int) []ErrorRecord {
 func (r *Registry) SetAuthLookup(lookup AuthLookup) {
 	r.mu.Lock()
 	r.authLookup = lookup
+	r.mu.Unlock()
+}
+
+// SetBytesRecorder installs (or replaces) the per-auth request bytes
+// recorder. Invoked exactly once when SetAuth fires for a request,
+// with the request body size captured at Register time. The cliproxy
+// Service wires this to the LeastRemainingQuotaSelector so the next
+// pick reflects volume not yet absorbed by wham/usage.
+func (r *Registry) SetBytesRecorder(rec AuthBytesRecorder) {
+	r.mu.Lock()
+	r.bytesRecorder = rec
 	r.mu.Unlock()
 }
 
@@ -402,16 +475,22 @@ func (r *Registry) maybeRecordError(snap Entry) {
 	}
 	r.mu.RLock()
 	er := r.errors
+	logger := r.errorsLog
 	r.mu.RUnlock()
 	if er == nil {
 		return
 	}
-	er.add(ErrorRecord{
+	rec := ErrorRecord{
 		Entry:      snap,
 		StatusCode: snap.StatusCode,
 		Reason:     reason,
 		RecordedAt: time.Now(),
-	})
+	}
+	er.add(rec)
+	// Persist after the ring update so an append failure cannot keep
+	// the record out of the live panel — operator visibility wins
+	// over durability when the two diverge.
+	logger.append(rec)
 }
 
 // classifyErrorReason returns a short tag describing why an entry is
@@ -519,6 +598,78 @@ func (r *Registry) SetModel(t *trackedRequest, model string) {
 	r.broadcast(Event{Type: "updated", Entry: t.snapshot()})
 }
 
+// SetWorkspace records the client's reported current working directory
+// (typically extracted from a Codex CLI <cwd>…</cwd> tag). Empty input
+// does NOT overwrite an existing non-empty value, mirroring the
+// SetTurnMetadata pattern: a malformed follow-up request cannot erase
+// context that was already captured.
+func (r *Registry) SetWorkspace(t *trackedRequest, workspace string) {
+	if t == nil || workspace == "" {
+		return
+	}
+	t.mu.Lock()
+	if t.workspace == workspace {
+		t.mu.Unlock()
+		return
+	}
+	t.workspace = workspace
+	t.mu.Unlock()
+	r.touch(t)
+	r.broadcast(Event{Type: "updated", Entry: t.snapshot()})
+}
+
+// RecordSessionWorkspace remembers the workspace path observed for a
+// given session_id, outside the per-entry tracking lifetime. The
+// Bindings reverse-index endpoint uses this to render the workspace
+// next to each cached session binding (which long-outlives any single
+// in-flight Entry). FIFO-evicts the oldest entry when sessionWorkspaceMax
+// is exceeded.
+func (r *Registry) RecordSessionWorkspace(sessionID, workspace string) {
+	if r == nil {
+		return
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	workspace = strings.TrimSpace(workspace)
+	if sessionID == "" || workspace == "" {
+		return
+	}
+	r.sessionWorkspacesMu.Lock()
+	defer r.sessionWorkspacesMu.Unlock()
+	if existing, ok := r.sessionWorkspaces[sessionID]; ok {
+		if existing == workspace {
+			return
+		}
+		// Same key, value changed (e.g., user reopened a different
+		// workspace in the same chat panel) — overwrite, keep its
+		// position in the ord slice unchanged so eviction stays FIFO
+		// over the original insertion order.
+		r.sessionWorkspaces[sessionID] = workspace
+		return
+	}
+	if len(r.sessionWorkspaceOrd) >= sessionWorkspaceMax {
+		oldest := r.sessionWorkspaceOrd[0]
+		r.sessionWorkspaceOrd = r.sessionWorkspaceOrd[1:]
+		delete(r.sessionWorkspaces, oldest)
+	}
+	r.sessionWorkspaces[sessionID] = workspace
+	r.sessionWorkspaceOrd = append(r.sessionWorkspaceOrd, sessionID)
+}
+
+// SessionWorkspaceSnapshot returns a copy of the entire session-id →
+// workspace map. Safe for the caller to retain and mutate.
+func (r *Registry) SessionWorkspaceSnapshot() map[string]string {
+	if r == nil {
+		return nil
+	}
+	r.sessionWorkspacesMu.RLock()
+	defer r.sessionWorkspacesMu.RUnlock()
+	out := make(map[string]string, len(r.sessionWorkspaces))
+	for k, v := range r.sessionWorkspaces {
+		out[k] = v
+	}
+	return out
+}
+
 // SetAuth updates the selected auth identifier and enriches label, provider,
 // and outbound proxy from the configured AuthLookup.
 func (r *Registry) SetAuth(t *trackedRequest, authID string) {
@@ -527,6 +678,7 @@ func (r *Registry) SetAuth(t *trackedRequest, authID string) {
 	}
 	r.mu.RLock()
 	lookup := r.authLookup
+	recorder := r.bytesRecorder
 	r.mu.RUnlock()
 
 	label, provider, proxy := "", "", ""
@@ -539,7 +691,8 @@ func (r *Registry) SetAuth(t *trackedRequest, authID string) {
 	}
 
 	t.mu.Lock()
-	if t.authID == authID && t.authLabel == label && t.provider == provider && t.authProxy == proxy {
+	alreadySet := t.authID == authID
+	if alreadySet && t.authLabel == label && t.provider == provider && t.authProxy == proxy {
 		t.mu.Unlock()
 		return
 	}
@@ -554,6 +707,17 @@ func (r *Registry) SetAuth(t *trackedRequest, authID string) {
 	// otherwise removing a proxy at runtime wouldn't show up here.
 	t.authProxy = proxy
 	t.mu.Unlock()
+
+	// Record the request body size against this auth's local quota
+	// counter — once per request, gated on alreadySet so a stream/retry
+	// that lands on the same credential doesn't double-charge. We pull
+	// requestBytes from the atomic counter (filled at Register time from
+	// Content-Length).
+	if !alreadySet && recorder != nil {
+		if n := t.requestBytes.Load(); n > 0 {
+			recorder(authID, n)
+		}
+	}
 	r.touch(t)
 	r.broadcast(Event{Type: "updated", Entry: t.snapshot()})
 }
