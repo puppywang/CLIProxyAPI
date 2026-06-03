@@ -166,6 +166,16 @@ func parseWhamUsage(body []byte) (coreauth.QuotaSnapshot, bool, error) {
 			snap.LimitReached = true
 		}
 	}
+	// Saturation heuristic: wham sometimes reports used_percent=100
+	// while still leaving limit_reached=false (the "approval review
+	// failed: hit usage limit" case observed on the codex reasoning
+	// model — the weekly window is at 100% and the upstream API IS
+	// blocking, but the flag doesn't flip). Treat >=100% on either
+	// window as limit-reached so downstream cooldown logic kicks in
+	// without waiting for an HTTP-429 from the next user request.
+	if !snap.LimitReached && (snap.UsedPercentPrimary >= 100 || snap.UsedPercentSecondary >= 100) {
+		snap.LimitReached = true
+	}
 	return snap, true, nil
 }
 

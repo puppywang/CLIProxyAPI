@@ -259,7 +259,10 @@ func (h *Handler) ForceAuthCooldown(c *gin.Context) {
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
-	updated, err := h.authManager.ForceCooldown(ctx, resolvedID, until)
+	// Empty statusMessage falls back to "manual cooldown" inside the
+	// manager; only the refresher's wham-saturation hook passes a
+	// different label.
+	updated, err := h.authManager.ForceCooldown(ctx, resolvedID, until, "")
 	if err != nil {
 		msg := err.Error()
 		if strings.Contains(msg, "not found") {

@@ -3414,6 +3414,8 @@ func (m *Manager) ClearCooldown(ctx context.Context, id string) (*Auth, error) {
 			strings.Contains(lower, "upstream connect error") ||
 			strings.Contains(lower, "transient upstream error") ||
 			strings.Contains(lower, "disconnect/reset before headers") ||
+			strings.Contains(lower, "manual cooldown") ||
+			strings.Contains(lower, "wham quota") ||
 			strings.HasPrefix(lower, "{\"error\"") {
 			auth.StatusMessage = ""
 		}
@@ -3472,16 +3474,26 @@ const ManualCooldownReason = "manual"
 // ForceCooldown marks an auth as quota-exceeded until `until`, regardless
 // of what upstream wham/usage thinks. Used when wham returns stale or
 // wrong data (e.g. claims 100% available on an account that has
-// actually exhausted its quota) and the operator needs to take the
-// auth out of rotation manually. Mirrors the per-model + registry
-// suspension that an upstream 429 would trigger so the selector and
-// every downstream filter treat this auth as exhausted until `until`.
+// actually exhausted its quota) and the operator (or the refresher's
+// own saturation heuristic) needs to take the auth out of rotation.
+// Mirrors the per-model + registry suspension that an upstream 429
+// would trigger so the selector and every downstream filter treat this
+// auth as exhausted until `until`.
+//
+// `statusMessage` annotates the auth-level / per-model state with a
+// human-readable label (rendered in the cooldowns panel and auth-files
+// status). Pass "" for the default "manual cooldown" wording; the
+// refresher's wham-saturation hook passes "wham quota limit reached"
+// so an operator can distinguish hand-set vs auto-detected cooldowns
+// at a glance. The cooldown reason is always ManualCooldownReason
+// so the auto-recovery path treats both kinds identically (don't
+// clear until the deadline passes, regardless of wham flicker).
 //
 // If `until` is zero or already in the past, returns an error without
 // changing state — a zero/expired cooldown is the same as Clear, which
-// the operator should use instead so the auto-recovery semantics are
+// the caller should use instead so the auto-recovery semantics are
 // honoured (Clear nukes the manual marker too).
-func (m *Manager) ForceCooldown(ctx context.Context, id string, until time.Time) (*Auth, error) {
+func (m *Manager) ForceCooldown(ctx context.Context, id string, until time.Time, statusMessage string) (*Auth, error) {
 	id = strings.TrimSpace(id)
 	if m == nil {
 		return nil, fmt.Errorf("auth manager: nil receiver")
@@ -3493,6 +3505,10 @@ func (m *Manager) ForceCooldown(ctx context.Context, id string, until time.Time)
 	if until.IsZero() || !until.After(now) {
 		return nil, fmt.Errorf("auth manager: cooldown deadline must be in the future")
 	}
+	msg := strings.TrimSpace(statusMessage)
+	if msg == "" {
+		msg = "manual cooldown"
+	}
 	m.mu.Lock()
 	auth, ok := m.auths[id]
 	if !ok {
@@ -3501,7 +3517,7 @@ func (m *Manager) ForceCooldown(ctx context.Context, id string, until time.Time)
 	}
 	auth.Unavailable = true
 	auth.Status = StatusError
-	auth.StatusMessage = "manual cooldown"
+	auth.StatusMessage = msg
 	auth.NextRetryAfter = until
 	auth.Quota = QuotaState{
 		Exceeded:      true,
@@ -3521,7 +3537,7 @@ func (m *Manager) ForceCooldown(ctx context.Context, id string, until time.Time)
 		}
 		state.Unavailable = true
 		state.Status = StatusError
-		state.StatusMessage = "manual cooldown"
+		state.StatusMessage = msg
 		state.NextRetryAfter = until
 		state.Quota = QuotaState{
 			Exceeded:      true,
