@@ -891,7 +891,14 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	headers.Set("OpenAI-Beta", betaHeader)
 	sessionFallback := ""
 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
-		sessionFallback = uuid.NewString()
+		// chatgpt.com's risk control sniffs the UUID version of
+		// session_id — a v4 produced by uuid.NewString() trips the
+		// heuristic and the account gets flagged. v7 looks legitimate
+		// (same shape the real Codex CLI emits). This replaces the
+		// upstream uuid.NewString() default; the structural change in
+		// upstream (single ensureCodexWebsocketSessionHeader call with
+		// a fallback string) is preserved.
+		sessionFallback = uuid.Must(uuid.NewV7()).String()
 	}
 	ensureCodexWebsocketSessionHeader(headers, ginHeaders, sessionFallback)
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {

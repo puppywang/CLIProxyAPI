@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
@@ -802,14 +803,97 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 	// reload swaps it (applyConfigUpdate), this refresher is stopped and
 	// replaced by a new one bound to the new selector.
 	selector := s.quotaSelector
+	mgr := s.coreManager
 	refresher := quota.NewRefresher(
 		s.quotaFetcher,
-		func() []*coreauth.Auth { return s.coreManager.List() },
+		func() []*coreauth.Auth { return mgr.List() },
 		selector.PushSnapshot,
+		// Auto-clear stale cooldown markers when wham confirms the
+		// auth is healthy upstream. Bridges the gap between the
+		// conductor's "recover on next success call" path and the
+		// reality that a stuck auth may be filtered out of the
+		// candidate pool, never seeing a success to trigger the
+		// existing recovery. Without this, an auth like
+		// t.yamada.takashi can sit on a 2h-stale `quota_exceeded`
+		// marker indefinitely because the next-success path can't
+		// fire.
+		quota.WithStaleCooldownClearer(func(ctx context.Context, authID string) error {
+			// Skip auto-clear when the operator has set a manual
+			// cooldown that has not yet expired — the whole point of
+			// the manual entry is to hold an auth out of rotation
+			// even when wham/usage is returning bogus 100%-available
+			// data. Once NextRecoverAt passes, the operator's
+			// intended duration is fulfilled and the refresher can
+			// clear normally.
+			if existing, ok := mgr.GetByID(authID); ok && existing != nil {
+				if existing.Quota.Reason == coreauth.ManualCooldownReason &&
+					!existing.Quota.NextRecoverAt.IsZero() &&
+					existing.Quota.NextRecoverAt.After(time.Now()) {
+					return nil
+				}
+			}
+			_, err := mgr.ClearCooldown(ctx, authID)
+			return err
+		}),
 	)
 	refresher.Start(ctx)
 	s.quotaRefresher = refresher
 	log.Infof("quota refresher started (interval=%s, concurrency=%d)", quota.DefaultRefreshInterval, quota.DefaultConcurrency)
+
+	// Expose the snapshot + synchronous refresh to the management API so
+	// the operator UI can render quota state next to each credential and
+	// drive a per-account "refresh now" button. The wiring goes through
+	// the api.Server because the management handler lives there; this
+	// service holds the actual quota subsystem.
+	if s.server != nil {
+		// optTime is the same omit-zero helper the cooldown endpoint uses:
+		// Go's omitempty leaves zero time.Time as "0001-01-01T00:00:00Z"
+		// in JSON because time.Time is a struct, not a primitive. The
+		// pointer pattern makes the field genuinely optional and the UI
+		// can then test for null instead of parsing the absurd zero
+		// timestamp and rendering "739768d ago".
+		optTime := func(t time.Time) *time.Time {
+			if t.IsZero() {
+				return nil
+			}
+			return &t
+		}
+		toManagement := func(snap coreauth.QuotaSnapshot) managementHandlers.QuotaSnapshotData {
+			return managementHandlers.QuotaSnapshotData{
+				UsedPercentPrimary:   snap.UsedPercentPrimary,
+				UsedPercentSecondary: snap.UsedPercentSecondary,
+				LimitReached:         snap.LimitReached,
+				ResetAtPrimary:       optTime(snap.ResetAtPrimary),
+				ResetAtSecondary:     optTime(snap.ResetAtSecondary),
+				FetchedAt:            optTime(snap.FetchedAt),
+			}
+		}
+		snapshotFn := func(authID string) (managementHandlers.QuotaSnapshotData, bool) {
+			snap, ok := selector.Snapshot(authID)
+			if !ok {
+				return managementHandlers.QuotaSnapshotData{}, false
+			}
+			return toManagement(snap), true
+		}
+		refreshFn := func(ctx context.Context, authID string) (managementHandlers.QuotaSnapshotData, bool, error) {
+			snap, ok, err := refresher.RefreshNow(ctx, authID)
+			if err != nil || !ok {
+				return managementHandlers.QuotaSnapshotData{}, ok, err
+			}
+			return toManagement(snap), true, nil
+		}
+		s.server.SetQuotaProviders(snapshotFn, refreshFn)
+		// Forward request-body-bytes from the in-flight monitor into
+		// the quota selector's local accumulator. The monitor invokes
+		// this exactly once per request (at SetAuth time) so the next
+		// CombinedQuotaScore reflects in-flight volume that wham/usage
+		// has not yet absorbed — closing the ~10-min reporting gap
+		// between wham snapshots.
+		qsel := s.quotaSelector
+		s.server.SetMonitorBytesRecorder(func(authID string, bytes int64) {
+			qsel.RecordRequestBytes(authID, bytes)
+		})
+	}
 }
 
 // stopQuotaRefresher stops the background refresher if running. Idempotent.
@@ -1182,11 +1266,13 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 
 	if s.coreManager != nil && selectorChanged {
 		var selector coreauth.Selector
+		var leastBound *coreauth.LeastBoundSelector
 		switch nextStrategy {
 		case "fill-first":
 			selector = &coreauth.FillFirstSelector{}
 		default:
-			selector = coreauth.NewRoundRobinSelectorWithPersistence(rrCursorPath(newCfg))
+			leastBound = coreauth.NewLeastBoundSelector(nil, nil)
+			selector = leastBound
 		}
 
 		// Wrap with quota-aware selection. Mirrors the chain in builder.go
@@ -1215,12 +1301,25 @@ func (s *Service) applyConfigUpdate(newCfg *config.Config) {
 					ttl = parsed
 				}
 			}
-			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
+			affinity := coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
 				Fallback:        selector,
 				TTL:             ttl,
 				PersistencePath: sessionAffinityCachePath(newCfg),
 				Strict:          nextSessionAffinityStrict,
 			})
+			if leastBound != nil {
+				qs := quotaSelector
+				// Mirror builder.go: combined primary*100 + secondary
+				// so weekly usage breaks primary-tied ties.
+				leastBound.SetSecondaryScore(func(authID string) int {
+					score, ok := qs.CombinedQuotaScore(authID)
+					if !ok {
+						return coreauth.DefaultNeutralUsedPercent * 100
+					}
+					return score
+				})
+			}
+			selector = affinity
 		}
 
 		s.coreManager.SetSelector(selector)
