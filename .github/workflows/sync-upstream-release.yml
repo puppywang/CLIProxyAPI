@@ -143,10 +143,34 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM_TAG: ${{ steps.detect.outputs.upstream_tag }}
           FORK_TAG:     ${{ steps.detect.outputs.fork_tag }}
+          RUN_URL:      ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          # Dedup: every 6h while the conflict persists, this step runs.
+          # Without a guard we would file a new issue every cron, which
+          # turns the inbox into spam and trains the operator to ignore
+          # it — the exact opposite of what alerting is for. So: only
+          # file when there is no open auto-sync issue mentioning this
+          # upstream tag. When one already exists, append a comment with
+          # the latest run URL instead — gives the operator a single
+          # rolling thread per conflict.
+          EXISTING_NUM=$(gh issue list \
+            --label "auto-sync" \
+            --state open \
+            --search "in:title \"${UPSTREAM_TAG}\"" \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING_NUM" ]; then
+            echo "Open auto-sync issue #${EXISTING_NUM} already covers ${UPSTREAM_TAG}; appending run link."
+            gh issue comment "$EXISTING_NUM" \
+              --body "Still failing as of $(date -u +%Y-%m-%dT%H:%M:%SZ). Latest run: ${RUN_URL}" || true
+            exit 0
+          fi
+
           BODY_FILE=$(mktemp)
           {
             echo "Scheduled sync could not auto-rebase \`${FEATURE_BRANCH}\` onto upstream tag **${UPSTREAM_TAG}**."
+            echo
+            echo "Latest failing run: ${RUN_URL}"
             echo
             echo "## Rebase output"
             echo
