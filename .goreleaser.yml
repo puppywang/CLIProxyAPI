@@ -1,0 +1,56 @@
+version: 2
+
+# Fork-local config. Upstream removed their .goreleaser.yml in 9ee64935
+# and migrated to a tag-triggered matrix workflow, but our
+# sync-upstream-release.yml still invokes goreleaser directly because
+# the default GITHUB_TOKEN cannot trigger downstream workflows on push.
+# This config is intentionally minimal — cross-compile pure-Go binaries
+# without the zig CGO toolchain the original config depended on. The
+# main server has no `import "C"` so CGO_ENABLED=0 is safe; the only
+# CGO-using files in the tree are example plugins under examples/plugin/
+# that goreleaser never builds.
+
+builds:
+  - id: "cli-proxy-api"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    main: ./cmd/server/
+    binary: cli-proxy-api
+    ldflags:
+      - -s -w -X 'main.Version={{.Version}}' -X 'main.Commit={{.ShortCommit}}' -X 'main.BuildDate={{.Date}}'
+
+archives:
+  - id: "cli-proxy-api"
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{- if eq .Arch "arm64" -}}aarch64{{- else -}}{{ .Arch }}{{- end -}}
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+      - README_CN.md
+      - config.example.yaml
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
