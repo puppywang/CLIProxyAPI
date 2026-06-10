@@ -864,7 +864,16 @@
   const metaCount = $('metaCount');
   const keyEl = $('mgmtKey');
 
-  keyEl.value = sessionStorage.getItem(KEY_STORAGE) || '';
+  // Persist the management key in localStorage so reopening the page
+  // (new tab, new window, browser restart) doesn't make the operator
+  // re-paste it every time. Migrate any sessionStorage value seeded by
+  // older builds so existing users don't have to retype on the first
+  // visit after this change.
+  const migratedKey = localStorage.getItem(KEY_STORAGE) || sessionStorage.getItem(KEY_STORAGE) || '';
+  if (migratedKey && !localStorage.getItem(KEY_STORAGE)) {
+    localStorage.setItem(KEY_STORAGE, migratedKey);
+  }
+  keyEl.value = migratedKey;
 
   // Server-vs-client clock offset. The browser's Date.now() can drift several
   // seconds away from the server (NTP skew, VM suspend, etc.). Without this,
@@ -2142,7 +2151,7 @@
       setStatus('Enter the management key first.', true);
       return;
     }
-    sessionStorage.setItem(KEY_STORAGE, key);
+    localStorage.setItem(KEY_STORAGE, key);
     if (evt) { evt.close(); evt = null; }
     // EventSource does not support custom headers; embed the key in the URL.
     const url = '/v0/management/in-flight/stream?key=' + encodeURIComponent(key);
