@@ -497,6 +497,12 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			entry["account"] = account
 		}
 	}
+	// Grok Build vs official API routing, surfaced so the UI can render and
+	// toggle it per grok account. true = official API (api.x.ai), false = Grok
+	// Build (cli-chat-proxy, the larger SuperGrok allowance).
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") {
+		entry["xai_using_api"] = xaiEffectiveUsingAPI(auth)
+	}
 	if !auth.CreatedAt.IsZero() {
 		entry["created_at"] = auth.CreatedAt
 	}
@@ -542,6 +548,15 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 				entry["priority"] = int(v)
 			case int:
 				entry["priority"] = v
+			case int64:
+				entry["priority"] = int(v)
+			case json.Number:
+				// PatchAuthFileFields decodes with UseNumber, so a freshly
+				// patched priority is a json.Number in memory until a disk
+				// reload re-unmarshals it to float64.
+				if parsed, err := v.Int64(); err == nil {
+					entry["priority"] = int(parsed)
+				}
 			case string:
 				if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
 					entry["priority"] = parsed
@@ -573,6 +588,21 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if snapshotFn := h.getQuotaSnapshotFunc(); snapshotFn != nil {
 		if snap, ok := snapshotFn(auth.ID); ok {
 			entry["quota"] = snap
+		}
+	}
+	// Surface cooldown markers (per-model ModelState, auth-level Quota,
+	// registry suspended models) so the quota panel can render them
+	// inline and the standalone cooldowns panel can be retired. Reuses
+	// buildCooldownAccount (same shape /v0/management/auth-cooldowns
+	// returns) so the UI's cooldown rendering logic is shared. Only the
+	// cooldown-specific sub-fields are attached — the overlapping
+	// status/disabled/unavailable fields stay on the top-level entry
+	// where the quota panel already reads them.
+	if cd, ok := buildCooldownAccount(auth, registry.GetGlobalRegistry(), time.Now()); ok {
+		entry["cooldown"] = gin.H{
+			"auth":                      cd.Auth,
+			"models":                    cd.Models,
+			"registry_suspended_models": cd.RegistrySuspendedModels,
 		}
 	}
 	return entry
@@ -696,6 +726,45 @@ func authAttribute(auth *coreauth.Auth, key string) string {
 		return ""
 	}
 	return auth.Attributes[key]
+}
+
+// xaiEffectiveUsingAPI mirrors executor.xaiUsingAPI for display: it reports
+// whether an xai auth resolves to the official API path (true) or Grok Build
+// (false). Precedence: explicit using_api attribute, then metadata, then
+// auth_kind (OAuth defaults to Grok Build). Keep in sync with
+// internal/runtime/executor/xai_executor.go.
+func xaiEffectiveUsingAPI(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return true
+	}
+	if auth.Attributes != nil {
+		if raw := strings.TrimSpace(auth.Attributes["using_api"]); raw != "" {
+			if b, err := strconv.ParseBool(raw); err == nil {
+				return b
+			}
+		}
+	}
+	if auth.Metadata != nil {
+		if raw, ok := auth.Metadata["using_api"]; ok && raw != nil {
+			switch v := raw.(type) {
+			case bool:
+				return v
+			case string:
+				if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+					return b
+				}
+			}
+		}
+	}
+	if ak := strings.TrimSpace(auth.Attributes["auth_kind"]); ak != "" {
+		return !strings.EqualFold(ak, "oauth")
+	}
+	if auth.Metadata != nil {
+		if ak, ok := auth.Metadata["auth_kind"].(string); ok && strings.TrimSpace(ak) != "" {
+			return !strings.EqualFold(strings.TrimSpace(ak), "oauth")
+		}
+	}
+	return true
 }
 
 func isRuntimeOnlyAuth(auth *coreauth.Auth) bool {
@@ -955,6 +1024,28 @@ func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.Fil
 }
 
 func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
+	// A sub2api accounts export expands into one CPA auth file per account, so
+	// uploading such an export (or POSTing it to the import endpoint) is handled
+	// transparently here rather than writing the raw export as a bogus auth.
+	if isSub2apiExport(data) {
+		files, _, convErr := convertSub2apiExport(data)
+		if convErr != nil {
+			return convErr
+		}
+		if len(files) == 0 {
+			return fmt.Errorf("sub2api export contained no importable accounts")
+		}
+		for _, f := range files {
+			if err := h.writeSingleAuthFile(ctx, f.Name, f.Data); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return h.writeSingleAuthFile(ctx, name, data)
+}
+
+func (h *Handler) writeSingleAuthFile(ctx context.Context, name string, data []byte) error {
 	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
 	if !filepath.IsAbs(dst) {
 		if abs, errAbs := filepath.Abs(dst); errAbs == nil {

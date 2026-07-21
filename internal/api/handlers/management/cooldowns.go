@@ -174,6 +174,57 @@ func (h *Handler) ClearAuthCooldown(c *gin.Context) {
 	})
 }
 
+// ReleaseAuthBindings drops every session-affinity binding attached to an
+// account. Used after the account hits its quota: releasing its bindings
+// lets each stranded conversation re-pick a fresh account on its next turn
+// (the quota selector excludes the exhausted account, and the new
+// priority/floor logic routes to the best alternative), without the client
+// having to fork the conversation locally. Because CPA strips
+// previous_response_id from every codex upstream call, the switched account
+// receives full context and the conversation continues transparently.
+func (h *Handler) ReleaseAuthBindings(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth manager not configured"})
+		return
+	}
+	identifier := strings.TrimSpace(c.Param("id"))
+	if identifier == "" {
+		identifier = strings.TrimSpace(c.Query("id"))
+	}
+	if identifier == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing auth id"})
+		return
+	}
+	if strings.ContainsAny(identifier, "/\\") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid auth id"})
+		return
+	}
+	resolvedID := identifier
+	for _, a := range h.authManager.List() {
+		if a == nil {
+			continue
+		}
+		if a.ID == identifier || a.FileName == identifier {
+			resolvedID = a.ID
+			break
+		}
+	}
+	selector, ok := h.authManager.Selector().(*coreauth.SessionAffinitySelector)
+	if !ok || selector == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session affinity not enabled"})
+		return
+	}
+	released := selector.InvalidateAuthBindings(resolvedID)
+	c.JSON(http.StatusOK, gin.H{
+		"id":       resolvedID,
+		"released": released,
+	})
+}
+
 // ForceAuthCooldown manually marks an auth as quota-exceeded until a
 // given deadline, used when upstream wham/usage returns wrong data
 // (e.g. claims 100% available on an auth that has actually exhausted
