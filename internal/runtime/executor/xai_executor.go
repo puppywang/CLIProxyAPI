@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +47,16 @@ const (
 	xaiVideosExtensionsPath     = "/videos/extensions"
 	xaiVideosPath               = "/videos"
 	xaiIdempotencyKeyMetaKey    = "idempotency_key"
+	// Grok CLI identity headers, required by the cli-chat-proxy ("Grok Build")
+	// chat endpoint to accept an OAuth token as a grok-cli client.
+	xaiTokenAuthHeader     = "X-XAI-Token-Auth"
+	xaiTokenAuthValue      = "xai-grok-cli"
+	xaiClientVersionHeader = "x-grok-client-version"
+	xaiClientVersionValue  = "0.2.93"
+	// xaiUsingAPIAttr, when set truthy on an auth, forces the official API path
+	// (api.x.ai) for non-media HTTP chat instead of Grok Build. OAuth accounts
+	// default to Grok Build (using_api=false); non-OAuth defaults to the API.
+	xaiUsingAPIAttr = "using_api"
 )
 
 // XAIExecutor is a stateless executor for xAI Grok's Responses API.
@@ -104,13 +115,18 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		return e.executeVideos(ctx, auth, req, opts)
 	}
 
-	token, baseURL := xaiCreds(auth)
-	if baseURL == "" {
-		baseURL = xaiauth.DefaultAPIBaseURL
-	}
+	token, _ := xaiCreds(auth)
+	// Grok Build routing: OAuth chat resolves to cli-chat-proxy (the SuperGrok
+	// subscription path); explicit custom base_url and using_api=true / non-OAuth
+	// stay on the official API. Media requests resolve their own base URL and
+	// are unaffected. The composer bridge follows the same chat base URL.
+	baseURL := xaiChatBaseURL(auth)
 
 	prepared, err := e.prepareResponsesRequest(ctx, req, opts, true)
 	if err != nil {
+		return resp, err
+	}
+	if err = e.maybeBridgeComposerImages(ctx, auth, baseURL, token, prepared); err != nil {
 		return resp, err
 	}
 
@@ -123,7 +139,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	if err != nil {
 		return resp, err
 	}
-	applyXAIHeaders(httpReq, auth, token, true, prepared.sessionID)
+	applyXAIChatHeaders(httpReq, auth, token, true, prepared.sessionID)
 	e.recordXAIRequest(ctx, auth, url, httpReq.Header.Clone(), prepared.body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -147,7 +163,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return resp, statusErr{code: httpResp.StatusCode, msg: string(data)}
+		return resp, statusErr{code: xaiTerminalStatus(httpResp.StatusCode, data), msg: string(normalizeXAIErrorPayload(httpResp.StatusCode, data))}
 	}
 
 	data, err := io.ReadAll(httpResp.Body)
@@ -220,7 +236,7 @@ func (e *XAIExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return resp, statusErr{code: httpResp.StatusCode, msg: string(data)}
+		return resp, statusErr{code: xaiTerminalStatus(httpResp.StatusCode, data), msg: string(normalizeXAIErrorPayload(httpResp.StatusCode, data))}
 	}
 
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
@@ -285,20 +301,21 @@ func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return resp, statusErr{code: httpResp.StatusCode, msg: string(data)}
+		return resp, statusErr{code: xaiTerminalStatus(httpResp.StatusCode, data), msg: string(normalizeXAIErrorPayload(httpResp.StatusCode, data))}
 	}
 
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
 }
 
 func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
-	token, baseURL := xaiCreds(auth)
-	if baseURL == "" {
-		baseURL = xaiauth.DefaultAPIBaseURL
-	}
+	token, _ := xaiCreds(auth)
+	baseURL := xaiChatBaseURL(auth)
 
 	prepared, err := e.prepareResponsesRequest(ctx, req, opts, true)
 	if err != nil {
+		return nil, err
+	}
+	if err = e.maybeBridgeComposerImages(ctx, auth, baseURL, token, prepared); err != nil {
 		return nil, err
 	}
 
@@ -311,7 +328,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 	if err != nil {
 		return nil, err
 	}
-	applyXAIHeaders(httpReq, auth, token, true, prepared.sessionID)
+	applyXAIChatHeaders(httpReq, auth, token, true, prepared.sessionID)
 	e.recordXAIRequest(ctx, auth, url, httpReq.Header.Clone(), prepared.body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -333,7 +350,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(data)}
+		return nil, statusErr{code: xaiTerminalStatus(httpResp.StatusCode, data), msg: string(normalizeXAIErrorPayload(httpResp.StatusCode, data))}
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -529,6 +546,27 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxye
 	}, nil
 }
 
+// maybeBridgeComposerImages applies the grok-composer image bridge in place on
+// the prepared body when enabled and applicable. Composer models reject image
+// input upstream; the bridge describes each image with a vision model and
+// substitutes the description so the composer request succeeds. A no-op for
+// non-composer models, image-free requests, or when disabled in config.
+func (e *XAIExecutor) maybeBridgeComposerImages(ctx context.Context, auth *cliproxyauth.Auth, baseURL, token string, prepared *xaiPreparedRequest) error {
+	if e.cfg == nil || !e.cfg.XAI.ComposerBridgeEnabled() || !helps.IsGrokComposerModel(prepared.baseModel) {
+		return nil
+	}
+	client := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	url := strings.TrimSuffix(baseURL, "/") + "/responses"
+	bridged, n, err := helps.BridgeComposerImages(ctx, client, url, token, e.cfg.XAI.VisionModel(), e.cfg.XAI.VisionMaxTokens(), prepared.body)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		prepared.body = bridged
+	}
+	return nil
+}
+
 func (e *XAIExecutor) recordXAIRequest(ctx context.Context, auth *cliproxyauth.Auth, url string, headers http.Header, body []byte) {
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -547,6 +585,70 @@ func (e *XAIExecutor) recordXAIRequest(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+}
+
+// normalizeXAIErrorPayload rewrites xAI's non-standard error payloads into the
+// OpenAI error envelope so OpenAI-compatible clients (e.g. GitHub Copilot) can
+// parse them. The important case is grok's out-of-credits / spending-limit
+// response — HTTP 403 with {"code":"personal-team-blocked:spending-limit",
+// "error":"You have run out of credits ..."}. xAI puts a plain string in
+// "error", but OpenAI clients expect an object ({"error":{"message":...,
+// "type":...}}), so a raw passthrough breaks their parser. We map it to an
+// insufficient_quota error object. The HTTP status is left as the caller set
+// it (403 stays 403): the account is exhausted, so the request is terminal —
+// converting to a retryable status would just loop the client onto the same
+// spent credential. Bodies that don't match are returned unchanged.
+// normalizeXAIErrorPayload reshapes grok's quota-exhaustion error bodies into
+// the OpenAI insufficient_quota envelope so OpenAI-compatible clients (e.g.
+// Copilot) render a clear "out of quota" instead of grok's non-standard shapes.
+// It covers both the official-API spending-limit 403
+// (code: personal-team-blocked:...) and the Grok Build balance 402
+// ({"error":"Grok Build usage balance exhausted"}). Any other error passes
+// through unchanged.
+func normalizeXAIErrorPayload(status int, data []byte) []byte {
+	if !xaiIsQuotaExhaustedError(status, data) {
+		return data
+	}
+	msg := strings.TrimSpace(gjson.GetBytes(data, "error").String())
+	if msg == "" {
+		msg = strings.TrimSpace(gjson.GetBytes(data, "error.message").String())
+	}
+	if msg == "" {
+		msg = "xAI/Grok account is out of credits or over its usage limit."
+	}
+	out := []byte(`{"error":{}}`)
+	out, _ = sjson.SetBytes(out, "error.message", msg)
+	out, _ = sjson.SetBytes(out, "error.type", "insufficient_quota")
+	out, _ = sjson.SetBytes(out, "error.code", "insufficient_quota")
+	return out
+}
+
+// xaiIsQuotaExhaustedError reports whether a non-2xx grok response is a quota /
+// balance exhaustion: the official-API spending-limit 403 (code prefixed
+// personal-team-blocked) or the Grok Build balance 402 (error text mentions a
+// usage balance exhausted / running out of credits).
+func xaiIsQuotaExhaustedError(status int, data []byte) bool {
+	if status != http.StatusForbidden && status != http.StatusPaymentRequired {
+		return false
+	}
+	if strings.HasPrefix(gjson.GetBytes(data, "code").String(), "personal-team-blocked") {
+		return true
+	}
+	errStr := strings.ToLower(gjson.GetBytes(data, "error").String())
+	return strings.Contains(errStr, "usage balance exhausted") ||
+		strings.Contains(errStr, "run out of credits")
+}
+
+// xaiTerminalStatus remaps a recognized Grok quota-exhaustion 402 (the Grok
+// Build "usage balance exhausted" case) to 403 so the conductor treats it as a
+// terminal quota error — the clean insufficient_quota body reaches the client
+// and the account cools — instead of converting 402->500 for transparent retry.
+// The 403 spending-limit case is already terminal and is returned unchanged.
+func xaiTerminalStatus(status int, data []byte) int {
+	if status == http.StatusPaymentRequired && xaiIsQuotaExhaustedError(status, data) {
+		return http.StatusForbidden
+	}
+	return status
 }
 
 func xaiCreds(auth *cliproxyauth.Auth) (token, baseURL string) {
@@ -569,6 +671,11 @@ func xaiCreds(auth *cliproxyauth.Auth) (token, baseURL string) {
 }
 
 func applyXAIHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string) {
+	applyXAIDefaultHeaders(r, token, stream, sessionID)
+	applyXAICustomHeaders(r, auth)
+}
+
+func applyXAIDefaultHeaders(r *http.Request, token string, stream bool, sessionID string) {
 	r.Header.Set("Content-Type", "application/json")
 	if strings.TrimSpace(token) != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
@@ -582,11 +689,95 @@ func applyXAIHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, str
 	if sessionID != "" {
 		r.Header.Set("x-grok-conv-id", sessionID)
 	}
+}
+
+func applyXAICustomHeaders(r *http.Request, auth *cliproxyauth.Auth) {
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
+}
+
+// applyXAIChatHeaders applies headers for non-image/video chat requests. On the
+// official API path it matches applyXAIHeaders. On the Grok Build path
+// (using_api=false and the resolved chat base URL is cli-chat-proxy) it also
+// attaches the grok-cli identity headers the chat-proxy requires to accept an
+// OAuth token as a grok-cli client. Custom header overrides are applied last.
+func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string) {
+	if xaiUsingAPI(auth) {
+		applyXAIHeaders(r, auth, token, stream, sessionID)
+		return
+	}
+	applyXAIDefaultHeaders(r, token, stream, sessionID)
+	if xaiIsCLIChatProxyBaseURL(xaiChatBaseURL(auth)) {
+		r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
+		r.Header.Set(xaiClientVersionHeader, xaiClientVersionValue)
+		r.Header.Set("User-Agent", "xai-grok-workspace/"+xaiClientVersionValue)
+	}
+	applyXAICustomHeaders(r, auth)
+}
+
+// xaiUsingAPI reports whether this xAI auth should use the official API path for
+// non-media HTTP chat. Precedence: explicit using_api attribute, then metadata,
+// then auth_kind (OAuth defaults to Grok Build, i.e. using_api=false).
+func xaiUsingAPI(auth *cliproxyauth.Auth) bool {
+	if auth == nil {
+		return true
+	}
+	if len(auth.Attributes) > 0 {
+		if raw := strings.TrimSpace(auth.Attributes[xaiUsingAPIAttr]); raw != "" {
+			if parsed, errParse := strconv.ParseBool(raw); errParse == nil {
+				return parsed
+			}
+		}
+	}
+	if len(auth.Metadata) > 0 {
+		if raw, ok := auth.Metadata[xaiUsingAPIAttr]; ok && raw != nil {
+			switch v := raw.(type) {
+			case bool:
+				return v
+			case string:
+				if parsed, errParse := strconv.ParseBool(strings.TrimSpace(v)); errParse == nil {
+					return parsed
+				}
+			}
+		}
+	}
+	if raw := strings.TrimSpace(auth.Attributes["auth_kind"]); raw != "" {
+		return !strings.EqualFold(raw, "oauth")
+	}
+	return !strings.EqualFold(xaiMetadataString(auth.Metadata, "auth_kind"), "oauth")
+}
+
+// xaiChatBaseURL returns the base URL for non-image/video xAI HTTP chat. When
+// using_api is true the official API base URL is used. When false (including
+// the OAuth default), an empty or official-default base_url is rewritten to the
+// CLI chat-proxy (Grok Build); an explicit non-default base_url is still honored.
+func xaiChatBaseURL(auth *cliproxyauth.Auth) string {
+	_, baseURL := xaiCreds(auth)
+	if xaiUsingAPI(auth) {
+		if baseURL == "" {
+			return xaiauth.DefaultAPIBaseURL
+		}
+		return baseURL
+	}
+	if baseURL != "" && !xaiIsDefaultAPIBaseURL(baseURL) {
+		return baseURL
+	}
+	return xaiauth.CLIChatProxyBaseURL
+}
+
+func xaiNormalizeBaseURL(baseURL string) string {
+	return strings.TrimRight(strings.TrimSpace(baseURL), "/")
+}
+
+func xaiIsDefaultAPIBaseURL(baseURL string) bool {
+	return xaiNormalizeBaseURL(baseURL) == xaiNormalizeBaseURL(xaiauth.DefaultAPIBaseURL)
+}
+
+func xaiIsCLIChatProxyBaseURL(baseURL string) bool {
+	return xaiNormalizeBaseURL(baseURL) == xaiNormalizeBaseURL(xaiauth.CLIChatProxyBaseURL)
 }
 
 func xaiExecutionSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {

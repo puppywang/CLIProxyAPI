@@ -80,6 +80,15 @@ type Config struct {
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
+	// AutoReleaseOn429, when true, makes the conductor react to an upstream
+	// 429 by (a) immediately dropping every session-affinity binding on the
+	// exhausted auth so its stranded conversations re-pick a fresh account
+	// on their next turn, and (b) converting the 429 that would otherwise
+	// surface to the client into a 500 so the client retries — by the time
+	// the retry arrives the binding is gone and the selector routes to a
+	// different account. Persisted so the toggle survives restarts.
+	AutoReleaseOn429 bool `yaml:"auto-release-on-429" json:"auto-release-on-429"`
+
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
@@ -116,6 +125,9 @@ type Config struct {
 
 	// Codex configures provider-wide Codex request behavior.
 	Codex CodexConfig `yaml:"codex" json:"codex"`
+
+	// XAI configures provider-wide xAI/Grok request behavior.
+	XAI XAIConfig `yaml:"xai" json:"xai"`
 
 	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
 	// These are used only when the client does not send its own headers.
@@ -262,6 +274,54 @@ type CodexHeaderDefaults struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+}
+
+// XAIConfig configures provider-wide xAI/Grok request behavior.
+type XAIConfig struct {
+	// ComposerImageBridge enables the grok-composer image bridge: when a
+	// request targets a composer model (which upstream rejects image input)
+	// and carries image parts, each image is first described by a
+	// vision-capable model and the image part is replaced with that text so
+	// the composer request succeeds. Defaults to enabled (see ApplyDefaults);
+	// set to false in config to disable.
+	ComposerImageBridge *bool `yaml:"composer-image-bridge" json:"composer-image-bridge"`
+	// ComposerVisionModel is the model used to describe images for the bridge.
+	// Defaults to "grok-build-0.1" when empty.
+	ComposerVisionModel string `yaml:"composer-vision-model" json:"composer-vision-model"`
+	// ComposerVisionMaxTokens caps the description length produced by the
+	// vision model. A tight cap keeps the (blocking) describe step fast; the
+	// default 512 matches the reference sub2api implementation. Values <= 0
+	// fall back to the default.
+	ComposerVisionMaxTokens int `yaml:"composer-vision-max-tokens" json:"composer-vision-max-tokens"`
+}
+
+// ComposerBridgeEnabled reports whether the grok-composer image bridge is
+// active. It defaults to true when unset so operators get working image
+// support out of the box; an explicit `composer-image-bridge: false` disables
+// it.
+func (c XAIConfig) ComposerBridgeEnabled() bool {
+	if c.ComposerImageBridge == nil {
+		return true
+	}
+	return *c.ComposerImageBridge
+}
+
+// VisionModel returns the configured composer bridge vision model, or the
+// default grok-build-0.1 when unset.
+func (c XAIConfig) VisionModel() string {
+	if m := strings.TrimSpace(c.ComposerVisionModel); m != "" {
+		return m
+	}
+	return "grok-build-0.1"
+}
+
+// VisionMaxTokens returns the configured description length cap, or the
+// default 512 when unset/invalid.
+func (c XAIConfig) VisionMaxTokens() int {
+	if c.ComposerVisionMaxTokens > 0 {
+		return c.ComposerVisionMaxTokens
+	}
+	return 512
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -746,6 +806,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.UsageStatisticsEnabled = false
 	cfg.RedisUsageQueueRetentionSeconds = 60
 	cfg.DisableCooling = false
+	cfg.AutoReleaseOn429 = false
 	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr

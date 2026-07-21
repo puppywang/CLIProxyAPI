@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -14,6 +15,63 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func xaiTestAuth(attrs map[string]string, meta map[string]any) *cliproxyauth.Auth {
+	return &cliproxyauth.Auth{Provider: "xai", Attributes: attrs, Metadata: meta}
+}
+
+func TestXAIUsingAPIAndChatBaseURL(t *testing.T) {
+	const api = "https://api.x.ai/v1"
+	const build = "https://cli-chat-proxy.grok.com/v1"
+	cases := []struct {
+		name       string
+		auth       *cliproxyauth.Auth
+		wantUseAPI bool
+		wantBase   string
+	}{
+		{"oauth defaults to build", xaiTestAuth(map[string]string{"auth_kind": "oauth", "base_url": api}, nil), false, build},
+		{"using_api attr true forces api", xaiTestAuth(map[string]string{"auth_kind": "oauth", "base_url": api, "using_api": "true"}, nil), true, api},
+		{"using_api metadata bool false forces build", xaiTestAuth(map[string]string{"base_url": api}, map[string]any{"using_api": false}), false, build},
+		{"non-oauth defaults to api", xaiTestAuth(map[string]string{"auth_kind": "api_key", "base_url": api}, nil), true, api},
+		{"explicit custom base_url honored on build path", xaiTestAuth(map[string]string{"auth_kind": "oauth", "base_url": "https://grok.example.com/v1"}, nil), false, "https://grok.example.com/v1"},
+		{"nil auth uses api", nil, true, api},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := xaiUsingAPI(tc.auth); got != tc.wantUseAPI {
+				t.Errorf("xaiUsingAPI = %v, want %v", got, tc.wantUseAPI)
+			}
+			if got := xaiChatBaseURL(tc.auth); got != tc.wantBase {
+				t.Errorf("xaiChatBaseURL = %q, want %q", got, tc.wantBase)
+			}
+		})
+	}
+}
+
+func TestApplyXAIChatHeaders(t *testing.T) {
+	// OAuth account with the default api.x.ai base_url -> Grok Build: the
+	// grok-cli identity headers must be attached so chat-proxy accepts the token.
+	auth := xaiTestAuth(map[string]string{"auth_kind": "oauth", "base_url": "https://api.x.ai/v1"}, nil)
+	r, _ := http.NewRequest(http.MethodPost, "https://cli-chat-proxy.grok.com/v1/responses", nil)
+	applyXAIChatHeaders(r, auth, "tok", true, "")
+	if got := r.Header.Get(xaiTokenAuthHeader); got != xaiTokenAuthValue {
+		t.Errorf("%s = %q, want %q", xaiTokenAuthHeader, got, xaiTokenAuthValue)
+	}
+	if r.Header.Get(xaiClientVersionHeader) == "" {
+		t.Errorf("%s not set on build path", xaiClientVersionHeader)
+	}
+	if r.Header.Get("Authorization") != "Bearer tok" {
+		t.Errorf("Authorization = %q, want Bearer tok", r.Header.Get("Authorization"))
+	}
+
+	// API path (using_api=true) -> no grok-cli identity headers.
+	auth2 := xaiTestAuth(map[string]string{"auth_kind": "oauth", "base_url": "https://api.x.ai/v1", "using_api": "true"}, nil)
+	r2, _ := http.NewRequest(http.MethodPost, "https://api.x.ai/v1/responses", nil)
+	applyXAIChatHeaders(r2, auth2, "tok", true, "")
+	if r2.Header.Get(xaiTokenAuthHeader) != "" {
+		t.Errorf("%s must not be set on api path", xaiTokenAuthHeader)
+	}
+}
 
 func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 	var gotPath string
@@ -644,5 +702,74 @@ func TestNormalizeXAIToolChoiceForTools_NoOpWhenBothAbsent(t *testing.T) {
 
 	if gjson.GetBytes(out, "tool_choice").Exists() {
 		t.Fatalf("tool_choice should not appear: %s", string(out))
+	}
+}
+
+func TestNormalizeXAIErrorPayload(t *testing.T) {
+	// grok out-of-credits / spending-limit 403 -> OpenAI insufficient_quota object.
+	in := []byte(`{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits or need a Grok subscription."}`)
+	out := normalizeXAIErrorPayload(403, in)
+	if gjson.GetBytes(out, "error.type").String() != "insufficient_quota" {
+		t.Errorf("type = %q, want insufficient_quota", gjson.GetBytes(out, "error.type").String())
+	}
+	if gjson.GetBytes(out, "error.code").String() != "insufficient_quota" {
+		t.Errorf("code = %q, want insufficient_quota", gjson.GetBytes(out, "error.code").String())
+	}
+	if !strings.Contains(gjson.GetBytes(out, "error.message").String(), "run out of credits") {
+		t.Errorf("message not preserved: %q", gjson.GetBytes(out, "error.message").String())
+	}
+	// error must be an object (OpenAI shape), not a string.
+	if gjson.GetBytes(out, "error").Type != gjson.JSON {
+		t.Errorf("error should be a JSON object, got %v", gjson.GetBytes(out, "error").Type)
+	}
+
+	// Non-403 is left untouched.
+	other := []byte(`{"code":"x","error":"boom"}`)
+	if string(normalizeXAIErrorPayload(500, other)) != string(other) {
+		t.Errorf("non-403 body should be unchanged")
+	}
+	// 403 that isn't a personal-team-block is left untouched.
+	forbidden := []byte(`{"code":"some_other_forbidden","error":"nope"}`)
+	if string(normalizeXAIErrorPayload(403, forbidden)) != string(forbidden) {
+		t.Errorf("unrelated 403 body should be unchanged")
+	}
+	// Empty error string falls back to a default message.
+	empty := []byte(`{"code":"personal-team-blocked:spending-limit"}`)
+	if gjson.GetBytes(normalizeXAIErrorPayload(403, empty), "error.message").String() == "" {
+		t.Errorf("empty error should get a default message")
+	}
+}
+
+func TestNormalizeXAIErrorPayloadGrokBuild402(t *testing.T) {
+	// Grok Build "usage balance exhausted" 402 -> OpenAI insufficient_quota
+	// object, and the status is remapped to a terminal 403 (so it is not
+	// converted to a retryable 500 and the clean body reaches the client).
+	in := []byte(`{"error":"Grok Build usage balance exhausted"}`)
+	out := normalizeXAIErrorPayload(402, in)
+	if gjson.GetBytes(out, "error.type").String() != "insufficient_quota" {
+		t.Errorf("type = %q, want insufficient_quota", gjson.GetBytes(out, "error.type").String())
+	}
+	if gjson.GetBytes(out, "error").Type != gjson.JSON {
+		t.Errorf("error should be a JSON object")
+	}
+	if !strings.Contains(gjson.GetBytes(out, "error.message").String(), "usage balance exhausted") {
+		t.Errorf("message not preserved: %q", gjson.GetBytes(out, "error.message").String())
+	}
+	if got := xaiTerminalStatus(402, in); got != 403 {
+		t.Errorf("xaiTerminalStatus(build 402) = %d, want 403 (terminal)", got)
+	}
+
+	// A 403 spending-limit stays 403.
+	if got := xaiTerminalStatus(403, []byte(`{"code":"personal-team-blocked:spending-limit","error":"x"}`)); got != 403 {
+		t.Errorf("xaiTerminalStatus(403 spending-limit) = %d, want 403", got)
+	}
+
+	// An unrelated 402 is neither remapped nor rewritten.
+	unrelated := []byte(`{"error":"card declined"}`)
+	if got := xaiTerminalStatus(402, unrelated); got != 402 {
+		t.Errorf("xaiTerminalStatus(unrelated 402) = %d, want 402", got)
+	}
+	if string(normalizeXAIErrorPayload(402, unrelated)) != string(unrelated) {
+		t.Errorf("unrelated 402 body should be unchanged")
 	}
 }
