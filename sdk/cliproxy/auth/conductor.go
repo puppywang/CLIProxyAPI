@@ -94,6 +94,26 @@ func SetQuotaCooldownDisabled(disable bool) {
 	quotaCooldownDisabled.Store(disable)
 }
 
+// autoReleaseOn429, when true, makes the conductor react to an upstream
+// 429 by (a) immediately dropping every session-affinity binding on the
+// exhausted auth so its stranded conversations re-pick a fresh account
+// on their next turn, and (b) converting the 429 that would otherwise
+// surface to the client into a 500 so the client retries — by the time
+// the retry arrives the binding is gone and the selector routes to a
+// different account. The net effect is transparent failover: the user
+// sees at worst a single retried request, never a hard 429.
+var autoReleaseOn429 atomic.Bool
+
+// SetAutoReleaseOn429 toggles the auto-release-on-429 behaviour globally.
+func SetAutoReleaseOn429(enable bool) {
+	autoReleaseOn429.Store(enable)
+}
+
+// AutoReleaseOn429Enabled reports whether auto-release-on-429 is active.
+func AutoReleaseOn429Enabled() bool {
+	return autoReleaseOn429.Load()
+}
+
 func quotaCooldownDisabledForAuth(auth *Auth) bool {
 	if auth != nil {
 		if override, ok := auth.DisableCoolingOverride(); ok {
@@ -1507,6 +1527,29 @@ func (m *Manager) invalidateSessionAffinity(authID string) {
 	}
 }
 
+// invalidateSessionAffinityCount is the counting variant of
+// invalidateSessionAffinity. It prefers the InvalidateAuthBindings
+// method exposed by SessionAffinitySelector (which returns the number
+// of dropped cache entries) and falls back to the no-return
+// InvalidateAuth interface assertion used by the conductor's Remove
+// path. Returns the number of bindings released, or 0 when the selector
+// has no counting invalidator or no cache configured.
+func (m *Manager) invalidateSessionAffinityCount(authID string) int {
+	if m == nil || authID == "" {
+		return 0
+	}
+	type bindingInvalidator interface {
+		InvalidateAuthBindings(string) int
+	}
+	if inv, ok := m.selector.(bindingInvalidator); ok && inv != nil {
+		return inv.InvalidateAuthBindings(authID)
+	}
+	if invalidator, ok := m.selector.(interface{ InvalidateAuth(string) }); ok && invalidator != nil {
+		invalidator.InvalidateAuth(authID)
+	}
+	return 0
+}
+
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()
@@ -1568,7 +1611,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 				return resp, nil
 			}
 		}
-		return cliproxyexecutor.Response{}, lastErr
+		return cliproxyexecutor.Response{}, maybeConvert429To500(lastErr)
 	}
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
@@ -1598,7 +1641,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		}
 	}
 	if lastErr != nil {
-		return cliproxyexecutor.Response{}, lastErr
+		return cliproxyexecutor.Response{}, maybeConvert429To500(lastErr)
 	}
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
@@ -1638,7 +1681,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
 			return streamErrorResult(bootstrapErr.Headers(), bootstrapErr.cause), nil
 		}
-		return nil, lastErr
+		return nil, maybeConvert429To500(lastErr)
 	}
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
@@ -2706,6 +2749,109 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 	return false
 }
 
+// maybeConvert429To500 wraps a conductor-level error so that, when the
+// auto-release-on-429 toggle is on, an upstream 429 or 402 that would
+// otherwise surface to the client is reported as HTTP 500 instead. The
+// client treats 500 as retryable; by the time the retry arrives the
+// binding is gone and the selector routes to a different account. The
+// net effect is transparent failover: the user sees at worst a single
+// retried request, never a hard 429/402.
+//
+// 402 (Payment Required) is treated the same way because a
+// deactivated_workspace / billing-exhausted account is just as fatal to
+// its stranded conversations as a rate limit — without the conversion
+// the client sees a raw 402 and has no path to a healthy account.
+//
+// Errors that are not 429/402, or that carry no status, are returned
+// unchanged. The toggle is read live so an operator can flip it via
+// the management endpoint without restart.
+func maybeConvert429To500(err error) error {
+	if err == nil {
+		return err
+	}
+	status := statusCodeFromError(err)
+	// A transient upstream "engine overloaded" signal is engine-wide, not
+	// credential-specific: failing over to another credential of the same
+	// overloaded upstream cannot help, so surface it as a clean, standard 429
+	// (retryable) instead of masking it as a failover 500. OpenAI-compatible
+	// clients back off and retry on 429. Codex/grok usage-limit 429s do not
+	// say "overloaded", so their transparent-failover path below is unaffected.
+	// These 429s reach maybeConvert429To500 only after the per-credential
+	// failover loop has already tried every eligible account, so the client
+	// retrying a 500 just re-runs the same exhausted loop and hammers the
+	// upstream ("reconnecting…" storms). Surface them as their native,
+	// retryable 429 (with reset hints) so the client backs off per Retry-After.
+	// The conductor's auto-release-on-429 still drops the binding either way, so
+	// a bound conversation can still fail over to a fresh account on its next
+	// (backed-off) attempt.
+	//   - engine overloaded: engine-wide transient, failover can't help.
+	//   - usage/quota limit reached (codex usage_limit_reached, grok
+	//     insufficient_quota): the account is out of quota until a definite
+	//     reset; retrying immediately is futile.
+	if status == http.StatusTooManyRequests && (isUpstreamOverloadError(err) || isUsageLimitError(err)) {
+		return err
+	}
+	// A model_cooldown error means EVERY credential for the model is already
+	// cooling down — there is nothing to fail over to, and it carries a
+	// concrete reset_seconds/reset_time. Keep its native 429.
+	var mcErr *modelCooldownError
+	if errors.As(err, &mcErr) {
+		return err
+	}
+	if !autoReleaseOn429.Load() {
+		return err
+	}
+	// 401 is included alongside 429/402: a dead credential's bound
+	// conversation must fail over rather than surface a hard 401. The
+	// binding is dropped in the conductor's 401 case, and converting to a
+	// retryable 500 makes the client re-issue onto a fresh account.
+	if status != http.StatusTooManyRequests && status != http.StatusPaymentRequired && status != http.StatusUnauthorized {
+		return err
+	}
+	// If the error is already our *Error, rewrite its HTTPStatus in
+	// place; otherwise wrap it so the 500 surfaces through the
+	// StatusCode() interface that the API layer consults.
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		if authErr.HTTPStatus == http.StatusTooManyRequests || authErr.HTTPStatus == http.StatusPaymentRequired || authErr.HTTPStatus == http.StatusUnauthorized {
+			authErr.HTTPStatus = http.StatusInternalServerError
+		}
+		return authErr
+	}
+	return &Error{
+		Code:       "upstream_rate_limit_retried",
+		Message:    err.Error(),
+		Retryable:  true,
+		HTTPStatus: http.StatusInternalServerError,
+	}
+}
+
+// isUpstreamOverloadError reports whether err carries a transient upstream
+// engine-overload marker (e.g. Kimi's "engine_overloaded_error" / "The engine
+// is currently overloaded, please try again later"). Such errors are engine-
+// wide and retryable in place, so they should surface as a 429 rather than be
+// converted to a failover 500.
+func isUpstreamOverloadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "overloaded")
+}
+
+// isUsageLimitError reports whether err is an upstream usage/quota-limit
+// exhaustion (codex "usage_limit_reached", grok "insufficient_quota"). These
+// carry a definite reset and cannot be helped by an immediate client retry, so
+// they should surface as a retryable 429 (back off per reset) rather than a 500.
+func isUsageLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "usage_limit_reached") ||
+		strings.Contains(lower, "usage limit has been reached") ||
+		strings.Contains(lower, "insufficient_quota")
+}
+
 func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
@@ -2765,6 +2911,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
+	// shouldReleaseBindings is set on the 429 branch when the global
+	// auto-release toggle is on. The actual invalidation runs after
+	// m.mu is released so the selector (which may take its own lock)
+	// never nests under the auth manager's lock.
+	shouldReleaseBindings := false
 	var authSnapshot *Auth
 
 	m.mu.Lock()
@@ -2795,7 +2946,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		} else {
 			if result.Model != "" {
-				if !isRequestScopedNotFoundResultError(result.Error) {
+				if !isRequestScopedNotFoundResultError(result.Error) && !isRequestScopedInvalidResultError(result.Error) {
 					disableCooling := quotaCooldownDisabledForAuth(auth)
 					state := ensureModelState(auth, result.Model)
 					state.Unavailable = true
@@ -2838,6 +2989,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								suspendReason = "unauthorized"
 								shouldSuspendModel = true
 							}
+							// Auto-release this auth's session-affinity bindings
+							// on 401 too. A 401 means the stored credential is
+							// dead (expired/revoked token — for CPA files with no
+							// refresh_token it never recovers), and strict
+							// session-affinity would otherwise keep routing the
+							// bound conversation straight back to the dead
+							// account (strict-bypass ignores the 30-min cooldown),
+							// producing an endless 401 loop with no failover. The
+							// paired 401->500 conversion (see maybeConvert429To500)
+							// makes the client retry onto a fresh account.
+							if autoReleaseOn429.Load() {
+								shouldReleaseBindings = true
+							}
 						case 402, 403:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
@@ -2846,6 +3010,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								state.NextRetryAfter = next
 								suspendReason = "payment_required"
 								shouldSuspendModel = true
+							}
+							// Auto-release this auth's session-affinity
+							// bindings so its stranded conversations
+							// re-pick a fresh account on their next turn.
+							// A 402 (deactivated_workspace / billing) is
+							// just as fatal to the account as a 429, so
+							// we apply the same binding-drop + 500-
+							// conversion treatment when the toggle is on.
+							if autoReleaseOn429.Load() {
+								shouldReleaseBindings = true
 							}
 						case 404:
 							if disableCooling {
@@ -2881,6 +3055,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								suspendReason = "quota"
 								shouldSuspendModel = true
 								setModelQuota = true
+							}
+							// Auto-release this auth's session-affinity
+							// bindings so its stranded conversations
+							// re-pick a fresh account on their next turn.
+							// The 429→500 conversion (so the client
+							// retries instead of seeing a hard 429) is
+							// applied at the executeMixedOnce return
+							// boundary; here we only drop the bindings.
+							if autoReleaseOn429.Load() {
+								shouldReleaseBindings = true
 							}
 						case 408, 500, 502, 503, 504:
 							if disableCooling {
@@ -2921,6 +3105,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
 	} else if shouldSuspendModel {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
+	}
+
+	if shouldReleaseBindings {
+		if released := m.invalidateSessionAffinityCount(result.AuthID); released > 0 {
+			log.WithFields(log.Fields{
+				"auth_id":  result.AuthID,
+				"model":    result.Model,
+				"released": released,
+			}).Info("auto-release: dropped session-affinity bindings on exhausted account")
+		}
 	}
 
 	m.hook.OnResult(ctx, result)
@@ -3280,6 +3474,52 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 	return isRequestScopedNotFoundMessage(err.Message)
 }
 
+// isRequestScopedInvalidResultError reports whether err is a request-scoped
+// 400/422 validation error — the client's request itself is at fault (input
+// too large / malformed params), not the model's availability on this account.
+// Such errors must NOT mark the model (or auth) unavailable: the next
+// well-formed request to the same model/account should succeed. A model being
+// benched by one oversized request would otherwise cascade across every account
+// and end in a spurious "no auth available". Model-not-supported 400s are
+// deliberately excluded — those are a durable per-account condition handled as
+// a 12h model suspension elsewhere.
+func isRequestScopedInvalidResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromResult(err)
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	if isModelSupportResultError(err) {
+		return false
+	}
+	return isRequestScopedInvalidMessage(err.Message)
+}
+
+func isRequestScopedInvalidMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	patterns := [...]string{
+		"invalid_request_error",
+		"context_too_large",
+		"context window",
+		"exceeds the context",
+		"maximum context length",
+		"too many tokens",
+		"reduce the length",
+		"invalid value",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 // isRequestInvalidError returns true if the error represents a client request
 // error that should not be retried. Specifically, it treats 400 responses with
 // "invalid_request_error", request-scoped 404 item misses caused by `store=false`,
@@ -3320,7 +3560,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	if auth == nil {
 		return
 	}
-	if isRequestScopedNotFoundResultError(resultErr) {
+	if isRequestScopedNotFoundResultError(resultErr) || isRequestScopedInvalidResultError(resultErr) {
 		return
 	}
 	disableCooling := quotaCooldownDisabledForAuth(auth)
@@ -3980,9 +4220,6 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			continue
 		}
 		if _, used := tried[candidate.ID]; used {
-			continue
-		}
-		if _, ok := m.executors[providerKey]; !ok {
 			continue
 		}
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {

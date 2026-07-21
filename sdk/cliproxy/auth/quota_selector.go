@@ -2,8 +2,10 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"math/rand/v2"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -401,7 +403,18 @@ func (s *LeastRemainingQuotaSelector) Pick(ctx context.Context, provider, model 
 	}
 
 	now := time.Now()
-	healthy, stressed, excluded := s.partitionByQuota(auths, now)
+
+	// Priority gate. Restrict the codex candidates to the highest
+	// `priority` level that still has a usable (not excluded) account,
+	// so operators can force a drain order: tag short-lived accounts
+	// with a higher priority and every new binding lands on them until
+	// they saturate, at which point the gate falls through to the next
+	// level automatically — no need to disable the long-lived accounts
+	// by hand. Non-codex auths always pass through (priority is a
+	// codex-quota concept). When no priority is set anywhere every codex
+	// auth shares level 0 and this is a no-op.
+	gated := s.gateByPriority(auths, model, now)
+	healthy, stressed, excluded := s.partitionByQuota(gated, model, now)
 
 	// Pick from the healthiest tier that has any candidates. Falling
 	// back to the stressed tier (50-89% used) before draining the
@@ -410,6 +423,22 @@ func (s *LeastRemainingQuotaSelector) Pick(ctx context.Context, provider, model 
 	// ones when no fresh accounts remain.
 	pool := healthy
 	tier := "healthy"
+	// Adaptive floor. With a small candidate set the hard 50%-used tier
+	// gate can strand capacity: one fresh account soaks up every new
+	// binding while a half-spent sibling sits idle (the operator-reported
+	// 2-account case — a 9%-used account got all traffic while an
+	// 80%-used one was never picked). When the healthy tier has fewer
+	// than the floor, promote the least-5h-used stressed accounts to fill
+	// it so the inner score-based selector can spread across both. With a
+	// large healthy tier (>= floor) this never fires and the original
+	// "reserve half-spent accounts" behaviour is preserved.
+	if len(pool) < quotaSelectorHealthyFloor && len(stressed) > 0 {
+		promoted := promoteLeastUsedStressed(stressed, quotaSelectorHealthyFloor-len(pool), now, s.cache)
+		if len(promoted) > 0 {
+			pool = append(append(make([]*Auth, 0, len(healthy)+len(promoted)), healthy...), promoted...)
+			tier = "healthy+promoted"
+		}
+	}
 	if len(pool) == 0 {
 		pool = stressed
 		tier = "stressed"
@@ -433,11 +462,11 @@ func (s *LeastRemainingQuotaSelector) Pick(ctx context.Context, provider, model 
 	}
 	pickedSnap, hasSnap := s.cache.get(picked.ID, now)
 	if hasSnap {
-		entry.Infof("quota-selector: picked | auth=%s tier=%s primary_used=%d%% secondary_used=%d%% pool_size=%d excluded=%d provider=%s model=%s",
-			picked.ID, tier, pickedSnap.UsedPercentPrimary, pickedSnap.UsedPercentSecondary, len(pool), excluded, provider, model)
+		entry.Infof("quota-selector: picked | auth=%s tier=%s priority=%d primary_used=%d%% secondary_used=%d%% pool_size=%d excluded=%d provider=%s model=%s",
+			picked.ID, tier, codexAuthPriority(picked), pickedSnap.UsedPercentPrimary, pickedSnap.UsedPercentSecondary, len(pool), excluded, provider, model)
 	} else {
-		entry.Infof("quota-selector: picked | auth=%s tier=%s primary_used=unknown pool_size=%d excluded=%d provider=%s model=%s",
-			picked.ID, tier, len(pool), excluded, provider, model)
+		entry.Infof("quota-selector: picked | auth=%s tier=%s priority=%d primary_used=unknown pool_size=%d excluded=%d provider=%s model=%s",
+			picked.ID, tier, codexAuthPriority(picked), len(pool), excluded, provider, model)
 	}
 	return picked, nil
 }
@@ -458,13 +487,27 @@ func (s *LeastRemainingQuotaSelector) Pick(ctx context.Context, provider, model 
 //
 // Non-codex auths always land in healthy — quota policy does not apply
 // outside the Codex pool.
-func (s *LeastRemainingQuotaSelector) partitionByQuota(auths []*Auth, now time.Time) (healthy []*Auth, stressed []*Auth, excluded int) {
+func (s *LeastRemainingQuotaSelector) partitionByQuota(auths []*Auth, model string, now time.Time) (healthy []*Auth, stressed []*Auth, excluded int) {
 	for _, a := range auths {
 		if a == nil {
 			continue
 		}
 		if !strings.EqualFold(strings.TrimSpace(a.Provider), "codex") {
 			healthy = append(healthy, a)
+			continue
+		}
+		// ModelState is the real-time signal: MarkResult flips
+		// Unavailable / Quota.Exceeded the instant an upstream 429
+		// lands, whereas the wham/usage cache snapshot the tiers
+		// below consult can lag the refresher by minutes. Honour the
+		// real-time block first so an account that just 429'd is
+		// excluded from the pool immediately — otherwise the priority
+		// gate keeps maxPriority pinned to its level (it still looks
+		// healthy in the stale cache) and every lower-priority live
+		// account is locked out, starving the pool for minutes until
+		// the refresher catches up.
+		if blocked, _, _ := isAuthBlockedForModel(a, model, now); blocked {
+			excluded++
 			continue
 		}
 		snap, fresh := s.cache.get(a.ID, now)
@@ -496,6 +539,166 @@ func (s *LeastRemainingQuotaSelector) partitionByQuota(auths []*Auth, now time.T
 		stressed = append(stressed, a)
 	}
 	return healthy, stressed, excluded
+}
+
+// quotaSelectorHealthyFloor is the minimum number of candidates the Pick
+// pool tries to hold before it stops promoting stressed accounts into the
+// healthy tier. 2 keeps at least one alternative in rotation so a single
+// fresh account does not soak up every new binding while a half-spent
+// sibling sits idle. Package var so tests (and future config wiring) can
+// tune it.
+var quotaSelectorHealthyFloor = 2
+
+// gateByPriority restricts the codex auths to the highest `priority` level
+// that still has a usable (not excluded) account, dropping every codex auth
+// at a lower level. Non-codex auths always pass through untouched — priority
+// is a codex-quota concept only.
+//
+// Draining semantics: an operator tags short-lived accounts with a higher
+// priority; while any of them can still serve (not limit_reached, not at/above
+// UnhealthyUsedPercent) they are the only codex candidates, so every new
+// binding lands on them. When they all saturate, the highest usable level
+// recomputes to the next priority down and the long-lived accounts take over
+// — automatically, and reversibly once the high-priority accounts' short
+// window resets. When no priority is configured anywhere, every codex auth
+// shares level 0 and this returns the input unchanged.
+func (s *LeastRemainingQuotaSelector) gateByPriority(auths []*Auth, model string, now time.Time) []*Auth {
+	maxPriority := 0
+	found := false
+	for _, a := range auths {
+		if a == nil || !strings.EqualFold(strings.TrimSpace(a.Provider), "codex") {
+			continue
+		}
+		if s.isExcludedNow(a, model, now) {
+			continue
+		}
+		p := codexAuthPriority(a)
+		if !found || p > maxPriority {
+			maxPriority = p
+			found = true
+		}
+	}
+	if !found {
+		// No usable codex auth at all — leave the list untouched so the
+		// caller's own empty-pool fallback decides what to do.
+		return auths
+	}
+	out := make([]*Auth, 0, len(auths))
+	for _, a := range auths {
+		if a == nil {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(a.Provider), "codex") {
+			out = append(out, a)
+			continue
+		}
+		// Keep every codex auth at the winning level, even ones that are
+		// currently excluded — partitionByQuota drops the excluded ones,
+		// but their membership is what defines "this level still exists".
+		if codexAuthPriority(a) == maxPriority {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// isExcludedNow reports whether an auth would be dropped by partitionByQuota
+// right now. An auth is excluded when EITHER signal says it is unavailable:
+//   - ModelState (real-time): MarkResult flips Unavailable / Quota.Exceeded
+//     the instant an upstream 429 lands. This is the authoritative signal —
+//     without it, the priority gate would keep maxPriority pinned to a
+//     just-429'd account's level (the wham cache still shows it healthy) and
+//     lock out every lower-priority live account for minutes until the
+//     refresher catches up.
+//   - quota cache snapshot (wham/usage, may lag the refresher by minutes):
+//     limit_reached or 5h used at/above UnhealthyUsedPercent.
+//
+// No fresh snapshot is treated as usable, matching the async partition path
+// the production refresher drives.
+func (s *LeastRemainingQuotaSelector) isExcludedNow(a *Auth, model string, now time.Time) bool {
+	if a == nil {
+		return true
+	}
+	if blocked, _, _ := isAuthBlockedForModel(a, model, now); blocked {
+		return true
+	}
+	snap, fresh := s.cache.get(a.ID, now)
+	if !fresh {
+		return false
+	}
+	if snap.LimitReached {
+		return true
+	}
+	return snap.UsedPercentPrimary >= UnhealthyUsedPercent
+}
+
+// promoteLeastUsedStressed returns up to n stressed accounts with the lowest
+// 5h used-percent — the ones with the most short-window headroom, hence the
+// safest to add to the healthy pool when it is under the floor. A stressed
+// account with no fresh snapshot ranks worst (treated as 100% used) so a
+// freshly-known-half-spent account is preferred over an unknown one.
+func promoteLeastUsedStressed(stressed []*Auth, n int, now time.Time, cache *quotaCache) []*Auth {
+	if n <= 0 || len(stressed) == 0 {
+		return nil
+	}
+	type scored struct {
+		auth *Auth
+		used int
+	}
+	ranked := make([]scored, 0, len(stressed))
+	for _, a := range stressed {
+		used := 100
+		if snap, ok := cache.get(a.ID, now); ok {
+			used = snap.UsedPercentPrimary
+		}
+		ranked = append(ranked, scored{auth: a, used: used})
+	}
+	sort.SliceStable(ranked, func(i, j int) bool { return ranked[i].used < ranked[j].used })
+	if n > len(ranked) {
+		n = len(ranked)
+	}
+	out := make([]*Auth, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, ranked[i].auth)
+	}
+	return out
+}
+
+// codexAuthPriority reads the account's drain priority. Higher = drained
+// first. Mirrors the auth-files list endpoint's precedence: Attributes
+// (set by the config synthesizer from a JSON "priority" field) wins, else
+// Metadata (set via UploadAuthFile / PatchAuthFileFields). Absent or
+// unparseable → 0.
+func codexAuthPriority(auth *Auth) int {
+	if auth == nil {
+		return 0
+	}
+	if auth.Attributes != nil {
+		if raw := strings.TrimSpace(auth.Attributes["priority"]); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil {
+				return parsed
+			}
+		}
+	}
+	if auth.Metadata != nil {
+		switch v := auth.Metadata["priority"].(type) {
+		case float64:
+			return int(v)
+		case int:
+			return v
+		case int64:
+			return int(v)
+		case json.Number:
+			if parsed, err := v.Int64(); err == nil {
+				return int(parsed)
+			}
+		case string:
+			if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+				return parsed
+			}
+		}
+	}
+	return 0
 }
 
 // warmCache fetches snapshots for the given auths concurrently with a

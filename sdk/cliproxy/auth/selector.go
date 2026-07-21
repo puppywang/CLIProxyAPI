@@ -1099,6 +1099,20 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	}
 }
 
+// InvalidateAuthBindings removes all session bindings for a specific auth
+// and returns how many cache entries were dropped. Used by the management
+// "release" action: after an account hits its quota, releasing its
+// bindings lets each stranded conversation re-pick a fresh account on its
+// next turn (the quota selector excludes the exhausted account), without
+// the client having to fork the conversation locally. Returns 0 when no
+// cache is configured.
+func (s *SessionAffinitySelector) InvalidateAuthBindings(authID string) int {
+	if s == nil || s.cache == nil {
+		return 0
+	}
+	return s.cache.InvalidateAuthCount(authID)
+}
+
 // BindingsByAuthSnapshot returns the live session-cache contents
 // grouped by auth_id. Used by the management endpoint that renders
 // the bindings reverse-index panel. Nil-safe; returns nil when the

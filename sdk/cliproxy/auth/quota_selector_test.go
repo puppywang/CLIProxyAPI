@@ -383,3 +383,232 @@ func TestLeastRemainingQuotaSelector_AsyncLimitReachedStillExcludes(t *testing.T
 		t.Fatalf("picked %q, want auth-b (auth-a is limit_reached)", got.ID)
 	}
 }
+
+// TestLeastRemainingQuotaSelector_PriorityGateDrainsHighFirst verifies that
+// when accounts carry different `priority` values, only the highest usable
+// level is offered to the inner selector — even when a lower-priority
+// account is equally healthy. This is the "drain short-lived accounts
+// first" behaviour: a fresh long-lived account must not steal bindings
+// while a high-priority account can still serve.
+func TestLeastRemainingQuotaSelector_PriorityGateDrainsHighFirst(t *testing.T) {
+	t.Parallel()
+
+	auths := []*Auth{
+		{ID: "auth-hi", Provider: "codex", Attributes: map[string]string{"priority": "100"}},
+		{ID: "auth-lo", Provider: "codex"}, // priority 0 (long-lived reserve)
+	}
+	selector := NewLeastRemainingQuotaSelector(LeastRemainingQuotaConfig{
+		Inner:   &RoundRobinSelector{cursors: map[string]int{"codex:gpt-5.5": 0}},
+		Fetcher: newFakeQuotaFetcher(nil),
+		TTL:     time.Minute,
+		Async:   true,
+	})
+	// Both healthy; auth-lo is even fresher. Without the gate the inner RR
+	// would happily rotate onto auth-lo — the gate must keep it out.
+	selector.PushSnapshot("auth-hi", QuotaSnapshot{UsedPercentPrimary: 40, UsedPercentSecondary: 40})
+	selector.PushSnapshot("auth-lo", QuotaSnapshot{UsedPercentPrimary: 1, UsedPercentSecondary: 1})
+
+	for i := 0; i < 5; i++ {
+		got, err := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick error = %v", err)
+		}
+		if got.ID != "auth-hi" {
+			t.Fatalf("pick %d: got %q, want auth-hi (higher priority must drain first)", i, got.ID)
+		}
+	}
+}
+
+// TestLeastRemainingQuotaSelector_PrioritySpillsWhenHighExhausted verifies
+// the auto-spill: once every account at the top priority level is excluded
+// (limit_reached / >= UnhealthyUsedPercent), the gate falls through to the
+// next level down without any manual intervention.
+func TestLeastRemainingQuotaSelector_PrioritySpillsWhenHighExhausted(t *testing.T) {
+	t.Parallel()
+
+	auths := []*Auth{
+		{ID: "auth-hi", Provider: "codex", Attributes: map[string]string{"priority": "100"}},
+		{ID: "auth-lo", Provider: "codex"},
+	}
+	selector := NewLeastRemainingQuotaSelector(LeastRemainingQuotaConfig{
+		Inner:   &RoundRobinSelector{cursors: map[string]int{"codex:gpt-5.5": 0}},
+		Fetcher: newFakeQuotaFetcher(nil),
+		TTL:     time.Minute,
+		Async:   true,
+	})
+	// High-priority account is saturated; must spill to the long-lived one.
+	selector.PushSnapshot("auth-hi", QuotaSnapshot{UsedPercentPrimary: 0, LimitReached: true})
+	selector.PushSnapshot("auth-lo", QuotaSnapshot{UsedPercentPrimary: 20, UsedPercentSecondary: 5})
+
+	got, err := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick error = %v", err)
+	}
+	if got.ID != "auth-lo" {
+		t.Fatalf("got %q, want auth-lo (auth-hi exhausted, gate must spill down a level)", got.ID)
+	}
+}
+
+// TestLeastRemainingQuotaSelector_PrioritySpillsOnModelStateQuotaExceeded
+// is the regression test for the 2026-07-02 production incident: a
+// high-priority account (priority=100) hits an upstream 429, MarkResult
+// flips its ModelState to Unavailable + Quota.Exceeded in real time, but
+// the wham/usage cache snapshot still shows it as healthy (1% used) because
+// the refresher lags by minutes. Before the fix, gateByPriority consulted
+// only the stale quota cache, kept maxPriority=100, and locked out every
+// priority=0 live account — starving the pool and returning 500 for ~4
+// minutes until the refresher caught up. After the fix, isExcludedNow /
+// partitionByQuota also consult ModelState, so the just-429'd account is
+// excluded immediately and the gate spills to the priority=0 reserve.
+func TestLeastRemainingQuotaSelector_PrioritySpillsOnModelStateQuotaExceeded(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	auths := []*Auth{
+		{
+			ID:         "auth-hi",
+			Provider:   "codex",
+			Attributes: map[string]string{"priority": "100"},
+			// ModelState reflects the real-time 429: MarkResult marked
+			// this model Unavailable with a quota-exceeded cooldown.
+			ModelStates: map[string]*ModelState{
+				"gpt-5.5": {
+					Unavailable:    true,
+					Status:         StatusError,
+					NextRetryAfter: now.Add(5 * time.Minute),
+					Quota: QuotaState{
+						Exceeded:      true,
+						Reason:        "quota",
+						NextRecoverAt: now.Add(5 * time.Minute),
+					},
+				},
+			},
+		},
+		{ID: "auth-lo", Provider: "codex"}, // priority 0 (long-lived reserve)
+	}
+	selector := NewLeastRemainingQuotaSelector(LeastRemainingQuotaConfig{
+		Inner:   &RoundRobinSelector{cursors: map[string]int{"codex:gpt-5.5": 0}},
+		Fetcher: newFakeQuotaFetcher(nil),
+		TTL:     time.Minute,
+		Async:   true,
+	})
+	// Stale quota cache: auth-hi still looks healthy (1%), auth-lo is
+	// usable. This is the exact production state that caused the incident.
+	selector.PushSnapshot("auth-hi", QuotaSnapshot{UsedPercentPrimary: 1, UsedPercentSecondary: 0})
+	selector.PushSnapshot("auth-lo", QuotaSnapshot{UsedPercentPrimary: 20, UsedPercentSecondary: 5})
+
+	got, err := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick error = %v (expected spill to auth-lo whose ModelState is clean)", err)
+	}
+	if got.ID != "auth-lo" {
+		t.Fatalf("got %q, want auth-lo (auth-hi ModelState says quota-excluded even though stale cache shows 1%%; gate must spill to priority=0)", got.ID)
+	}
+}
+
+// TestLeastRemainingQuotaSelector_ModelStateExcludedEvenAtSamePriority
+// verifies the partitionByQuota ModelState check in isolation: two
+// same-priority accounts, one with a ModelState quota-exceeded marker, the
+// other clean. The clean one must be picked — the stale quota cache would
+// have put both in the healthy tier without the ModelState guard.
+func TestLeastRemainingQuotaSelector_ModelStateExcludedEvenAtSamePriority(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	auths := []*Auth{
+		{
+			ID:       "auth-429",
+			Provider: "codex",
+			ModelStates: map[string]*ModelState{
+				"gpt-5.5": {
+					Unavailable:    true,
+					Status:         StatusError,
+					NextRetryAfter: now.Add(5 * time.Minute),
+					Quota:          QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: now.Add(5 * time.Minute)},
+				},
+			},
+		},
+		{ID: "auth-ok", Provider: "codex"},
+	}
+	selector := NewLeastRemainingQuotaSelector(LeastRemainingQuotaConfig{
+		Inner:   &RoundRobinSelector{cursors: map[string]int{"codex:gpt-5.5": 0}},
+		Fetcher: newFakeQuotaFetcher(nil),
+		TTL:     time.Minute,
+		Async:   true,
+	})
+	// Both look healthy in the stale cache; only ModelState distinguishes them.
+	selector.PushSnapshot("auth-429", QuotaSnapshot{UsedPercentPrimary: 1})
+	selector.PushSnapshot("auth-ok", QuotaSnapshot{UsedPercentPrimary: 10})
+
+	got, err := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick error = %v", err)
+	}
+	if got.ID != "auth-ok" {
+		t.Fatalf("got %q, want auth-ok (auth-429 has ModelState quota-exceeded; must be excluded despite stale 1%% cache)", got.ID)
+	}
+}
+
+// TestLeastRemainingQuotaSelector_AdaptiveFloorPromotesStressed verifies the
+// small-pool fix: with one healthy and one stressed account at the same
+// priority, the stressed account is promoted so the pool holds both — the
+// stressed one is therefore reachable, whereas the old hard tier gate would
+// have hidden it entirely behind the single healthy candidate.
+func TestLeastRemainingQuotaSelector_AdaptiveFloorPromotesStressed(t *testing.T) {
+	t.Parallel()
+
+	auths := []*Auth{
+		{ID: "auth-fresh", Provider: "codex"},
+		{ID: "auth-stressed", Provider: "codex"},
+	}
+	selector := NewLeastRemainingQuotaSelector(LeastRemainingQuotaConfig{
+		// Cursor 1 targets the second pool slot; the pool is built as
+		// healthy (auth-fresh) + promoted (auth-stressed), so index 1 is
+		// the promoted stressed account. If promotion did NOT happen the
+		// pool would be size 1 and 1%1==0 would land on auth-fresh.
+		Inner:   &RoundRobinSelector{cursors: map[string]int{"codex:gpt-5.5": 1}},
+		Fetcher: newFakeQuotaFetcher(nil),
+		TTL:     time.Minute,
+		Async:   true,
+	})
+	selector.PushSnapshot("auth-fresh", QuotaSnapshot{UsedPercentPrimary: 9, UsedPercentSecondary: 1})
+	selector.PushSnapshot("auth-stressed", QuotaSnapshot{UsedPercentPrimary: 80, UsedPercentSecondary: 20})
+
+	got, err := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick error = %v", err)
+	}
+	if got.ID != "auth-stressed" {
+		t.Fatalf("got %q, want auth-stressed (adaptive floor should promote it into the pool)", got.ID)
+	}
+}
+
+// TestCodexAuthPriority_ReadsBothSources checks the precedence and the
+// several JSON shapes a Metadata-sourced priority can arrive in.
+func TestCodexAuthPriority_ReadsBothSources(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		auth *Auth
+		want int
+	}{
+		{"nil", nil, 0},
+		{"unset", &Auth{}, 0},
+		{"attributes-string", &Auth{Attributes: map[string]string{"priority": "7"}}, 7},
+		{"metadata-float64", &Auth{Metadata: map[string]any{"priority": float64(5)}}, 5},
+		{"metadata-int", &Auth{Metadata: map[string]any{"priority": 3}}, 3},
+		{"metadata-string", &Auth{Metadata: map[string]any{"priority": "9"}}, 9},
+		{
+			"attributes-wins-over-metadata",
+			&Auth{Attributes: map[string]string{"priority": "100"}, Metadata: map[string]any{"priority": float64(1)}},
+			100,
+		},
+		{"attributes-unparseable-falls-through", &Auth{Attributes: map[string]string{"priority": "abc"}, Metadata: map[string]any{"priority": 4}}, 4},
+	}
+	for _, tc := range cases {
+		if got := codexAuthPriority(tc.auth); got != tc.want {
+			t.Errorf("%s: codexAuthPriority = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}

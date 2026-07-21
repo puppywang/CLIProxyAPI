@@ -353,21 +353,34 @@ func (c *SessionCache) peekLocked(sessionID string) (string, bool) {
 // InvalidateAuth removes all sessions bound to a specific auth ID.
 // Used when an auth becomes unavailable.
 func (c *SessionCache) InvalidateAuth(authID string) {
+	c.InvalidateAuthCount(authID)
+}
+
+// InvalidateAuthCount is InvalidateAuth with a return value: the number of
+// cache entries removed. Kept as a separate method so the existing
+// no-return InvalidateAuth signature (matched by an interface assertion in
+// the conductor) is left untouched. A single logical conversation usually
+// has two entries — the codex-thread key and its codex-window mirror — so
+// the count can exceed the number of distinct conversations; it is meant
+// for an operator-facing "released N bindings" acknowledgement, not exact
+// conversation accounting.
+func (c *SessionCache) InvalidateAuthCount(authID string) int {
 	if authID == "" {
-		return
+		return 0
 	}
-	changed := false
+	removed := 0
 	c.mu.Lock()
 	for sid, entry := range c.entries {
 		if entry.authID == authID {
 			delete(c.entries, sid)
-			changed = true
+			removed++
 		}
 	}
 	c.mu.Unlock()
-	if changed {
+	if removed > 0 {
 		c.dirty.Store(true)
 	}
+	return removed
 }
 
 // Stop terminates the background goroutines. If persistence is enabled, a
