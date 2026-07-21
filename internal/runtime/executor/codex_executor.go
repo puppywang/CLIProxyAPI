@@ -1525,6 +1525,16 @@ func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexI
 	if turnID := strings.TrimSpace(gjson.Get(rawTurnMetadata, "turn_id").String()); turnID != "" {
 		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "turn_id", state.confuseTurnID(turnID))
 	}
+	// installation_id identifies the single codex install; left unconfused it
+	// lets upstream correlate every account that shares this proxy's install
+	// id. Rewrite it (deterministically, per-account, as v4 to match codex's
+	// Uuid::new_v4()) so each account presents its own install identity. Uses
+	// the same (authID, "installation", original) key as the body-side
+	// client_metadata.x-codex-installation-id confuse, so the two stay
+	// consistent within a request.
+	if instID := strings.TrimSpace(gjson.Get(rawTurnMetadata, "installation_id").String()); instID != "" {
+		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "installation_id", codexIdentityConfuseUUID(state.authID, "installation", instID))
+	}
 	if state.promptCacheKey != "" && gjson.Get(rawTurnMetadata, "window_id").Exists() {
 		updatedTurnMetadata, _ = sjson.Set(updatedTurnMetadata, "window_id", state.promptCacheKey+":0")
 	}
@@ -1579,14 +1589,68 @@ func codexIdentityConfuseEnabled(cfg *config.Config) bool {
 	return cfg.Routing.SessionAffinity || strategy == "fill-first" || strategy == "fillfirst" || strategy == "ff"
 }
 
+// codexIdentityConfuseUUID deterministically derives a confused replacement
+// UUID for an original codex identifier, keyed on (authID, kind, value) so it
+// is stable per account+conversation and distinct across accounts.
+//
+// The output matches the UUID *version* real codex emits for each field, so a
+// confused value is format-indistinguishable from a genuine one:
+//   - thread_id / session_id / turn_id / prompt_cache_key are UUIDv7 in
+//     codex-rs (protocol/src/{thread_id,session_id}.rs use Uuid::now_v7()) →
+//     we emit v7 and REUSE the original's 48-bit millisecond timestamp, so the
+//     confused id carries the same plausible recent time. The remaining 74
+//     bits are hash-derived (deterministic, account-scoped), so the full value
+//     differs per account and cannot correlate accounts, while the version (7)
+//     and variant (10) nibbles stay valid.
+//   - installation_id is UUIDv4 (core/src/installation_id.rs) → we emit v4.
+//
+// The previous implementation emitted UUIDv5 for every field, which was a dead
+// giveaway: codex never produces v5 ids here, so the version nibble alone
+// flagged the traffic as non-codex.
 func codexIdentityConfuseUUID(authID string, kind string, value string) string {
 	name := strings.Join([]string{"cli-proxy-api", "codex", "identity-confuse", kind, strings.TrimSpace(authID), strings.TrimSpace(value)}, ":")
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
+	sum := sha256.Sum256([]byte(name))
+	var b [16]byte
+	copy(b[:], sum[:16])
+	if kind == "installation" {
+		// UUIDv4 — codex generates installation_id via Uuid::new_v4().
+		b[6] = (b[6] & 0x0F) | 0x40
+	} else {
+		// UUIDv7 — reuse the original's 48-bit ms timestamp when it parses as
+		// a UUID (a genuine codex v7 carries a real recent timestamp);
+		// otherwise leave the hash bytes as a synthetic timestamp.
+		if orig, errParse := uuid.Parse(strings.TrimSpace(value)); errParse == nil {
+			copy(b[0:6], orig[0:6])
+		}
+		b[6] = (b[6] & 0x0F) | 0x70
+	}
+	b[8] = (b[8] & 0x3F) | 0x80 // RFC 4122 variant (10xx) — shared by v4 and v7
+	out, errFrom := uuid.FromBytes(b[:])
+	if errFrom != nil {
+		// Unreachable for a 16-byte slice; keep a stable valid fallback.
+		return uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
+	}
+	return out.String()
 }
 
 func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config) {
 	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("Authorization", "Bearer "+token)
+	// K12 / agent-identity accounts (ChatGPT education plan) authenticate with a
+	// per-request ed25519-signed assertion instead of a bearer access token —
+	// their plain access token no longer works upstream. Build the assertion
+	// from the credential's agent key/runtime/task; fall back to the bearer path
+	// only if the assertion can't be built (so a misconfigured file fails loudly
+	// upstream rather than silently sending a bad header).
+	if auth != nil && codexauth.IsAgentIdentityMetadata(auth.Metadata) {
+		if assertion, errAssert := codexauth.AgentAssertionFromMetadata(auth.Metadata, time.Now()); errAssert == nil {
+			r.Header.Set("Authorization", assertion)
+		} else {
+			log.Warnf("codex agent identity: failed to build assertion: %v", errAssert)
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+	} else {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	var ginHeaders http.Header
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
