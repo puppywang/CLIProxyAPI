@@ -96,6 +96,14 @@ func Middleware(reg *Registry) gin.HandlerFunc {
 			cancel,
 		)
 
+		// Attach the request-body timer (installed by RequestBodyTimingMiddleware
+		// earlier in the chain) so the entry can report how long the upload took.
+		if bt := bodyTimingFromContext(c.Request.Context()); bt != nil {
+			entry.mu.Lock()
+			entry.bodyTiming = bt
+			entry.mu.Unlock()
+		}
+
 		// Try to extract model and workspace cwd from the JSON body without
 		// consuming it. The RequestLoggingMiddleware (if installed earlier)
 		// has already restored the body, so we can safely read and restore
@@ -159,6 +167,11 @@ func Middleware(reg *Registry) gin.HandlerFunc {
 
 		defer func() {
 			reg.SetStatusCode(entry, wrapper.Status())
+			// Record the error body (if any) before Finish snapshots the entry,
+			// so the recent-errors ring carries the reason.
+			if snip := wrapper.ErrorSnippet(); snip != "" {
+				reg.SetErrorSnippet(entry, snip)
+			}
 			reg.Finish(entry)
 			cancel()
 		}()
@@ -224,6 +237,21 @@ func peekTurnMetadata(c *gin.Context) (sessionID, threadID, turnID, threadSource
 // is not the opening "<" of the closing tag, which covers both shapes.
 var cwdPattern = regexp.MustCompile(`<cwd>([^<]+)</cwd>`)
 
+// modelFieldPattern matches a top-level-style "model":"…" field so the model
+// can be recovered from a truncated JSON prefix (large bodies) without full
+// parsing. The model field sits near the top of request bodies in practice.
+var modelFieldPattern = regexp.MustCompile(`"model"\s*:\s*"([^"]+)"`)
+
+// modelFromPrefix extracts the first "model":"…" value from a (possibly
+// truncated) JSON prefix. Display-only best effort for oversized bodies.
+func modelFromPrefix(prefix []byte) string {
+	m := modelFieldPattern.FindSubmatch(prefix)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(string(m[1]))
+}
+
 // peekModelAndWorkspaceFromRequest reads the request body once, extracts the
 // model name and (when present) the workspace cwd embedded in a Codex
 // environment_context block, and restores the body for downstream handlers.
@@ -234,9 +262,19 @@ func peekModelAndWorkspaceFromRequest(c *gin.Context) (model, workspace string) 
 	}
 	const maxPeek = 1 << 20 // 1 MiB
 	if c.Request.ContentLength > 0 && c.Request.ContentLength > maxPeek {
-		// Skip peek on very large bodies; model will be filled by the executor
-		// callback path instead.
-		return "", ""
+		// Large body (e.g. big Codex /v1/responses payloads). Don't buffer it
+		// all, but still recover the model from a bounded prefix so error rows
+		// aren't left blank when the request fails before the executor fills
+		// the model (e.g. an early "unknown provider" 502). The model field
+		// sits near the top of the request JSON.
+		const modelPeek = 64 << 10
+		prefix, errPeek := io.ReadAll(io.LimitReader(c.Request.Body, modelPeek))
+		if errPeek != nil {
+			return "", ""
+		}
+		// Restore body as prefix + the still-unread remainder (no full buffering).
+		c.Request.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), c.Request.Body))
+		return modelFromPrefix(prefix), ""
 	}
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxPeek+1))
 	if err != nil {
@@ -284,6 +322,31 @@ type countingWriter struct {
 	reg            *Registry
 	entry          *trackedRequest
 	headerCaptured bool
+	// errBuf accumulates a bounded prefix of the response body, but only for
+	// error outcomes (status >= 400). For a 4xx/5xx the body IS the error
+	// payload, so this captures exactly why the request failed.
+	errBuf []byte
+}
+
+const maxErrSnippet = 2048
+
+// captureErr appends response bytes to the bounded error buffer when the
+// outcome is an error. A 2xx (incl. streaming) never accumulates because the
+// status gate is false, so the hot success path pays only one comparison.
+func (w *countingWriter) captureErr(data []byte) {
+	if len(w.errBuf) >= maxErrSnippet || w.ResponseWriter.Status() < 400 {
+		return
+	}
+	room := maxErrSnippet - len(w.errBuf)
+	if room > len(data) {
+		room = len(data)
+	}
+	w.errBuf = append(w.errBuf, data[:room]...)
+}
+
+// ErrorSnippet returns the captured error body prefix (empty on success).
+func (w *countingWriter) ErrorSnippet() string {
+	return string(w.errBuf)
 }
 
 func (w *countingWriter) captureStreaming() {
@@ -305,6 +368,7 @@ func (w *countingWriter) Write(data []byte) (int, error) {
 		w.entry.firstChunkAt.CompareAndSwap(0, time.Now().UnixNano())
 		w.reg.AddResponseBytes(w.entry, n)
 		w.reg.ExtractUsage(w.entry, data[:n])
+		w.captureErr(data[:n])
 	}
 	return n, err
 }
@@ -317,8 +381,10 @@ func (w *countingWriter) WriteString(data string) (int, error) {
 		w.reg.AddResponseBytes(w.entry, n)
 		if n == len(data) {
 			w.reg.ExtractUsage(w.entry, []byte(data))
+			w.captureErr([]byte(data))
 		} else {
 			w.reg.ExtractUsage(w.entry, []byte(data[:n]))
+			w.captureErr([]byte(data[:n]))
 		}
 	}
 	return n, err

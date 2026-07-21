@@ -332,6 +332,9 @@
   }
   .reason-pill.manual     { background: rgba(167,107,255,0.12); color: #c4a0ff; border-color: rgba(167,107,255,0.3); }
   .reason-pill.auto-stall { background: rgba(245,180,80,0.14);  color: #f5c98a; border-color: rgba(245,180,80,0.3); }
+  .reason-pill.auto-slow  { background: rgba(240,140,90,0.14);  color: #f0a878; border-color: rgba(240,140,90,0.3); }
+  /* Specific-situation line under a stall reason pill (e.g. gap + bytes). */
+  .hist-detail { margin-top: 3px; font-size: 11px; line-height: 1.3; max-width: 240px; }
 
   /* Typography helpers */
   .muted { color: var(--muted); }
@@ -456,6 +459,64 @@
     font-weight: 500;
   }
   /* Codex account quota panel */
+  .quota-aggregate {
+    margin: 8px 0 12px;
+    padding: 10px 14px;
+    background: rgba(143,198,255,0.05);
+    border: 1px solid rgba(143,198,255,0.18);
+    border-radius: 6px;
+    font-size: 12px;
+    color: rgba(255,255,255,0.75);
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .quota-aggregate-pool {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .quota-aggregate-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: rgba(255,255,255,0.4);
+  }
+  .quota-aggregate-now {
+    font-size: 14px;
+    font-weight: 600;
+    color: rgba(255,255,255,0.92);
+  }
+  .quota-aggregate-bar {
+    height: 6px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .quota-aggregate-bar-fill {
+    height: 100%;
+    transition: width 200ms ease;
+  }
+  .qa-fill-healthy  { background: #6ad36a; }
+  .qa-fill-stressed { background: #f5c98a; }
+  .qa-fill-dead     { background: #ff8a8a; }
+  .quota-aggregate-line {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 11px;
+    color: rgba(255,255,255,0.6);
+  }
+  .quota-aggregate-line strong {
+    color: rgba(255,255,255,0.85);
+    font-weight: 500;
+  }
+  .quota-aggregate-line .delta-up {
+    color: #6ad36a;
+  }
+  .quota-aggregate-line .muted {
+    color: rgba(255,255,255,0.35);
+  }
   .quota-refresh-all {
     margin-left: 12px;
     padding: 2px 10px;
@@ -467,6 +528,23 @@
     cursor: pointer;
   }
   .quota-refresh-all:hover { background: rgba(143,198,255,0.22); }
+  /* Auto-release-on-429/402 toggle. Lives in the quota panel summary so
+     an operator flipping it after seeing a 429 or 402 (deactivated
+     workspace) has the control right next to the affected accounts. The
+     checkbox drives the global conductor toggle via PUT
+     /v0/management/auto-release-429. */
+  .auto-release-429-toggle {
+    margin-left: 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: rgba(255,255,255,0.7);
+    cursor: pointer;
+    user-select: none;
+  }
+  .auto-release-429-toggle input { margin: 0; cursor: pointer; }
+  .auto-release-429-toggle .ar429-hint { color: rgba(255,255,255,0.4); font-size: 10px; }
   .quota-bar-wrap {
     display: flex;
     align-items: center;
@@ -507,7 +585,8 @@
   .status-pill.unavail  { color: #f5c98a; border-color: rgba(245,201,138,0.35); background: rgba(245,201,138,0.08); }
   .status-pill.disabled { color: rgba(255,255,255,0.4); border-color: rgba(255,255,255,0.15); background: rgba(255,255,255,0.03); }
   .quota-refresh-btn,
-  .cooldown-force-btn {
+  .cooldown-force-btn,
+  .codex-invite-btn {
     background: transparent;
     color: rgba(255,255,255,0.6);
     border: 1px solid rgba(255,255,255,0.15);
@@ -534,20 +613,422 @@
     background: rgba(245,201,138,0.08);
     border-color: rgba(245,201,138,0.35);
   }
-  /* Cooldown panel */
-  #cooldownsSection table { table-layout: fixed; width: 100%; }
-  #cooldownsSection col.cc-account  { width: 22%; }
-  #cooldownsSection col.cc-status   { width: 16%; }
-  #cooldownsSection col.cc-auth     { width: 18%; }
-  #cooldownsSection col.cc-models   { width: 22%; }
-  #cooldownsSection col.cc-registry { width: 14%; }
-  #cooldownsSection col.cc-actions  { width: 8%; }
-  #cooldownsSection th:last-child,
-  #cooldownsSection td:last-child {
-    text-align: center;
-    padding-left: 0;
-    padding-right: 0;
+  .codex-invite-btn {
+    /* Teal — a third, distinct hue so the row reads ↻ (neutral) / ⏸
+       (warning) / ✉ (neutral-positive action). */
+    color: #7fd4d4;
   }
+  .codex-invite-btn:hover:not(:disabled) {
+    background: rgba(127,212,212,0.08);
+    border-color: rgba(127,212,212,0.35);
+  }
+  .quota-refresh-btn:disabled,
+  .cooldown-force-btn:disabled,
+  .codex-invite-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+  .prio-set-btn {
+    background: transparent;
+    color: rgba(255,255,255,0.6);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 4px;
+    padding: 0;
+    box-sizing: border-box;
+    width: 28px;
+    height: 24px;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    color: #c9a3ff;
+  }
+  .prio-set-btn:hover:not(:disabled) {
+    background: rgba(201,163,255,0.08);
+    border-color: rgba(201,163,255,0.35);
+  }
+  .prio-pill {
+    display: inline-block;
+    padding: 0 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    color: #c9a3ff;
+    background: rgba(201,163,255,0.12);
+    border: 1px solid rgba(201,163,255,0.3);
+    vertical-align: middle;
+  }
+  /* Provider chip on a quota row (e.g. grok). Codex is unlabelled. */
+  .provider-pill {
+    display: inline-block;
+    padding: 0 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    vertical-align: middle;
+    flex: 0 0 auto;
+    margin-right: 4px;
+  }
+  .provider-pill.xai {
+    color: #7fd4d4;
+    background: rgba(127,212,212,0.12);
+    border: 1px solid rgba(127,212,212,0.32);
+  }
+  /* Clickable Grok Build/API endpoint toggle on a grok quota row. Green =
+     Build (cli-chat-proxy, larger allowance); amber = official API. */
+  .grok-build-toggle {
+    display: inline-block;
+    padding: 1px 6px;
+    margin-right: 5px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    vertical-align: middle;
+    flex: 0 0 auto;
+    cursor: pointer;
+    line-height: 1.4;
+    box-sizing: border-box;
+  }
+  .grok-build-toggle.is-build {
+    color: #b8f0b8;
+    background: rgba(106,211,106,0.12);
+    border: 1px solid rgba(106,211,106,0.4);
+  }
+  .grok-build-toggle.is-api {
+    color: #f5d9a8;
+    background: rgba(245,201,138,0.12);
+    border: 1px solid rgba(245,201,138,0.4);
+  }
+  .grok-build-toggle:hover:not(:disabled) { filter: brightness(1.2); }
+  .grok-build-toggle:disabled { opacity: 0.5; cursor: default; }
+  /* Slow request-body upload highlight (client→CPA transfer time). */
+  .body-slow { color: #f0a878; font-weight: 600; }
+  .release-bindings-btn {
+    background: transparent;
+    color: #f5c98a;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 4px;
+    padding: 0;
+    box-sizing: border-box;
+    width: 28px;
+    height: 24px;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+  }
+  .release-bindings-btn:hover:not(:disabled) {
+    background: rgba(245,201,138,0.08);
+    border-color: rgba(245,201,138,0.35);
+  }
+  .delete-account-btn {
+    background: transparent;
+    color: #ff8a8a;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 4px;
+    padding: 0;
+    box-sizing: border-box;
+    width: 28px;
+    height: 24px;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+  }
+  .delete-account-btn:hover:not(:disabled) {
+    background: rgba(255,138,138,0.1);
+    border-color: rgba(255,138,138,0.4);
+  }
+  /* Codex invite modal */
+  .ci-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    backdrop-filter: blur(2px);
+  }
+  .ci-overlay[hidden] { display: none; }
+  .ci-modal {
+    background: #1a1c20;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 8px;
+    width: 480px;
+    max-width: calc(100vw - 32px);
+    max-height: calc(100vh - 64px);
+    padding: 20px 22px 18px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    overflow: auto;
+  }
+  .ci-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .ci-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: rgba(255,255,255,0.92);
+  }
+  .ci-close {
+    background: transparent;
+    border: none;
+    color: rgba(255,255,255,0.5);
+    font-size: 20px;
+    line-height: 1;
+    padding: 0 4px;
+    cursor: pointer;
+  }
+  .ci-close:hover { color: rgba(255,255,255,0.9); }
+  .ci-account {
+    font-size: 12px;
+    color: rgba(255,255,255,0.55);
+    word-break: break-all;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .ci-refresh-btn {
+    flex: 0 0 auto;
+    background: transparent;
+    color: rgba(255,255,255,0.6);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 4px;
+    padding: 3px 9px;
+    font-size: 11px;
+    cursor: pointer;
+    line-height: 1;
+    white-space: nowrap;
+  }
+  .ci-refresh-btn:hover:not(:disabled) {
+    color: #7fd4d4;
+    border-color: rgba(127,212,212,0.4);
+    background: rgba(127,212,212,0.08);
+  }
+  .ci-refresh-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .ci-cache-pill {
+    margin-left: 8px;
+    font-size: 10px;
+    color: rgba(255,255,255,0.4);
+    font-style: italic;
+  }
+  .ci-status {
+    background: #0f1114;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 4px;
+    padding: 10px 12px;
+    font-size: 11px;
+    line-height: 1.55;
+    color: rgba(255,255,255,0.75);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .ci-status-loading {
+    color: rgba(255,255,255,0.4);
+    font-style: italic;
+  }
+  .ci-status-row {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+  }
+  .ci-status-key {
+    flex: 0 0 88px;
+    color: rgba(255,255,255,0.45);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 10px;
+  }
+  .ci-status-val {
+    flex: 1;
+    overflow-wrap: anywhere;
+  }
+  .ci-pill {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    margin-right: 6px;
+  }
+  .ci-pill-ok   { color: #6ad36a; background: rgba(106,211,106,0.1); border: 1px solid rgba(106,211,106,0.3); }
+  .ci-pill-bad  { color: #ff8a8a; background: rgba(255,138,138,0.1); border: 1px solid rgba(255,138,138,0.3); }
+  .ci-pill-warn { color: #f5c98a; background: rgba(245,201,138,0.1); border: 1px solid rgba(245,201,138,0.3); }
+  .ci-pill-info { color: #7fd4d4; background: rgba(127,212,212,0.1); border: 1px solid rgba(127,212,212,0.3); }
+  .ci-status-error {
+    color: #ff8a8a;
+    font-size: 10px;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    margin-top: 2px;
+    word-break: break-all;
+  }
+  .ci-rules-warn {
+    background: rgba(245,201,138,0.06);
+    border: 1px solid rgba(245,201,138,0.2);
+    border-radius: 4px;
+    padding: 8px 10px;
+    font-size: 11px;
+    line-height: 1.5;
+    color: #f5c98a;
+  }
+  .ci-history-wrap {
+    background: #0f1114;
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 4px;
+    padding: 0;
+    font-size: 11px;
+  }
+  .ci-history-wrap summary {
+    cursor: pointer;
+    padding: 6px 10px;
+    color: rgba(255,255,255,0.6);
+    list-style: none;
+    user-select: none;
+  }
+  .ci-history-wrap summary::before {
+    content: '▸ ';
+    display: inline-block;
+    transition: transform 0.1s;
+  }
+  .ci-history-wrap[open] summary::before {
+    content: '▾ ';
+  }
+  .ci-history {
+    padding: 0 10px 8px;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 10.5px;
+    line-height: 1.5;
+    color: rgba(255,255,255,0.7);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .ci-history h4 {
+    margin: 6px 0 2px;
+    color: rgba(255,255,255,0.55);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .ci-history .empty {
+    color: rgba(255,255,255,0.35);
+    font-style: italic;
+  }
+  .ci-history table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .ci-history th,
+  .ci-history td {
+    text-align: left;
+    padding: 3px 6px 3px 0;
+    vertical-align: top;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .ci-history th {
+    color: rgba(255,255,255,0.4);
+    font-weight: 500;
+    font-size: 10px;
+  }
+  .ci-history a { color: #7fd4d4; text-decoration: none; }
+  .ci-history a:hover { text-decoration: underline; }
+  .ci-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: rgba(255,255,255,0.5);
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: -6px;
+  }
+  .ci-hint {
+    font-size: 10px;
+    text-transform: none;
+    letter-spacing: normal;
+    color: rgba(255,255,255,0.4);
+  }
+  #ciEmails {
+    width: 100%;
+    box-sizing: border-box;
+    background: #0f1114;
+    color: rgba(255,255,255,0.9);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px;
+    padding: 10px 12px;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 12px;
+    resize: vertical;
+    min-height: 100px;
+  }
+  #ciEmails:focus {
+    outline: none;
+    border-color: rgba(127,212,212,0.5);
+  }
+  .ci-meta {
+    font-size: 11px;
+    color: rgba(255,255,255,0.45);
+    min-height: 14px;
+  }
+  .ci-meta.error { color: #ff8a8a; }
+  .ci-result {
+    background: #0f1114;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 4px;
+    padding: 10px 12px;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.5;
+    color: rgba(255,255,255,0.8);
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 200px;
+    overflow: auto;
+  }
+  .ci-result.ok { border-color: rgba(106,211,106,0.25); }
+  .ci-result.fail { border-color: rgba(255,138,138,0.3); }
+  .ci-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 4px;
+  }
+  .ci-btn {
+    padding: 7px 16px;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    line-height: 1;
+  }
+  .ci-btn-secondary {
+    background: transparent;
+    color: rgba(255,255,255,0.7);
+    border-color: rgba(255,255,255,0.15);
+  }
+  .ci-btn-secondary:hover { background: rgba(255,255,255,0.05); }
+  .ci-btn-primary {
+    background: rgba(127,212,212,0.15);
+    color: #7fd4d4;
+    border-color: rgba(127,212,212,0.4);
+  }
+  .ci-btn-primary:hover:not(:disabled) {
+    background: rgba(127,212,212,0.25);
+  }
+  .ci-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* Cooldown cell styles — used by the Cooldown column in the quota
+     panel (the standalone cooldowns panel was retired). */
   .cooldown-msg {
     font-size: 11px;
     overflow: hidden;
@@ -590,6 +1071,16 @@
     opacity: 0.35;
     cursor: not-allowed;
   }
+  /* Cooldown cell inside the quota panel — compact inline rendering of
+     auth-level + per-model + registry-suspended markers. Inherits the
+     .cooldown-model-row / .kind-badge styles already defined above. */
+  .cooldown-cell {
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .cooldown-cell .cooldown-model-row {
+    padding: 1px 0;
+  }
   /* Fixed-layout table with <colgroup> widths summing to exactly 100%.
      Using <col> elements is more reliable than nth-child rules because
      they apply at the column level, not per-cell — and they survive
@@ -602,12 +1093,67 @@
      The accompanying .quota-bar-wrap loses its min-width so the bar
      never forces its column wider than the colgroup says. */
   #quotaSection table { table-layout: fixed; width: 100%; }
-  #quotaSection col.qc-account  { width: 28%; }
-  #quotaSection col.qc-status   { width: 12%; }
-  #quotaSection col.qc-bar      { width: 16%; }
-  #quotaSection col.qc-resets   { width: 14%; }
-  #quotaSection col.qc-fetched  { width: 10%; }
-  #quotaSection col.qc-actions  { width: 4%; }
+  #quotaSection col.qc-account   { width: 16%; }
+  #quotaSection col.qc-status    { width: 8%; }
+  #quotaSection col.qc-bar       { width: 11%; }
+  #quotaSection col.qc-resets    { width: 10%; }
+  #quotaSection col.qc-fetched   { width: 7%; }
+  #quotaSection col.qc-bindings  { width: 9%; }
+  #quotaSection col.qc-cooldown  { width: 12%; }
+  #quotaSection col.qc-actions   { width: 16%; }
+  /* Bindings cell — a compact "N active" button that opens a popup with the
+     full session list (uuids + workspace paths) rather than cramming them
+     into the narrow cell. */
+  .qc-bindings-btn {
+    background: transparent;
+    border: 1px solid rgba(143,198,255,0.3);
+    color: #8fc6ff;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    line-height: 1.3;
+  }
+  .qc-bindings-btn:hover { background: rgba(143,198,255,0.1); }
+  .qc-bindings-btn .muted { color: rgba(255,255,255,0.45); }
+  .qc-binding-none { color: rgba(255,255,255,0.35); font-size: 12px; }
+  .qc-filename {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 10.5px;
+    opacity: 0.75;
+    word-break: break-all;
+  }
+  .qc-acct-line1 {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+  }
+  .qc-acct-line1 .prio-pill { flex: 0 0 auto; }
+  .qc-acct-email {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  /* Bindings popup session list */
+  .bm-sessions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 55vh;
+    overflow: auto;
+  }
+  .bm-sessions .binding-row {
+    padding: 6px 8px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 4px;
+    white-space: normal;
+    word-break: break-all;
+  }
+  .bm-empty { color: rgba(255,255,255,0.4); font-size: 12px; }
   #quotaSection th:last-child,
   #quotaSection td:last-child {
     text-align: center;
@@ -696,8 +1242,18 @@
         Stall timeout (seconds)
         <input id="stallInput" type="number" min="0" step="1" value="0">
       </label>
+      <label>
+        Slow window (seconds)
+        <input id="slowWindowInput" type="number" min="0" step="1" value="0">
+      </label>
+      <label>
+        Slow min bytes / window
+        <input id="slowMinBytesInput" type="number" min="0" step="256" value="0">
+      </label>
       <button id="saveSettingsBtn">Save</button>
-      <span class="muted" id="settingsHint">0 disables auto-cancel. When &gt;0, any non-terminal request with no response activity for that many seconds is cancelled automatically.</span>
+    </div>
+    <div class="row">
+      <span class="muted" id="settingsHint">Stall timeout: 0 disables. When &gt;0, any request with no response activity for that many seconds is cancelled (catches dead/silent streams). Slow window + min bytes form a throughput floor: once a stream is producing bytes, if fewer than the min bytes arrive in any window of that many seconds, it is cancelled as a slow "trickle" stream. Both slow knobs must be &gt;0 to enable; either at 0 disables the slow watchdog.</span>
     </div>
     <div id="settingsStatus" class="status-line"></div>
   </section>
@@ -711,6 +1267,7 @@
           <th>Started / TTFB</th>
           <th>Duration</th>
           <th>Method / Path</th>
+          <th>Protocol</th>
           <th>Model</th>
           <th>Window</th>
           <th>Workspace</th>
@@ -750,41 +1307,23 @@
     </div>
   </details>
 
-  <details class="history" id="cooldownsSection">
-    <summary>
-      Auth cooldowns (<span id="cooldownsCount">0</span>)
-      <button type="button" id="cooldownsRefreshBtn" class="quota-refresh-all" title="Refresh cooldown snapshot">Refresh</button>
-    </summary>
-    <div class="table-wrap">
-      <table>
-        <colgroup>
-          <col class="cc-account">
-          <col class="cc-status">
-          <col class="cc-auth">
-          <col class="cc-models">
-          <col class="cc-registry">
-          <col class="cc-actions">
-        </colgroup>
-        <thead>
-          <tr>
-            <th>Account</th>
-            <th>Status</th>
-            <th>Auth cooldown</th>
-            <th>Model cooldowns</th>
-            <th>Registry suspended</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody id="cooldownsBody"></tbody>
-      </table>
-    </div>
-  </details>
-
   <details class="history" id="quotaSection">
     <summary>
-      Codex account quota (<span id="quotaCount">0</span>)
+      Account quota — Codex &amp; Grok (<span id="quotaCount">0</span>)
       <button type="button" id="quotaRefreshAllBtn" class="quota-refresh-all" title="Refresh every codex account's wham/usage snapshot now">Refresh all</button>
+      <label class="auto-release-429-toggle" title="When on, an upstream 429 or 402 (deactivated workspace / billing) auto-releases that account's session bindings and converts the error into a 500 so the client retries onto a fresh account — transparent failover with no client-side fork">
+        <input type="checkbox" id="autoRelease429Checkbox">
+        <span>Auto-release on 429/402</span>
+        <span class="ar429-hint">(429/402→500 + drop bindings)</span>
+      </label>
     </summary>
+    <!-- Aggregate panel — fleet-wide rollup of 5h + 7d capacity. Each cell:
+         "now" is the sum-of-remaining-percent across active accounts in
+         units of "full windows worth"; "next 5h / next 7d" is the same
+         sum projected forward over the horizon, with each account
+         contributing up to one extra window when its reset_at falls
+         inside the horizon. See aggregateQuotaSummary() for the math. -->
+    <div id="quotaAggregate" class="quota-aggregate" hidden></div>
     <div class="table-wrap">
       <table>
         <colgroup>
@@ -794,36 +1333,24 @@
           <col class="qc-bar">
           <col class="qc-resets">
           <col class="qc-fetched">
+          <col class="qc-bindings">
+          <col class="qc-cooldown">
           <col class="qc-actions">
         </colgroup>
         <thead>
           <tr>
             <th>Account</th>
             <th>Status</th>
-            <th>5h window</th>
-            <th>Weekly window</th>
+            <th title="Shorter-horizon limit — codex: 5h · grok: weekly">5h window</th>
+            <th title="Longer-horizon limit — codex: 7d · grok: monthly">Weekly window</th>
             <th>Resets</th>
             <th>Last fetched</th>
+            <th>Bindings</th>
+            <th>Cooldown</th>
             <th></th>
           </tr>
         </thead>
         <tbody id="quotaBody"></tbody>
-      </table>
-    </div>
-  </details>
-
-  <details class="history" id="bindingsSection">
-    <summary>Active bindings by account (<span id="bindingsCount">0</span>)</summary>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Account</th>
-            <th>Windows</th>
-            <th>Sessions</th>
-          </tr>
-        </thead>
-        <tbody id="bindingsBody"></tbody>
       </table>
     </div>
   </details>
@@ -850,6 +1377,63 @@
     </div>
   </details>
 </main>
+
+<!-- Codex invite modal. Hidden until inviteCodexOne() flips display.
+     Built once so consecutive opens reuse the same DOM and we can
+     wire event listeners during init instead of every open. -->
+<div id="codexInviteModal" class="ci-overlay" hidden>
+  <div class="ci-modal" role="dialog" aria-modal="true" aria-labelledby="ciTitle">
+    <div class="ci-header">
+      <div class="ci-title" id="ciTitle">Send Codex referral invite</div>
+      <button type="button" class="ci-close" id="ciCloseBtn" title="Close (Esc)">×</button>
+    </div>
+    <div class="ci-account">
+      <span id="ciAccount"></span>
+      <button type="button" class="ci-refresh-btn" id="ciRefreshBtn"
+              title="Refetch status from chatgpt.com (bypasses 5-minute cache)">↻ Refresh</button>
+    </div>
+    <div class="ci-status" id="ciStatus">
+      <div class="ci-status-loading">Loading account status…</div>
+    </div>
+    <details class="ci-history-wrap" id="ciHistoryWrap" hidden>
+      <summary>Past invites & reset-credit ledger</summary>
+      <div class="ci-history" id="ciHistory"></div>
+    </details>
+    <div class="ci-rules-warn">
+      ⚠ Failed / undelivered / unaccepted sends still consume the quota. Verify
+      the recipient is eligible (Plus/Pro, not currently using Codex) before
+      sending.
+    </div>
+    <label class="ci-label" for="ciEmails">
+      Target emails
+      <span class="ci-hint">newline / comma / space separated · max 3 per account</span>
+    </label>
+    <textarea id="ciEmails" rows="6" spellcheck="false"
+              placeholder="alice@example.com&#10;bob@example.com, carol@example.com"></textarea>
+    <div class="ci-meta" id="ciMeta"></div>
+    <div class="ci-result" id="ciResult" hidden></div>
+    <div class="ci-actions">
+      <button type="button" class="ci-btn ci-btn-secondary" id="ciCancelBtn">Cancel</button>
+      <button type="button" class="ci-btn ci-btn-primary" id="ciSendBtn">Send invite</button>
+    </div>
+  </div>
+</div>
+
+<!-- Bindings popup — full session list for one account. Reuses the invite
+     modal's overlay/card styling; opened from the quota panel's Bindings
+     cell so the full uuids + workspace paths get room to breathe instead of
+     cramming into a narrow table cell. -->
+<div id="bindingsModal" class="ci-overlay" hidden>
+  <div class="ci-modal" role="dialog" aria-modal="true" aria-labelledby="bmTitle">
+    <div class="ci-header">
+      <div class="ci-title" id="bmTitle">Active bindings</div>
+      <button type="button" class="ci-close" id="bmCloseBtn" title="Close (Esc)">×</button>
+    </div>
+    <div class="ci-account" id="bmAccount"></div>
+    <div class="bm-sessions" id="bmSessions"></div>
+  </div>
+</div>
+
 <script>
 (function () {
   const KEY_STORAGE = 'cpa.monitor.key';
@@ -991,6 +1575,26 @@
     return pill + '<span class="path-cell">' + escapeHtml(e.path || '') + '</span>';
   }
 
+  // Explicit upstream-protocol pill. `transport` is the client↔CPA protocol,
+  // which for Codex also selects the executor: a WebSocket client uses the
+  // Codex WebSocket executor (turns on the same conversation are serialized,
+  // one at a time), while an HTTP client uses the HTTP/SSE executor (turns run
+  // independently). Non-Codex providers are always HTTP.
+  function protocolCell(e) {
+    if (e.transport === 'ws') {
+      return '<span class="transport-pill ws" title="WebSocket client → Codex WebSocket executor. Turns on the same conversation are serialized (one at a time).">WS</span>';
+    }
+    return '<span class="transport-pill http" title="HTTP request (SSE streaming). Turns are not serialized per conversation.">HTTP</span>';
+  }
+
+  // Human-readable transfer speed (bytes/sec).
+  function fmtSpeed(bytesPerSec) {
+    if (!bytesPerSec || bytesPerSec <= 0) return '—';
+    if (bytesPerSec >= 1048576) return (bytesPerSec / 1048576).toFixed(1) + ' MB/s';
+    if (bytesPerSec >= 1024) return Math.round(bytesPerSec / 1024) + ' KB/s';
+    return Math.round(bytesPerSec) + ' B/s';
+  }
+
   // Treat the zero-time marker as "no first chunk yet".
   function firstChunkMs(e) {
     if (!e.first_chunk_at) return 0;
@@ -1001,14 +1605,41 @@
 
   function fmtStartedCell(e, now) {
     const startedStr = fmtStarted(e.started_at);
+    const lines = [];
     const fc = firstChunkMs(e);
     if (fc > 0) {
       const ttfb = fc - new Date(e.started_at).getTime();
-      return `${startedStr}<div class="muted">TTFB ${fmtDuration(Math.max(0, ttfb))}</div>`;
+      lines.push('TTFB ' + fmtDuration(Math.max(0, ttfb)));
+    } else {
+      // No first byte yet — show live "waiting" timer.
+      const waitingMs = now - new Date(e.started_at).getTime();
+      lines.push('waiting ' + fmtDuration(waitingMs));
     }
-    // No first byte yet — show live "waiting" timer.
-    const waitingMs = now - new Date(e.started_at).getTime();
-    return `${startedStr}<div class="muted">waiting ${fmtDuration(waitingMs)}</div>`;
+    // Upload phase: request body arriving off the wire (client → CPA). While
+    // receiving, show live progress + speed; when done, show duration + avg
+    // speed. Otherwise this time is hidden inside "waiting"/TTFB (or before the
+    // request even shows up here). Slow uploads are highlighted so a bad client
+    // link is obvious at a glance.
+    if (e.body_receive_ms != null && e.body_receive_ms > 0) {
+      const recv = e.body_received_bytes || 0;
+      const total = e.request_bytes || 0;
+      const secs = e.body_receive_ms / 1000;
+      const speed = (secs > 0 && recv > 0) ? recv / secs : 0;
+      let txt, slow;
+      if (e.receiving_body) {
+        const pct = total > 0 ? Math.min(100, Math.round(recv * 100 / total)) : null;
+        txt = 'recv body ' + fmtBytes(recv) + (total > 0 ? ('/' + fmtBytes(total)) : '') +
+              (speed > 0 ? (' @ ' + fmtSpeed(speed)) : '') + (pct != null ? (' ' + pct + '%') : '');
+        slow = (e.body_receive_ms >= 3000) || (speed > 0 && speed < 102400);
+      } else {
+        txt = 'body ' + fmtDuration(e.body_receive_ms) + (speed > 0 ? ' @ ' + fmtSpeed(speed) : '');
+        slow = e.body_receive_ms >= 5000;
+      }
+      lines.push(slow
+        ? '<span class="body-slow" title="Request-body upload (client → CPA). A slow speed here means a degraded client network path, not CPA.">' + txt + '</span>'
+        : txt);
+    }
+    return startedStr + lines.map(l => '<div class="muted">' + l + '</div>').join('');
   }
 
   function fmtTokensCell(e, now) {
@@ -1050,6 +1681,7 @@
       <td class="cell-started"></td>
       <td class="cell-duration duration"></td>
       <td class="cell-method method-path"></td>
+      <td class="cell-protocol"></td>
       <td class="cell-model"></td>
       <td class="cell-window"></td>
       <td class="cell-workspace"></td>
@@ -1067,6 +1699,7 @@
         started:   tr.querySelector('.cell-started'),
         duration:  tr.querySelector('.cell-duration'),
         method:    tr.querySelector('.cell-method'),
+        protocol:  tr.querySelector('.cell-protocol'),
         model:     tr.querySelector('.cell-model'),
         window:    tr.querySelector('.cell-window'),
         workspace: tr.querySelector('.cell-workspace'),
@@ -1128,13 +1761,22 @@
     setText(row.cells.duration, fmtDuration(liveMs), cache, 'duration');
 
     setHTML(row.cells.method, methodCell(e), cache, 'method');
+    setHTML(row.cells.protocol, protocolCell(e), cache, 'protocol');
     setHTML(row.cells.model,  escapeHtml(e.model || ''), cache, 'model');
     setHTML(row.cells.window, windowCell(e), cache, 'window');
     setHTML(row.cells.workspace, workspaceCell(e), cache, 'workspace');
     const providerLine = escapeHtml(e.provider || '');
     const proxyLine = e.auth_proxy ? '<div class="muted proxy-line">' + escapeHtml(e.auth_proxy) + '</div>' : '';
+    // Codex auth filename under the email — matches the Accounts table so a
+    // request can be traced to the exact credential file (auth_id IS the
+    // on-disk filename for file-based auths). Skipped when it equals the
+    // label (e.g. non-codex auths where id == label).
+    const fileLine = (e.auth_id && e.auth_id !== e.auth_label)
+      ? '<div class="muted qc-filename" title="' + escapeAttr(e.auth_id) + '">' + escapeHtml(e.auth_id) + '</div>'
+      : '';
     setHTML(row.cells.account,
       escapeHtml(e.auth_label || e.auth_id || '') +
+      fileLine +
       '<div class="muted">' + providerLine + '</div>' +
       proxyLine,
       cache, 'account');
@@ -1243,15 +1885,9 @@
 
   function updateTitle() {
     const inFlight = entries.size;
-    let cooldowns = 0;
-    const cooldownsEl = document.getElementById('cooldownsCount');
-    if (cooldownsEl) {
-      cooldowns = parseInt(cooldownsEl.textContent, 10) || 0;
-    }
     const parts = [];
     if (!titleConnected) parts.push('⊘');
     if (inFlight > 0) parts.push('▶' + inFlight);
-    if (cooldowns > 0) parts.push('⏸' + cooldowns);
     if (titleRecentErrors > 0) parts.push('⚠' + titleRecentErrors);
     document.title = parts.length ? parts.join(' ') + ' · ' + BASE_TITLE : BASE_TITLE;
   }
@@ -1470,6 +2106,8 @@
       const res = await apiFetch('/v0/management/in-flight/settings');
       const s = await res.json();
       $('stallInput').value = s.stall_timeout_seconds || 0;
+      $('slowWindowInput').value = s.slow_window_seconds || 0;
+      $('slowMinBytesInput').value = s.slow_min_bytes || 0;
       $('settingsPanel').hidden = false;
     } catch (err) {
       $('settingsStatus').textContent = err.message;
@@ -1479,8 +2117,15 @@
 
   async function saveSettings() {
     const val = parseInt($('stallInput').value, 10);
+    const slowWin = parseInt($('slowWindowInput').value, 10);
+    const slowMin = parseInt($('slowMinBytesInput').value, 10);
     if (isNaN(val) || val < 0) {
       $('settingsStatus').textContent = 'Stall timeout must be a non-negative integer.';
+      $('settingsStatus').classList.add('error');
+      return;
+    }
+    if (isNaN(slowWin) || slowWin < 0 || isNaN(slowMin) || slowMin < 0) {
+      $('settingsStatus').textContent = 'Slow window and min bytes must be non-negative integers.';
       $('settingsStatus').classList.add('error');
       return;
     }
@@ -1488,14 +2133,19 @@
       const res = await apiFetch('/v0/management/in-flight/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stall_timeout_seconds: val }),
+        body: JSON.stringify({ stall_timeout_seconds: val, slow_window_seconds: slowWin, slow_min_bytes: slowMin }),
       });
       const s = await res.json();
       $('stallInput').value = s.stall_timeout_seconds || 0;
+      $('slowWindowInput').value = s.slow_window_seconds || 0;
+      $('slowMinBytesInput').value = s.slow_min_bytes || 0;
       $('settingsStatus').classList.remove('error');
-      $('settingsStatus').textContent = val > 0
-        ? 'Auto-cancel enabled: requests stalled for ' + val + 's will be cancelled.'
-        : 'Auto-cancel disabled.';
+      const parts = [];
+      parts.push(val > 0 ? 'stall auto-cancel at ' + val + 's' : 'stall auto-cancel off');
+      parts.push((slowWin > 0 && slowMin > 0)
+        ? 'slow watchdog: <' + slowMin + ' B / ' + slowWin + 's'
+        : 'slow watchdog off');
+      $('settingsStatus').textContent = 'Saved — ' + parts.join(', ') + '.';
     } catch (err) {
       $('settingsStatus').classList.add('error');
       $('settingsStatus').textContent = err.message;
@@ -1549,11 +2199,11 @@
         tr.innerHTML = `
           <td><div class="hist-ago"></div><div class="muted">${fmtStarted(r.canceled_at)}</div></td>
           <td class="id-cell">${escapeHtml(e.id || '')}</td>
-          <td><span class="reason-pill ${escapeAttr(reasonClass)}">${escapeHtml(r.reason || '')}</span></td>
+          <td><span class="reason-pill ${escapeAttr(reasonClass)}">${escapeHtml(r.reason || '')}</span>${r.detail ? '<div class="muted hist-detail" title="'+escapeAttr(r.detail)+'">'+escapeHtml(r.detail)+'</div>' : ''}</td>
           <td>${escapeHtml(r.canceled_by || '')}</td>
           <td class="method-path">${methodCell(e)}</td>
           <td>${escapeHtml(e.model || '')}</td>
-          <td>${escapeHtml(e.auth_label || e.auth_id || '')}<div class="muted">${escapeHtml(e.provider || '')}</div>${e.auth_proxy ? '<div class="muted proxy-line">'+escapeHtml(e.auth_proxy)+'</div>' : ''}</td>
+          <td>${escapeHtml(e.auth_label || e.auth_id || '')}${(e.auth_id && e.auth_id !== e.auth_label) ? '<div class="muted qc-filename" title="'+escapeAttr(e.auth_id)+'">'+escapeHtml(e.auth_id)+'</div>' : ''}<div class="muted">${escapeHtml(e.provider || '')}</div>${e.auth_proxy ? '<div class="muted proxy-line">'+escapeHtml(e.auth_proxy)+'</div>' : ''}</td>
           <td class="bytes">${fmtBytes(e.request_bytes || 0)} → ${fmtBytes(e.response_bytes || 0)}</td>
           <td class="duration">${fmtDuration(durMs)}</td>
         `;
@@ -1588,6 +2238,33 @@
   function errorKey(r) {
     const e = r.entry || {};
     return (r.recorded_at || '') + '|' + (e.id || '');
+  }
+
+  // extractErrMsg pulls the human message out of common error JSON shapes
+  // ({"error":{"message":…}}, {"error":"…"}, {"message":…}, {"detail":…}),
+  // falling back to the raw string (e.g. truncated / non-JSON).
+  function extractErrMsg(s) {
+    if (!s) return '';
+    try {
+      const j = JSON.parse(s);
+      const err = j && j.error;
+      if (err && typeof err === 'object' && err.message) return String(err.message);
+      if (typeof err === 'string') return err;
+      if (j && j.message) return String(j.message);
+      if (j && j.detail) return String(j.detail);
+    } catch (_) { /* truncated / non-JSON: use raw */ }
+    return s;
+  }
+
+  // errSnippetLine renders the captured upstream error body under the reason
+  // pill, showing the human message with the full snippet on hover. Empty when
+  // no snippet was captured.
+  function errSnippetLine(e) {
+    const s = (e && e.error_snippet) ? String(e.error_snippet) : '';
+    if (!s) return '';
+    const msg = extractErrMsg(s);
+    const short = msg.length > 140 ? msg.slice(0, 140) + '…' : msg;
+    return '<div class="muted hist-detail" title="' + escapeAttr(s) + '">' + escapeHtml(short) + '</div>';
   }
 
   async function loadRecentErrors() {
@@ -1632,13 +2309,13 @@
         tr.innerHTML = `
           <td><div class="hist-ago"></div><div class="muted">${fmtStarted(r.recorded_at)}</div></td>
           <td class="id-cell">${e.id ? `<a href="#" class="log-link" data-id="${escapeAttr(e.id)}" title="Click to view API RESPONSE and RESPONSE sections inline">${escapeHtml(e.id)}</a><a href="#" class="log-download" data-id="${escapeAttr(e.id)}" title="Download full request/response log file">⬇</a>` : ''}</td>
-          <td><span class="reason-pill ${escapeAttr(reasonClass)}">${escapeHtml(r.reason || '')}</span></td>
+          <td><span class="reason-pill ${escapeAttr(reasonClass)}">${escapeHtml(r.reason || '')}</span>${errSnippetLine(e)}</td>
           <td>${r.status_code ? escapeHtml(String(r.status_code)) : '<span class="muted">—</span>'}</td>
           <td class="method-path">${methodCell(e)}</td>
           <td>${escapeHtml(e.model || '')}</td>
           <td>${windowCell(e)}</td>
           <td>${workspaceCell(e)}</td>
-          <td>${escapeHtml(e.auth_label || e.auth_id || '')}<div class="muted">${escapeHtml(e.provider || '')}</div></td>
+          <td>${escapeHtml(e.auth_label || e.auth_id || '')}${(e.auth_id && e.auth_id !== e.auth_label) ? '<div class="muted qc-filename" title="'+escapeAttr(e.auth_id)+'">'+escapeHtml(e.auth_id)+'</div>' : ''}<div class="muted">${escapeHtml(e.provider || '')}</div></td>
           <td class="duration">${fmtDuration(durMs)}</td>
         `;
         body.insertBefore(tr, body.firstChild);
@@ -1670,177 +2347,24 @@
     }
   }
 
-  // Bindings reverse-index panel. Each row groups all cache entries
-  // bound to one auth, with thread+window pairs of the same UUID
-  // folded into a single Sessions sub-entry (kind="both"). The view
-  // is server-side sorted: most-loaded accounts first, sessions by
-  // most-recent expires_at.
-  async function loadBindings() {
-    try {
-      const res = await apiFetch('/v0/management/session-affinity/bindings');
-      const data = await res.json();
-      noteServerNow(data.now);
-      const accounts = data.accounts || [];
-      const activeTotal = accounts.reduce((s, a) => s + (a.active_count || 0), 0);
-      const closedTotal = accounts.reduce((s, a) => s + (a.closed_count || 0), 0);
-      // Always render "N active" so the label is visible from a cold
-      // start; append the closed breakdown only when at least one
-      // fork-close has been recorded.
-      $('bindingsCount').textContent = closedTotal > 0
-        ? activeTotal + ' active + ' + closedTotal + ' closed'
-        : activeTotal + ' active';
-      const body = $('bindingsBody');
-      body.innerHTML = '';
-      for (const a of accounts) {
-        const tr = document.createElement('tr');
-        const accountLabel = escapeHtml(a.auth_label || a.auth_id);
-        const provider = a.provider ? '<div class="muted">' + escapeHtml(a.provider) + '</div>' : '';
-        const sessionsHtml = (a.windows || []).map(w => {
-          const wsCell = w.workspace
-            ? '<span class="workspace-cell" title="' + escapeAttr(w.workspace) + '">' + escapeHtml(shortWorkspace(w.workspace)) + '</span>'
-            : '<span class="muted">—</span>';
-          const uuidShort = (w.uuid || '').slice(0, 13);
-          const kindBadge = w.kind === 'both'
-            ? ''
-            : '<span class="kind-badge kind-' + escapeAttr(w.kind || 'other') + '">' + escapeHtml(w.kind || '') + '</span>';
-          const closedSuffix = w.closed
-            ? '<span class="kind-badge closed">closed</span>' +
-              (w.forked_to ? '<span class="muted forked-arrow">→ ' + escapeHtml((w.forked_to || '').slice(0, 13)) + '…</span>' : '')
-            : '';
-          const rowClass = w.closed ? 'binding-row binding-closed' : 'binding-row';
-          return '<div class="' + rowClass + '" title="' + escapeAttr(w.uuid) + '"><code>' + escapeHtml(uuidShort) + '…</code>' + kindBadge + closedSuffix + ' ' + wsCell + '</div>';
-        }).join('');
-        // Always show "X active" so operators can see the field name even
-        // when no closed bindings exist yet — appending "+ Y closed" only
-        // when at least one fork has been observed. Earlier this column
-        // collapsed to a plain number when closed_count==0, which read as
-        // "where is the active/closed split" until a fork actually fired.
-        const activeCount = a.active_count != null ? a.active_count : (a.windows_count || 0);
-        const closedCount = a.closed_count || 0;
-        let windowsCell = '<span class="windows-count">' + activeCount + ' active</span>';
-        if (closedCount > 0) {
-          windowsCell += ' <span class="muted">+ ' + closedCount + ' closed</span>';
-        }
-        tr.innerHTML =
-          '<td>' + accountLabel + provider + '</td>' +
-          '<td>' + windowsCell + '</td>' +
-          '<td>' + (sessionsHtml || '<span class="muted">—</span>') + '</td>';
-        body.appendChild(tr);
-      }
-    } catch (err) {
-      // best-effort
-    }
-  }
+  // Bindings are now folded into the Codex account quota panel — see
+  // renderQuotaBindingsCell + the /session-affinity/bindings fetch inside
+  // loadAccountQuota. The former standalone panel was removed because every
+  // per-account action already lives on the quota row.
 
-  // Auth cooldowns panel. Reads /v0/management/auth-cooldowns and
-  // shows only accounts that currently have a cooldown marker (either
-  // on the Auth-level Quota / NextRetryAfter / Unavailable, on any
-  // per-model state, or in the model_registry's suspended-clients
-  // map). The Clear button calls /v0/management/auth-cooldowns/:id/clear
-  // which wipes every transient marker on the auth — used when the
-  // operator knows upstream has recovered and the cached cooldown is
-  // just stale.
-  let cooldownsInflight = false;
-  async function loadCooldowns() {
-    if (cooldownsInflight) return;
-    cooldownsInflight = true;
-    try {
-      const res = await apiFetch('/v0/management/auth-cooldowns');
-      const data = await res.json();
-      noteServerNow(data.now);
-      const accounts = data.accounts || [];
-      $('cooldownsCount').textContent = String(accounts.length);
-      updateTitle();
-      const body = $('cooldownsBody');
-      body.innerHTML = '';
-      for (const a of accounts) {
-        body.appendChild(renderCooldownRow(a));
-      }
-    } catch (err) {
-      // best-effort
-    } finally {
-      cooldownsInflight = false;
-    }
-  }
-
-  function renderCooldownRow(a) {
-    const tr = document.createElement('tr');
-    tr.dataset.authId = a.auth_id;
-    const label = escapeHtml(a.auth_label || a.email || a.auth_id);
-    const sub = a.email ? '<div class="muted">' + escapeHtml(a.email) + '</div>' : '';
-
-    let statusPill;
-    if (a.disabled) statusPill = '<span class="status-pill disabled">disabled</span>';
-    else if (a.status === 'error') statusPill = '<span class="status-pill unavail">error</span>';
-    else statusPill = '<span class="status-pill active">' + escapeHtml(a.status || 'active') + '</span>';
-    const statusMsg = a.status_message ? '<div class="muted cooldown-msg" title="' + escapeAttr(a.status_message) + '">' + escapeHtml(truncate(a.status_message, 60)) + '</div>' : '';
-
-    const auth = a.auth || {};
-    const authParts = [];
-    if (auth.unavailable) authParts.push('<span class="kind-badge closed">unavail</span>');
-    if (auth.quota_exceeded) {
-      const recover = validTime(auth.quota_recover_at) ? ' until ' + fmtResetWhen(auth.quota_recover_at) : '';
-      authParts.push('<div>quota' + (auth.quota_reason ? ' (' + escapeHtml(auth.quota_reason) + ')' : '') + recover + '</div>');
-    }
-    if (validTime(auth.next_retry_after) && !auth.quota_exceeded) {
-      authParts.push('<div>retry ' + fmtResetWhen(auth.next_retry_after) + '</div>');
-    }
-    if (auth.quota_backoff_level) authParts.push('<div class="muted">backoff lvl ' + auth.quota_backoff_level + '</div>');
-    const authCell = authParts.length ? authParts.join('') : '<span class="muted">—</span>';
-
-    const models = a.models || [];
-    let modelsCell;
-    if (models.length === 0) {
-      modelsCell = '<span class="muted">—</span>';
-    } else {
-      modelsCell = models.map(m => {
-        const bits = [];
-        bits.push('<code>' + escapeHtml(m.model) + '</code>');
-        if (m.quota_exceeded) {
-          const recover = validTime(m.quota_recover_at) ? ' until ' + fmtResetWhen(m.quota_recover_at) : '';
-          bits.push('<span class="kind-badge closed">quota</span>' + recover);
-        } else if (validTime(m.next_retry_after)) {
-          bits.push('<span class="muted">retry ' + fmtResetWhen(m.next_retry_after) + '</span>');
-        } else if (m.unavailable) {
-          bits.push('<span class="kind-badge closed">unavail</span>');
-        }
-        return '<div class="cooldown-model-row">' + bits.join(' ') + '</div>';
-      }).join('');
-    }
-
-    const regSuspended = a.registry_suspended_models || [];
-    const regCell = regSuspended.length
-      ? regSuspended.map(m => '<code>' + escapeHtml(m) + '</code>').join(' ')
-      : '<span class="muted">—</span>';
-
-    const clearBtn = a.disabled
-      ? '<button type="button" class="quota-refresh-btn" disabled title="account disabled — un-disable via auth-files API first">×</button>'
-      : '<button type="button" class="cooldown-clear-btn" data-cooldown-clear="' + escapeAttr(a.auth_id) + '" title="Clear all cooldown markers for this account">Clear</button>';
-
-    tr.innerHTML =
-      '<td>' + label + sub + '</td>' +
-      '<td>' + statusPill + statusMsg + '</td>' +
-      '<td>' + authCell + '</td>' +
-      '<td>' + modelsCell + '</td>' +
-      '<td>' + regCell + '</td>' +
-      '<td>' + clearBtn + '</td>';
-    return tr;
-  }
-
-  function truncate(s, max) {
-    s = String(s || '');
-    return s.length <= max ? s : s.slice(0, max - 1) + '…';
-  }
-
+  // clearOneCooldown wipes all cooldown markers on an account via
+  // /v0/management/auth-cooldowns/:id/clear. The Clear button now lives
+  // in the quota panel's Cooldown column (the standalone cooldowns
+  // panel was retired — codex cooldowns are shown inline there). After
+  // clearing, the quota panel is reloaded so the Cooldown column
+  // reflects the wiped state.
   async function clearOneCooldown(authID, btnEl) {
     if (!authID) return;
     const original = btnEl ? btnEl.textContent : '';
     if (btnEl) { btnEl.disabled = true; btnEl.textContent = '…'; }
     try {
       await apiFetch('/v0/management/auth-cooldowns/' + encodeURIComponent(authID) + '/clear', { method: 'POST' });
-      // Re-render the whole panel so cleared rows that no longer have
-      // any cooldown markers fall off the list naturally.
-      await loadCooldowns();
+      await loadAccountQuota();
       setStatus('cleared cooldown for ' + authID);
     } catch (err) {
       setStatus('cooldown clear failed: ' + (err && err.message ? err.message : err), true);
@@ -1850,8 +2374,6 @@
   }
 
   document.addEventListener('click', (ev) => {
-    const refreshBtn = ev.target.closest('#cooldownsRefreshBtn');
-    if (refreshBtn) { ev.preventDefault(); loadCooldowns(); return; }
     const clearBtn = ev.target.closest('button[data-cooldown-clear]');
     if (clearBtn) {
       ev.preventDefault();
@@ -1868,15 +2390,39 @@
   // table on every poll.
   const quotaRows = new Map();
   let quotaInflight = false;
+  // Session-affinity bindings joined into each account row (keyed by
+  // auth_id). Populated by loadAccountQuota from /session-affinity/bindings
+  // so the account panel shows each account's live bindings inline — the
+  // former standalone "Active bindings by account" panel folded in here.
+  let quotaBindingsByAuth = {};
 
   async function loadAccountQuota() {
     if (quotaInflight) return;
     quotaInflight = true;
     try {
-      const res = await apiFetch('/v0/management/auth-files');
+      // Fetch auth-files (quota) and session-affinity bindings together.
+      // Bindings is best-effort — the endpoint only exists when a
+      // SessionAffinitySelector is configured, so a failure just means
+      // "no bindings column data", never a broken quota table.
+      const [res, bindingsRes] = await Promise.all([
+        apiFetch('/v0/management/auth-files'),
+        apiFetch('/v0/management/session-affinity/bindings').catch(() => null),
+      ]);
+      quotaBindingsByAuth = {};
+      if (bindingsRes) {
+        try {
+          const bd = await bindingsRes.json();
+          for (const acc of (bd.accounts || [])) {
+            if (acc && acc.auth_id) quotaBindingsByAuth[acc.auth_id] = acc;
+          }
+        } catch (_) { /* ignore malformed bindings payload */ }
+      }
       const data = await res.json();
       noteServerNow(data.now);
-      const files = (data.files || []).filter(a => (a.type || a.provider || '').toLowerCase() === 'codex');
+      const files = (data.files || []).filter(a => {
+        const p = (a.type || a.provider || '').toLowerCase();
+        return p === 'codex' || p === 'xai';
+      });
       $('quotaCount').textContent = String(files.length);
       const body = $('quotaBody');
       const seen = new Set();
@@ -1899,8 +2445,10 @@
         const xq = x.quota || {}, yq = y.quota || {};
         const xLimit = !!xq.limit_reached, yLimit = !!yq.limit_reached;
         if (xLimit !== yLimit) return xLimit ? -1 : 1;
-        const xp = xq.used_percent_primary || 0;
-        const yp = yq.used_percent_primary || 0;
+        // Use the busier of the two windows so grok rows (monthly usage in
+        // the secondary window, no primary) still sort by real usage.
+        const xp = Math.max(xq.used_percent_primary || 0, xq.used_percent_secondary || 0);
+        const yp = Math.max(yq.used_percent_primary || 0, yq.used_percent_secondary || 0);
         if (xp !== yp) return yp - xp;
         return String(x.id).localeCompare(String(y.id));
       });
@@ -1914,6 +2462,7 @@
       for (const id of [...quotaRows.keys()]) {
         if (!seen.has(id)) quotaRows.delete(id);
       }
+      renderQuotaAggregate(files);
     } catch (err) {
       // best-effort
     } finally {
@@ -1921,12 +2470,167 @@
     }
   }
 
+  // Fleet-wide aggregate. Units are "full windows worth" — each active
+  // account contributes 1.0 when its window is empty and 0 when it's
+  // fully used. The naive sum at "now" loses information about resets
+  // that are about to refill capacity, so we also project two horizons:
+  //   - next 5h:  each account's contribution += (5h - ttr_5h) / 5h
+  //               capped at +1 (account can refund at most one window
+  //               worth inside a 5h horizon since W = 5h)
+  //   - next 7d:  same logic with W = 7d. Since the 7d window only
+  //               refunds once per week, this delta is small in
+  //               practice but the math is identical.
+  // Disabled accounts are excluded (admin-removed from the routing
+  // pool). limit_reached accounts fall out naturally because used%=100.
+  function aggregateQuotaSummary(files) {
+    const now = Date.now();
+    const W5 = 5 * 3600 * 1000;          // 5h in ms
+    const W7 = 7 * 24 * 3600 * 1000;     // 7d in ms
+    let active = 0;
+    let now5 = 0, now7 = 0;
+    let next5 = 0, next7 = 0;
+    let nextReset5 = null, nextReset5Label = '';
+    let nextReset7 = null, nextReset7Label = '';
+    for (const a of files) {
+      if (a.disabled) continue;
+      // The fleet aggregate models Codex's 5h/7d rolling windows; grok's
+      // monthly credit pool has different semantics, so xai rows are
+      // excluded to avoid poisoning the projection.
+      if ((a.provider || a.type || '').toLowerCase() !== 'codex') continue;
+      const q = a.quota || {};
+      // wham/usage didn't deliver a snapshot yet — skip this account
+      // entirely so we don't poison the aggregate with zeros that just
+      // mean "we don't know".
+      if (q.used_percent_primary == null && q.used_percent_secondary == null) continue;
+      active++;
+      const u5 = Math.max(0, Math.min(100, Number(q.used_percent_primary) || 0));
+      const u7 = Math.max(0, Math.min(100, Number(q.used_percent_secondary) || 0));
+      const rem5 = (100 - u5) / 100;     // 0..1
+      const rem7 = (100 - u7) / 100;
+      now5 += rem5;
+      now7 += rem7;
+      // Project forward by horizon H = window length; bonus is the
+      // fraction of a fresh window we'd see after the upcoming reset.
+      const r5 = validTime(q.reset_at_primary) ? new Date(q.reset_at_primary).getTime() : 0;
+      const r7 = validTime(q.reset_at_secondary) ? new Date(q.reset_at_secondary).getTime() : 0;
+      if (r5 > now) {
+        const ttr5 = r5 - now;
+        const bonus5 = ttr5 < W5 ? (W5 - ttr5) / W5 : 0;
+        next5 += rem5 + bonus5;
+        if (nextReset5 == null || r5 < nextReset5) {
+          nextReset5 = r5;
+          nextReset5Label = a.label || a.email || a.id;
+        }
+      } else {
+        next5 += rem5;
+      }
+      if (r7 > now) {
+        const ttr7 = r7 - now;
+        const bonus7 = ttr7 < W7 ? (W7 - ttr7) / W7 : 0;
+        next7 += rem7 + bonus7;
+        if (nextReset7 == null || r7 < nextReset7) {
+          nextReset7 = r7;
+          nextReset7Label = a.label || a.email || a.id;
+        }
+      } else {
+        next7 += rem7;
+      }
+    }
+    return { active, now5, now7, next5, next7, nextReset5, nextReset5Label, nextReset7, nextReset7Label };
+  }
+
+  function quotaTierClass(remaining, total) {
+    if (total <= 0) return 'qa-fill-dead';
+    const ratio = remaining / total;
+    if (ratio >= 0.5) return 'qa-fill-healthy';
+    if (ratio >= 0.2) return 'qa-fill-stressed';
+    return 'qa-fill-dead';
+  }
+
+  function fmtAggregateDelta(now, future, total) {
+    const delta = future - now;
+    if (delta <= 0.05) return '';   // round-down floor — anything under
+                                    // 1/20 window is just noise
+    return ' <span class="delta-up">+' + delta.toFixed(1) + '</span>';
+  }
+
+  function renderQuotaAggregate(files) {
+    const root = $('quotaAggregate');
+    if (!root) return;
+    const s = aggregateQuotaSummary(files);
+    if (s.active === 0) { root.hidden = true; return; }
+    root.hidden = false;
+    const pct5 = Math.round((s.now5 / s.active) * 100);
+    const pct7 = Math.round((s.now7 / s.active) * 100);
+    const cls5 = quotaTierClass(s.now5, s.active);
+    const cls7 = quotaTierClass(s.now7, s.active);
+    const reset5 = s.nextReset5
+      ? '<strong>' + fmtResetWhen(new Date(s.nextReset5).toISOString()) + '</strong> · '
+        + '<span class="muted">' + escapeHtml(s.nextReset5Label) + '</span>'
+      : '<span class="muted">—</span>';
+    const reset7 = s.nextReset7
+      ? '<strong>' + fmtResetWhen(new Date(s.nextReset7).toISOString()) + '</strong> · '
+        + '<span class="muted">' + escapeHtml(s.nextReset7Label) + '</span>'
+      : '<span class="muted">—</span>';
+    root.innerHTML =
+      '<div class="quota-aggregate-pool">' +
+        '<div class="quota-aggregate-title">5h pool · ' + s.active + ' active</div>' +
+        '<div class="quota-aggregate-now">' + s.now5.toFixed(1) + ' / ' + s.active + ' windows free <span style="font-size:11px;color:rgba(255,255,255,0.5)">(' + pct5 + '%)</span></div>' +
+        '<div class="quota-aggregate-bar"><div class="quota-aggregate-bar-fill ' + cls5 + '" style="width:' + pct5 + '%"></div></div>' +
+        '<div class="quota-aggregate-line"><span>Next 5h projected</span><span>' + s.next5.toFixed(1) + ' windows' + fmtAggregateDelta(s.now5, s.next5, s.active) + '</span></div>' +
+        '<div class="quota-aggregate-line"><span>Next 5h reset</span><span>' + reset5 + '</span></div>' +
+      '</div>' +
+      '<div class="quota-aggregate-pool">' +
+        '<div class="quota-aggregate-title">7d pool · ' + s.active + ' active</div>' +
+        '<div class="quota-aggregate-now">' + s.now7.toFixed(1) + ' / ' + s.active + ' weeks free <span style="font-size:11px;color:rgba(255,255,255,0.5)">(' + pct7 + '%)</span></div>' +
+        '<div class="quota-aggregate-bar"><div class="quota-aggregate-bar-fill ' + cls7 + '" style="width:' + pct7 + '%"></div></div>' +
+        '<div class="quota-aggregate-line"><span>Next 7d projected</span><span>' + s.next7.toFixed(1) + ' weeks' + fmtAggregateDelta(s.now7, s.next7, s.active) + '</span></div>' +
+        '<div class="quota-aggregate-line"><span>Next 7d reset</span><span>' + reset7 + '</span></div>' +
+      '</div>';
+  }
+
   function renderQuotaRow(a) {
     const tr = document.createElement('tr');
     tr.dataset.authId = a.id;
     const label = escapeHtml(a.label || a.email || a.name || a.id);
-    const sub = a.email ? '<div class="muted">' + escapeHtml(a.email) + '</div>' : '';
+    // Sub-line: the auth FILE NAME rather than a second copy of the email,
+    // so duplicate accounts (same email via +aliases, different account_id)
+    // are distinguishable at a glance. Prefer the real filename; if it is
+    // somehow missing, synthesize codex-<email>-<acct8>.json from the first
+    // segment of the account id.
+    const fileName = (function () {
+      const nm = String(a.name || a.id || '').trim();
+      if (nm) return nm;
+      const acct = (a.id_token && a.id_token.chatgpt_account_id) || a.account_id || (a.account && a.account.id) || '';
+      const seg = String(acct).split('-')[0] || 'unknown';
+      return 'codex-' + (a.email || 'unknown') + '-' + seg + '.json';
+    })();
+    const sub = '<div class="muted qc-filename" title="' + escapeAttr(fileName) + '">' + escapeHtml(fileName) + '</div>';
     const q = a.quota || null;
+    const isXai = (a.provider || a.type || '').toLowerCase() === 'xai';
+    // Provider chip so grok rows are unmistakable in a mixed pool. Codex is
+    // the implicit default and stays unlabelled to avoid clutter.
+    const providerPill = isXai
+      ? '<span class="provider-pill xai" title="xAI / Grok account">grok</span>'
+      : '';
+    // Clickable Grok endpoint toggle (grok rows only). a.xai_using_api is true
+    // for the official API path, false for Grok Build. The label shows the mode
+    // the account is CURRENTLY on; clicking switches it.
+    const buildPill = isXai
+      ? '<button type="button" class="grok-build-toggle ' + (a.xai_using_api ? 'is-api' : 'is-build') + '" data-grok-toggle="' + escapeAttr(a.id) + '" data-using-api="' + (a.xai_using_api ? '1' : '0') + '" title="Grok endpoint for this account. Build = cli-chat-proxy (SuperGrok weekly allowance, usually larger quota); API = api.x.ai (pay-per-credit). Click to switch. Media requests always use the API.">' + (a.xai_using_api ? 'API' : 'Build') + '</button>'
+      : '';
+    // Drain-priority badge. Higher priority = drained first; only shown
+    // when non-zero so the common (unset) case stays clean.
+    const priority = Number(a.priority) || 0;
+    const prioPill = priority > 0
+      ? '<span class="prio-pill" title="Drain priority ' + priority + ' — higher drains first">⚑' + priority + '</span>'
+      : '';
+    // Line 1 is a flex row: the priority pill never shrinks (always visible),
+    // the email truncates with an ellipsis when the (now narrow) column can't
+    // fit it. The pill used to be appended after the email and got pushed out
+    // of view once the column shrank — this keeps it pinned at the front.
+    const nameCell = '<div class="qc-acct-line1">' + prioPill + providerPill + buildPill +
+      '<span class="qc-acct-email" title="' + escapeAttr(a.label || a.email || a.name || a.id) + '">' + label + '</span></div>';
 
     let statusPill;
     if (a.disabled) statusPill = '<span class="status-pill disabled">disabled</span>';
@@ -1934,41 +2638,187 @@
     else if (a.unavailable) statusPill = '<span class="status-pill unavail">unavailable</span>';
     else statusPill = '<span class="status-pill active">active</span>';
 
-    const primaryCell = q ? quotaBarCell(q.used_percent_primary) : '<span class="muted">—</span>';
-    const secondaryCell = q ? quotaBarCell(q.used_percent_secondary) : '<span class="muted">—</span>';
+    // The two columns are ordered by horizon: primary = shorter window,
+    // secondary = longer. For codex that's 5h / 7d; for grok it's weekly /
+    // monthly. Which period each grok column represents (and when it refreshes)
+    // is shown by the Resets column ("weekly in …" / "monthly in …") plus the
+    // header tooltips, so no inline tag is needed. Hover titles name each pool.
+    const primaryCell = q
+      ? (isXai ? '<span title="SuperGrok weekly cap (the binding limit)">' + quotaBarCell(q.used_percent_primary) + '</span>'
+               : quotaBarCell(q.used_percent_primary))
+      : '<span class="muted">—</span>';
+    const secondaryCell = q
+      ? (isXai ? '<span title="Monthly credit pool">' + quotaBarCell(q.used_percent_secondary) + '</span>'
+               : quotaBarCell(q.used_percent_secondary))
+      : '<span class="muted">—</span>';
 
     let resetsCell = '<span class="muted">—</span>';
     if (q && (validTime(q.reset_at_primary) || validTime(q.reset_at_secondary))) {
       const parts = [];
-      if (validTime(q.reset_at_primary)) parts.push('5h ' + fmtResetWhen(q.reset_at_primary));
-      if (validTime(q.reset_at_secondary)) parts.push('7d ' + fmtResetWhen(q.reset_at_secondary));
+      if (validTime(q.reset_at_primary)) parts.push('<span title="resets ' + escapeAttr(ciFmtTime(q.reset_at_primary)) + '">' + (isXai ? 'weekly ' : '5h ') + fmtResetWhen(q.reset_at_primary) + '</span>');
+      if (validTime(q.reset_at_secondary)) parts.push('<span title="resets ' + escapeAttr(ciFmtTime(q.reset_at_secondary)) + '">' + (isXai ? 'monthly ' : '7d ') + fmtResetWhen(q.reset_at_secondary) + '</span>');
       resetsCell = parts.join('<br>');
     }
     const fetchedCell = q && validTime(q.fetched_at)
       ? '<span title="' + escapeAttr(q.fetched_at) + '">' + escapeHtml(fmtAgo(q.fetched_at)) + '</span>'
       : '<span class="muted">—</span>';
+    // Priority setter (⚑) and release-bindings (⏏) are always available —
+    // you may want to tag a temporarily-disabled account, and releasing a
+    // dead account's bindings is harmless whatever its state.
+    const prioBtn = '<button type="button" class="prio-set-btn" data-prio-set="' + escapeAttr(a.id) + '" data-prio-cur="' + priority + '" title="Set drain priority (higher drains first; 0 = normal)">⚑</button>';
+    const releaseBtn = '<button type="button" class="release-bindings-btn" data-release-bindings="' + escapeAttr(a.id) + '" title="Release all conversations bound to this account so they re-pick a fresh account on their next turn (server-side fork — use after a 429)">⏏</button>';
+    // Delete is always available (even for a disabled account) — it removes
+    // the credential file from disk. Guarded by a confirm in the handler.
+    const deleteBtn = '<button type="button" class="delete-account-btn" data-delete-account="' + escapeAttr(a.id) + '" title="Delete this account (removes the auth file from disk — irreversible)">🗑</button>';
     let actions;
     if (a.disabled) {
       actions =
         '<button type="button" class="quota-refresh-btn" disabled title="auth disabled">↻</button>' +
-        '<button type="button" class="cooldown-force-btn" disabled title="auth disabled">⏸</button>';
+        '<button type="button" class="cooldown-force-btn" disabled title="auth disabled">⏸</button>' +
+        '<button type="button" class="codex-invite-btn" disabled title="auth disabled">✉</button>' +
+        ' ' + prioBtn +
+        ' ' + releaseBtn +
+        ' ' + deleteBtn;
     } else {
+      // Codex referral invites (✉) only make sense for codex accounts; show a
+      // disabled placeholder for grok so the action column stays aligned.
+      const inviteBtn = isXai
+        ? '<button type="button" class="codex-invite-btn" disabled title="Codex only">✉</button>'
+        : '<button type="button" class="codex-invite-btn" data-codex-invite="' + escapeAttr(a.id) + '" title="Send Codex referral invites from this account">✉</button>';
       actions =
-        '<button type="button" class="quota-refresh-btn" data-quota-refresh="' + escapeAttr(a.id) + '" title="Refresh wham/usage for this account">↻</button>' +
+        '<button type="button" class="quota-refresh-btn" data-quota-refresh="' + escapeAttr(a.id) + '" title="' + (isXai ? 'Refresh grok billing for this account' : 'Refresh wham/usage for this account') + '">↻</button>' +
         ' ' +
-        '<button type="button" class="cooldown-force-btn" data-cooldown-force="' + escapeAttr(a.id) + '" title="Force this account into cooldown (use when wham/usage is returning wrong data)">⏸</button>';
+        '<button type="button" class="cooldown-force-btn" data-cooldown-force="' + escapeAttr(a.id) + '" title="Force this account into cooldown (use when quota data is returning wrong values)">⏸</button>' +
+        ' ' +
+        inviteBtn +
+        ' ' + prioBtn +
+        ' ' + releaseBtn +
+        ' ' + deleteBtn;
     }
 
     tr.innerHTML =
-      '<td>' + label + sub + '</td>' +
+      '<td>' + nameCell + sub + '</td>' +
       '<td>' + statusPill + '</td>' +
       '<td>' + primaryCell + '</td>' +
       '<td>' + secondaryCell + '</td>' +
       '<td>' + resetsCell + '</td>' +
       '<td>' + fetchedCell + '</td>' +
+      '<td>' + renderQuotaBindingsCell(a.id) + '</td>' +
+      '<td>' + renderQuotaCooldownCell(a) + '</td>' +
       '<td>' + actions + '</td>';
     return tr;
   }
+
+  // renderQuotaCooldownCell builds the Cooldown cell from the `cooldown`
+  // field attached by /v0/management/auth-files (which reuses the same
+  // buildCooldownAccount shape /v0/management/auth-cooldowns returns).
+  // Shows auth-level quota/retry markers, per-model cooldowns, and
+  // registry-suspended models — the same information the retired
+  // standalone cooldowns panel used to show, now inline so the operator
+  // sees it next to the quota bar and bindings count. A Clear button is
+  // rendered when any marker is present; it calls the same
+  // /auth-cooldowns/:id/clear endpoint the old panel used.
+  function renderQuotaCooldownCell(a) {
+    const cd = a.cooldown;
+    if (!cd) return '<span class="muted">—</span>';
+    const auth = cd.auth || {};
+    const models = cd.models || [];
+    const regSuspended = cd.registry_suspended_models || [];
+    const parts = [];
+    // Auth-level markers
+    if (auth.unavailable) parts.push('<span class="kind-badge closed">unavail</span>');
+    if (auth.quota_exceeded) {
+      const recover = validTime(auth.quota_recover_at) ? ' until ' + fmtResetWhen(auth.quota_recover_at) : '';
+      parts.push('<div><span class="kind-badge closed">quota</span>' + (auth.quota_reason ? ' <span class="muted">' + escapeHtml(auth.quota_reason) + '</span>' : '') + recover + '</div>');
+    }
+    if (validTime(auth.next_retry_after) && !auth.quota_exceeded) {
+      parts.push('<div><span class="muted">retry ' + fmtResetWhen(auth.next_retry_after) + '</span></div>');
+    }
+    if (auth.quota_backoff_level) parts.push('<div class="muted">backoff lvl ' + auth.quota_backoff_level + '</div>');
+    // Per-model markers
+    for (const m of models) {
+      const bits = ['<code>' + escapeHtml(m.model) + '</code>'];
+      if (m.quota_exceeded) {
+        const recover = validTime(m.quota_recover_at) ? ' until ' + fmtResetWhen(m.quota_recover_at) : '';
+        bits.push('<span class="kind-badge closed">quota</span>' + recover);
+      } else if (validTime(m.next_retry_after)) {
+        bits.push('<span class="muted">retry ' + fmtResetWhen(m.next_retry_after) + '</span>');
+      } else if (m.unavailable) {
+        bits.push('<span class="kind-badge closed">unavail</span>');
+      }
+      // Surface WHY the model is down (upstream status_message), so an operator
+      // doesn't have to hit the management API to learn e.g. it was a
+      // context_too_large / "model not supported" 4xx rather than a quota cap.
+      const rawReason = m.status_message ? String(m.status_message) : '';
+      const reason = extractErrMsg(rawReason);
+      const reasonLine = reason
+        ? '<div class="muted cooldown-reason" title="' + escapeAttr(rawReason) + '">' + escapeHtml(reason.length > 90 ? reason.slice(0, 90) + '…' : reason) + '</div>'
+        : '';
+      parts.push('<div class="cooldown-model-row">' + bits.join(' ') + reasonLine + '</div>');
+    }
+    // Registry-suspended models
+    if (regSuspended.length) {
+      parts.push('<div class="muted">suspended: ' + regSuspended.map(m => '<code>' + escapeHtml(m) + '</code>').join(' ') + '</div>');
+    }
+    if (parts.length === 0) return '<span class="muted">—</span>';
+    // Clear button — only when there is something to clear.
+    const clearBtn = a.disabled
+      ? ''
+      : ' <button type="button" class="cooldown-clear-btn" data-cooldown-clear="' + escapeAttr(a.id) + '" title="Clear all cooldown markers for this account">Clear</button>';
+    return '<div class="cooldown-cell">' + parts.join('') + '</div>' + clearBtn;
+  }
+
+  // Build the per-account Bindings cell: a compact "N active" (+ "M closed")
+  // button that opens a popup with the full session list. Keeping the cell
+  // to just the count avoids cramming uuids/workspace paths into the narrow
+  // column; the popup (openBindingsModal) has room for the detail.
+  function renderQuotaBindingsCell(authID) {
+    const b = quotaBindingsByAuth[authID];
+    const activeCount = b ? (b.active_count != null ? b.active_count : (b.windows_count || 0)) : 0;
+    const closedCount = b ? (b.closed_count || 0) : 0;
+    const windows = (b && Array.isArray(b.windows)) ? b.windows : [];
+    if (activeCount === 0 && closedCount === 0 && windows.length === 0) {
+      return '<span class="qc-binding-none">—</span>';
+    }
+    let label = activeCount + ' active';
+    if (closedCount > 0) label += ' <span class="muted">+ ' + closedCount + ' closed</span>';
+    return '<button type="button" class="qc-bindings-btn" data-bindings-popup="' + escapeAttr(authID) + '" title="View sessions bound to this account">' + label + '</button>';
+  }
+
+  // Render one session row for the bindings popup — full uuid, kind badge,
+  // closed/forked markers, and the workspace path.
+  function renderBindingSessionRow(w) {
+    const wsCell = w.workspace
+      ? '<span class="workspace-cell" title="' + escapeAttr(w.workspace) + '">' + escapeHtml(shortWorkspace(w.workspace)) + '</span>'
+      : '<span class="muted">—</span>';
+    const kindBadge = w.kind === 'both'
+      ? ''
+      : '<span class="kind-badge kind-' + escapeAttr(w.kind || 'other') + '">' + escapeHtml(w.kind || '') + '</span>';
+    const closedSuffix = w.closed
+      ? '<span class="kind-badge closed">closed</span>' +
+        (w.forked_to ? '<span class="muted forked-arrow">→ ' + escapeHtml(w.forked_to || '') + '</span>' : '')
+      : '';
+    const rowClass = w.closed ? 'binding-row binding-closed' : 'binding-row';
+    return '<div class="' + rowClass + '"><code>' + escapeHtml(w.uuid || '') + '</code> ' + kindBadge + closedSuffix + ' ' + wsCell + '</div>';
+  }
+
+  function openBindingsModal(authID) {
+    const b = quotaBindingsByAuth[authID];
+    const label = (b && (b.auth_label || b.auth_id)) || authID;
+    const activeCount = b ? (b.active_count != null ? b.active_count : (b.windows_count || 0)) : 0;
+    const closedCount = b ? (b.closed_count || 0) : 0;
+    const windows = (b && Array.isArray(b.windows)) ? b.windows : [];
+    $('bmTitle').textContent = 'Active bindings';
+    let acct = 'Account: ' + label;
+    acct += ' · ' + activeCount + ' active';
+    if (closedCount > 0) acct += ' + ' + closedCount + ' closed';
+    $('bmAccount').textContent = acct;
+    $('bmSessions').innerHTML = windows.length
+      ? windows.map(renderBindingSessionRow).join('')
+      : '<div class="bm-empty">No sessions bound.</div>';
+    $('bindingsModal').hidden = false;
+  }
+  function closeBindingsModal() { $('bindingsModal').hidden = true; }
 
   // Render a used% as a small horizontal bar + numeric label. Colour
   // thresholds match the LeastRemainingQuotaSelector tier boundaries
@@ -2071,16 +2921,584 @@
         body: JSON.stringify(payload),
       });
       setStatus('forced cooldown for ' + authID);
-      // Refresh both panels — quota panel for the new status, cooldowns
-      // panel so the new row shows up immediately.
+      // Refresh the quota panel — the Cooldown column now shows the
+      // new marker inline (the standalone cooldowns panel is retired).
       await loadAccountQuota();
-      if (typeof loadCooldowns === 'function') await loadCooldowns();
     } catch (err) {
       setStatus('force cooldown failed: ' + (err && err.message ? err.message : err), true);
     } finally {
       if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || '⏸'; }
     }
   }
+
+  // setPriorityOne sets an account's drain priority via PatchAuthFileFields.
+  // Higher priority = drained first; new bindings land on the highest-priority
+  // account that can still serve, only spilling to lower priority when the top
+  // tier saturates. 0 = normal (the default). This is a rare admin action so a
+  // prompt is fine — no modal needed.
+  async function setPriorityOne(authID, current, btnEl) {
+    if (!authID) return;
+    const raw = window.prompt(
+      'Drain priority for ' + authID + '\n' +
+      'Higher number drains first (new sessions prefer it until it saturates).\n' +
+      '0 = normal. Example: set short-lived accounts to 100.',
+      String(current || 0)
+    );
+    if (raw === null) return;
+    const trimmed = String(raw).trim();
+    const value = parseInt(trimmed, 10);
+    if (!Number.isFinite(value) || String(value) !== trimmed) {
+      setStatus('set priority: "' + trimmed + '" is not an integer', true);
+      return;
+    }
+    const originalText = btnEl ? btnEl.textContent : '';
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = '…'; }
+    try {
+      await apiFetch('/v0/management/auth-files/fields', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: authID, priority: value }),
+      });
+      setStatus('set priority=' + value + ' for ' + authID);
+      await loadAccountQuota();
+    } catch (err) {
+      setStatus('set priority failed: ' + (err && err.message ? err.message : err), true);
+    } finally {
+      if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || '⚑'; }
+    }
+  }
+
+  // toggleGrokBuildOne switches a grok account between Grok Build (cli-chat-proxy,
+  // the larger SuperGrok weekly allowance) and the official API (api.x.ai) by
+  // patching its using_api attribute. currentUsingAPI is the current effective
+  // state (true = already on the API path).
+  async function toggleGrokBuildOne(authID, currentUsingAPI, btnEl) {
+    if (!authID) return;
+    const nextUsingAPI = !currentUsingAPI;
+    const target = nextUsingAPI ? 'official API (api.x.ai)' : 'Grok Build (cli-chat-proxy)';
+    if (!window.confirm(
+      'Switch ' + authID + ' to ' + target + '?\n\n' +
+      'Affects new grok chat requests for this account. Build usually has a ' +
+      'much larger allowance. Media (image/video) always use the official API.'
+    )) return;
+    const originalText = btnEl ? btnEl.textContent : '';
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = '…'; }
+    try {
+      await apiFetch('/v0/management/auth-files/fields', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: authID, using_api: nextUsingAPI }),
+      });
+      setStatus('grok ' + authID + ' → ' + (nextUsingAPI ? 'API' : 'Build'));
+      await loadAccountQuota();
+    } catch (err) {
+      setStatus('grok toggle failed: ' + (err && err.message ? err.message : err), true);
+    } finally {
+      if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || (currentUsingAPI ? 'API' : 'Build'); }
+    }
+  }
+
+  // releaseBindingsOne drops all session-affinity bindings on an account so
+  // its stranded conversations re-pick a fresh account on their next turn —
+  // the server-side equivalent of forking each conversation, minus the heavy
+  // client-side thread duplication. Confirm first: this affects every live
+  // conversation currently pinned to the account.
+  async function releaseBindingsOne(authID, btnEl) {
+    if (!authID) return;
+    if (!window.confirm(
+      'Release ALL conversations bound to ' + authID + '?\n\n' +
+      'Each one will re-pick a fresh account on its next turn (this account ' +
+      'is excluded while exhausted). Continue the conversation as normal — ' +
+      'no local fork needed. Bindings already in flight are unaffected.'
+    )) return;
+    const originalText = btnEl ? btnEl.textContent : '';
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = '…'; }
+    try {
+      const res = await apiFetch('/v0/management/auth-cooldowns/' + encodeURIComponent(authID) + '/release-bindings', {
+        method: 'POST',
+      });
+      const data = await res.json();
+      const n = (data && typeof data.released === 'number') ? data.released : '?';
+      setStatus('released ' + n + ' binding' + (n === 1 ? '' : 's') + ' for ' + authID + ' — next turn will re-pick');
+      await loadAccountQuota();
+    } catch (err) {
+      setStatus('release bindings failed: ' + (err && err.message ? err.message : err), true);
+    } finally {
+      if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || '⏏'; }
+    }
+  }
+
+  // deleteAccountOne removes an account's credential file from disk via
+  // DELETE /v0/management/auth-files?name=<file>. Irreversible — the auth
+  // file is gone and the account drops out of the pool immediately. Guarded
+  // by a confirm that names the account so a misclick can't nuke a credential.
+  async function deleteAccountOne(authID, btnEl) {
+    if (!authID) return;
+    if (!window.confirm(
+      '删除账号 ' + authID + ' ?\n\n' +
+      '会把它的认证文件从磁盘删除,账号立即移出池子,不可恢复。\n' +
+      '(只是想临时停用的话请用 disable,不要用删除。)'
+    )) return;
+    const originalText = btnEl ? btnEl.textContent : '';
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = '…'; }
+    try {
+      await apiFetch('/v0/management/auth-files?name=' + encodeURIComponent(authID), { method: 'DELETE' });
+      setStatus('deleted account ' + authID);
+      await loadAccountQuota();
+    } catch (err) {
+      setStatus('delete failed: ' + (err && err.message ? err.message : err), true);
+      if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || '🗑'; }
+    }
+  }
+
+  // Auto-release-on-429 toggle. Loads the current conductor state once
+  // on connect and mirrors flips to PUT /v0/management/auto-release-429.
+  // When on, an upstream 429 auto-drops that account's session bindings
+  // and the 429 is converted to a 500 so the client retries onto a fresh
+  // account — transparent failover with no client-side fork. The
+  // checkbox lives in the quota panel summary so it's next to the
+  // accounts it affects.
+  const ar429Checkbox = $('autoRelease429Checkbox');
+  let ar429Inflight = false;
+  async function loadAutoRelease429() {
+    if (!ar429Checkbox) return;
+    try {
+      const res = await apiFetch('/v0/management/auto-release-429');
+      const s = await res.json();
+      ar429Inflight = true;
+      ar429Checkbox.checked = !!s.enabled;
+      ar429Inflight = false;
+    } catch (err) {
+      // Best-effort: leave the checkbox unchecked on failure. The toggle
+      // is a convenience; the manual ⏏ button still works regardless.
+      ar429Inflight = true;
+      ar429Checkbox.checked = false;
+      ar429Inflight = false;
+    }
+  }
+  if (ar429Checkbox) {
+    ar429Checkbox.addEventListener('change', async () => {
+      if (ar429Inflight) return;
+      const want = ar429Checkbox.checked;
+      try {
+        const res = await apiFetch('/v0/management/auto-release-429', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: want }),
+        });
+        const s = await res.json();
+        ar429Inflight = true;
+        ar429Checkbox.checked = !!s.enabled;
+        ar429Inflight = false;
+        setStatus(want
+          ? 'Auto-release on 429 ENABLED — upstream 429 will drop that account\'s bindings and return 500 so the client retries onto a fresh account'
+          : 'Auto-release on 429 disabled — upstream 429 surfaces to the client as before (use ⏏ to release manually)');
+      } catch (err) {
+        // Revert the checkbox to the server's last known state.
+        ar429Inflight = true;
+        ar429Checkbox.checked = !want;
+        ar429Inflight = false;
+        setStatus('auto-release-429 toggle failed: ' + (err && err.message ? err.message : err), true);
+      }
+    });
+  }
+
+  // Codex invite modal — state captured once so handlers can read it.
+  // The button that opened the modal is remembered so we can restore
+  // its disabled/textContent on close. cap tracks the authoritative
+  // server-side remaining invites once the status endpoint has loaded;
+  // null means "status not yet fetched / fetch failed" and the Send
+  // button stays enabled (we don't gate on absent data).
+  const ciState = { authID: null, accountLabel: '', triggerBtn: null, cap: null, eligible: null };
+
+  // escapeHtml here is a tiny dedicated copy to keep the invite modal
+  // self-contained — there is no shared escape helper in this file yet.
+  function ciEsc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  function ciFmtTime(iso) {
+    if (!iso) return '';
+    const t = new Date(iso).getTime();
+    if (!isFinite(t)) return ciEsc(iso);
+    return new Date(t).toLocaleString('zh-CN', { hour12: false });
+  }
+
+  // ciCreditSource mirrors the userscript's creditSourceText() — credit
+  // entries fall into two practical buckets:
+  //   1) Launch-day giveaway from OpenAI (June 11). The title/description
+  //      typically contains "Codex Team" or "Thanks for using Codex".
+  //   2) Referral reward from inviting a friend. profile_user_id holds the
+  //      invitee's @handle and description names the friend.
+  // The /wham/rate-limit-reset-credits response gives all three strings;
+  // matching any of the official-giveaway markers across the concatenation
+  // reliably distinguishes the two buckets without us having to maintain a
+  // hard-coded list of source IDs.
+  function ciCreditSource(c) {
+    const title = c && c.title ? String(c.title) : '';
+    const description = c && c.description ? String(c.description) : '';
+    const profile = c && c.profile_user_id ? String(c.profile_user_id) : '';
+    const haystack = (title + ' ' + description + ' ' + profile).toLowerCase();
+    if (/codex team|thanks for using codex|official|官方/.test(haystack)) {
+      return '官方免费赠送';
+    }
+    // Referral rewards usually carry the friend's profile id; fall back
+    // through description → title → raw id so we always render something
+    // meaningful instead of a blank cell.
+    return description || title || profile || (c && c.reset_type) || '未知来源';
+  }
+
+  // ciCreditUseTime renders the "Redeemed" column with three states:
+  //   - already redeemed → the redemption timestamp
+  //   - redemption in progress → "兑换中: <timestamp>"
+  //   - never used → empty
+  // Matches the userscript's creditUseTime() so the same row reads the same
+  // way as it does on chatgpt.com's web UI.
+  function ciCreditUseTime(c) {
+    if (!c) return '';
+    if (c.redeemed_at) return ciFmtTime(c.redeemed_at);
+    if (c.redeem_started_at) return '兑换中: ' + ciFmtTime(c.redeem_started_at);
+    return '';
+  }
+
+  function ciRenderStatus(data, meta) {
+    const root = $('ciStatus');
+    if (!root) return;
+    root.innerHTML = '';
+    // Tag the account label with the cache verdict so the operator can tell
+    // "this view is from the cache, age 47s" apart from "just refetched".
+    const accEl = $('ciAccount');
+    if (accEl) {
+      const label = 'From: ' + ciState.accountLabel;
+      let pill = '';
+      if (meta && meta.cacheState === 'hit') {
+        pill = '<span class="ci-cache-pill">cached ' + (meta.cacheAge ? meta.cacheAge + 's ago' : '') + '</span>';
+      } else if (meta && meta.cacheState === 'miss') {
+        pill = '<span class="ci-cache-pill">fresh</span>';
+      }
+      accEl.innerHTML = ciEsc(label) + pill;
+    }
+
+    // Plan + eligibility line. Three signals decide the verdict pill:
+    //   - eligibility.should_show === false → ineligible (preferred reason)
+    //   - rules.remaining === 0 → cap exhausted (no reason text)
+    //   - otherwise → eligible
+    const plan = data.plan_type || '?';
+    let verdictPill, verdictText;
+    if (data.eligibility && data.eligibility.should_show === false) {
+      verdictPill = 'ci-pill-bad';
+      verdictText = 'NOT ELIGIBLE';
+      ciState.eligible = false;
+    } else if (data.rules && data.rules.remaining === 0) {
+      verdictPill = 'ci-pill-warn';
+      verdictText = 'CAP REACHED';
+      ciState.eligible = false;
+    } else if (data.eligibility && data.eligibility.should_show === true) {
+      verdictPill = 'ci-pill-ok';
+      verdictText = 'ELIGIBLE';
+      ciState.eligible = true;
+    } else {
+      verdictPill = 'ci-pill-info';
+      verdictText = 'UNKNOWN';
+      ciState.eligible = null;
+    }
+    ciState.cap = data.rules ? data.rules.remaining : null;
+
+    const rows = [];
+    rows.push('<div class="ci-status-row">' +
+      '<span class="ci-status-key">Status</span>' +
+      '<span class="ci-status-val">' +
+        '<span class="ci-pill ' + verdictPill + '">' + verdictText + '</span>' +
+        '<span class="ci-pill ci-pill-info">' + ciEsc(plan) + '</span>' +
+        (data.eligibility && data.eligibility.ineligible_reason
+          ? '<span style="color:#ff8a8a">' + ciEsc(data.eligibility.ineligible_reason) +
+            (data.eligibility.ineligible_reason_code ? ' (' + ciEsc(data.eligibility.ineligible_reason_code) + ')' : '') +
+            '</span>'
+          : '') +
+      '</span></div>');
+
+    if (data.rules) {
+      rows.push('<div class="ci-status-row">' +
+        '<span class="ci-status-key">Invites</span>' +
+        '<span class="ci-status-val">' +
+          ciEsc(data.rules.invites_sent) + ' / ' + ciEsc(data.rules.invites_total) +
+          ' used · <strong>' + ciEsc(data.rules.remaining) + ' remaining</strong>' +
+          (data.rules.time_frame ? ' <span style="opacity:0.5">· window: ' + ciEsc(data.rules.time_frame) + '</span>' : '') +
+        '</span></div>');
+    }
+
+    if (data.credits) {
+      const total = data.credits.total_earned_count;
+      rows.push('<div class="ci-status-row">' +
+        '<span class="ci-status-key">Resets</span>' +
+        '<span class="ci-status-val">' +
+          'available <strong>' + ciEsc(data.credits.available_count) + '</strong>' +
+          (total ? ' · earned ' + ciEsc(total) + ' total' : '') +
+        '</span></div>');
+    }
+
+    if (data.errors && Object.keys(data.errors).length) {
+      // The eligibility endpoint sits behind Cloudflare's UA-Client-Hints
+      // enforcement and is blocked for our non-browser TLS fingerprint
+      // every single call. Surfacing it as a "Partial fetch" error each
+      // time is noise — the verdict is still derived correctly from the
+      // /wham/* sources and from the POST response. Only show the error
+      // line if something OTHER than eligibility failed.
+      const noisy = new Set(['eligibility']);
+      const real = Object.entries(data.errors).filter(([k]) => !noisy.has(k));
+      if (real.length) {
+        const errLines = real
+          .map(([k, v]) => k + ': ' + String(v).split('\n')[0].slice(0, 140))
+          .join('<br>');
+        rows.push('<div class="ci-status-error">' + ciEsc('Partial fetch — ') + errLines + '</div>');
+      }
+    }
+    root.innerHTML = rows.join('');
+
+    // History panel — past invites + credit ledger. Hidden when empty.
+    const hist = $('ciHistory');
+    const histWrap = $('ciHistoryWrap');
+    const invitesArr = Array.isArray(data.history) ? data.history : [];
+    const creditsArr = data.credits && Array.isArray(data.credits.items) ? data.credits.items : [];
+    if (invitesArr.length === 0 && creditsArr.length === 0) {
+      histWrap.hidden = true;
+    } else {
+      histWrap.hidden = false;
+      let html = '';
+      if (invitesArr.length) {
+        html += '<h4>Sent invites</h4><table><thead><tr>' +
+          '<th>Email</th><th>Status</th><th>Expires</th><th>Reward</th><th>Link</th>' +
+          '</tr></thead><tbody>';
+        for (const r of invitesArr) {
+          // Mirror the userscript's grantText() — Chinese labels for
+          // "inviter / invitee" and "重置卡" so the row reads like the
+          // chatgpt.com web UI. Picks up the recipient + amount + type
+          // from each grant object so a single invite can carry rewards
+          // for both sides.
+          const grants = (r.grants || []).map(g => {
+            const who = g.recipient === 'referrer' ? '邀请人' : '被邀请人';
+            const ty = g.grant_type === 'rate_limit_reset_credit' ? '重置卡' : (g.grant_type || '');
+            return who + ' +' + (g.amount == null ? 1 : g.amount) + ' ' + ty;
+          }).join('；');
+          html += '<tr>' +
+            '<td>' + ciEsc(r.email) + '</td>' +
+            '<td>' + ciEsc(r.status) + '</td>' +
+            '<td>' + ciFmtTime(r.expires_at) + '</td>' +
+            '<td>' + ciEsc(grants) + '</td>' +
+            '<td>' + (r.referral_link ? '<a href="' + ciEsc(r.referral_link) + '" target="_blank" rel="noreferrer">open</a>' : '') + '</td>' +
+            '</tr>';
+        }
+        html += '</tbody></table>';
+      }
+      if (creditsArr.length) {
+        html += '<h4>Reset-credit ledger</h4><table><thead><tr>' +
+          '<th>Source</th><th>Status</th><th>Granted</th><th>Expires</th><th>Redeemed</th>' +
+          '</tr></thead><tbody>';
+        for (const c of creditsArr) {
+          html += '<tr>' +
+            '<td>' + ciEsc(ciCreditSource(c)) + '</td>' +
+            '<td>' + ciEsc(c.status) + '</td>' +
+            '<td>' + ciFmtTime(c.granted_at) + '</td>' +
+            '<td>' + ciFmtTime(c.expires_at) + '</td>' +
+            '<td>' + ciCreditUseTime(c) + '</td>' +
+            '</tr>';
+        }
+        html += '</tbody></table>';
+      }
+      hist.innerHTML = html;
+    }
+
+    // Update the send button gating based on the verdict. Only disable
+    // when we have a positive ineligibility signal (eligible === false);
+    // unknown / null leaves the button enabled because absence of
+    // information should not block the operator.
+    const sendBtn = $('ciSendBtn');
+    if (sendBtn) {
+      sendBtn.disabled = (ciState.eligible === false);
+    }
+  }
+
+  function ciSetStatusError(message) {
+    const root = $('ciStatus');
+    if (!root) return;
+    root.innerHTML = '<div class="ci-status-error">' + ciEsc(message) + '</div>';
+    ciState.cap = null;
+    ciState.eligible = null;
+  }
+
+  async function ciLoadStatus(opts) {
+    if (!ciState.authID) return;
+    const force = !!(opts && opts.refresh);
+    const root = $('ciStatus');
+    const refreshBtn = $('ciRefreshBtn');
+    if (root) root.innerHTML = '<div class="ci-status-loading">' +
+      (force ? 'Refreshing from chatgpt.com…' : 'Loading account status…') +
+      '</div>';
+    if (refreshBtn) refreshBtn.disabled = true;
+    try {
+      const url = '/v0/management/codex-invite/' + encodeURIComponent(ciState.authID) +
+                  '/status' + (force ? '?refresh=1' : '');
+      const res = await apiFetch(url);
+      const data = await res.json();
+      // Surface the backend's cache verdict so the operator knows whether
+      // this view is current-fresh or up-to-5-minutes stale. The header
+      // names match what the Go handler emits (X-Cache: hit/miss).
+      const cacheState = res.headers.get('X-Cache') || '';
+      const cacheAge = res.headers.get('X-Cache-Age-Seconds') || '';
+      try { console.log('codex-invite-status', ciState.authID, { cache: cacheState, age: cacheAge }, data); } catch (_) {}
+      ciRenderStatus(data, { cacheState, cacheAge });
+    } catch (err) {
+      ciSetStatusError('Failed to load status: ' + (err && err.message ? err.message : err));
+    } finally {
+      if (refreshBtn) refreshBtn.disabled = false;
+    }
+  }
+
+  function ciSetMeta(text, isError) {
+    const el = $('ciMeta');
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('error', !!isError);
+  }
+  function ciSetResult(text, tone) {
+    const el = $('ciResult');
+    if (!el) return;
+    if (!text) { el.hidden = true; el.textContent = ''; el.classList.remove('ok', 'fail'); return; }
+    el.hidden = false;
+    el.textContent = text;
+    el.classList.toggle('ok', tone === 'ok');
+    el.classList.toggle('fail', tone === 'fail');
+  }
+  function openCodexInviteModal(authID, accountLabel, btnEl) {
+    ciState.authID = authID;
+    ciState.accountLabel = accountLabel || authID;
+    ciState.triggerBtn = btnEl || null;
+    ciState.cap = null;
+    ciState.eligible = null;
+    $('ciAccount').textContent = 'From: ' + ciState.accountLabel;
+    $('ciEmails').value = '';
+    ciSetMeta('');
+    ciSetResult('');
+    $('ciHistoryWrap').hidden = true;
+    $('ciHistory').innerHTML = '';
+    $('ciSendBtn').disabled = false;
+    $('codexInviteModal').hidden = false;
+    setTimeout(() => $('ciEmails').focus(), 0);
+    // Fire-and-forget; the load function updates the panel + send button.
+    ciLoadStatus();
+  }
+  function closeCodexInviteModal() {
+    $('codexInviteModal').hidden = true;
+    ciState.authID = null;
+    ciState.accountLabel = '';
+    ciState.triggerBtn = null;
+  }
+
+  async function sendCodexInvite() {
+    if (!ciState.authID) return;
+    const raw = $('ciEmails').value.trim();
+    if (!raw) {
+      ciSetMeta('Please enter at least one email.', true);
+      return;
+    }
+    const sendBtn = $('ciSendBtn');
+    sendBtn.disabled = true;
+    ciSetMeta('Sending…');
+    ciSetResult('');
+    try {
+      const res = await apiFetch('/v0/management/codex-invite/' + encodeURIComponent(ciState.authID), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ emails_text: raw }),
+      });
+      const data = await res.json();
+      try { console.log('codex-invite', ciState.authID, data); } catch (_) {}
+      // ok + 2xx -> success. ok=false means wham rejected it (referral
+      // disabled / token expired / risk control); status_code carries
+      // the real reason and the upstream blob is the operator's signal.
+      const count = (data && data.emails && data.emails.length) || 0;
+      if (data && data.ok) {
+        // Wham accepted the call. Refresh the status panel from the
+        // server (it now has invites_sent + 1 and may have a new
+        // history entry); no more localStorage estimation.
+        ciSetMeta('Sent ' + count + ' invite' + (count === 1 ? '' : 's') + ' · status ' + data.status_code);
+        ciSetResult(JSON.stringify(data.upstream || data.upstream_raw || data, null, 2), 'ok');
+        setStatus('invite ' + ciState.authID + ' → ' + count + ' email' + (count === 1 ? '' : 's') + ' ok');
+        ciLoadStatus();
+      } else {
+        ciSetMeta('Upstream rejected · status ' + (data && data.status_code), true);
+        ciSetResult(JSON.stringify(data && (data.upstream || data.upstream_raw || data), null, 2), 'fail');
+        setStatus('invite ' + ciState.authID + ' failed (status ' + (data && data.status_code) + ')', true);
+      }
+    } catch (err) {
+      ciSetMeta('Request failed: ' + (err && err.message ? err.message : err), true);
+      setStatus('invite failed: ' + (err && err.message ? err.message : err), true);
+    } finally {
+      sendBtn.disabled = false;
+    }
+  }
+
+  // inviteCodexOne is the per-row entry point. Pulls the account label
+  // from the row so the modal header shows the email, not just the
+  // auth_id (which is the on-disk filename and noisier).
+  function inviteCodexOne(authID, btnEl) {
+    if (!authID) return;
+    let label = authID;
+    try {
+      const row = btnEl && btnEl.closest && btnEl.closest('tr');
+      const accountCell = row && row.querySelector('td');
+      if (accountCell) {
+        // The first child is the bold label, second is the muted sub.
+        const firstLine = accountCell.firstChild;
+        if (firstLine) label = (firstLine.textContent || authID).trim() || authID;
+      }
+    } catch (_) {}
+    openCodexInviteModal(authID, label, btnEl);
+  }
+
+  // Wire the modal's controls once on first interaction. Defers DOM
+  // lookups so they survive the modal not yet being parsed when this
+  // script runs (the modal markup is below </main> but above this
+  // <script>, so it IS parsed by now, but the defensive code is cheap).
+  document.addEventListener('click', (ev) => {
+    if (ev.target.id === 'ciSendBtn') { ev.preventDefault(); sendCodexInvite(); return; }
+    if (ev.target.id === 'ciRefreshBtn') { ev.preventDefault(); ciLoadStatus({ refresh: true }); return; }
+    if (ev.target.id === 'ciCancelBtn' || ev.target.id === 'ciCloseBtn') {
+      ev.preventDefault();
+      closeCodexInviteModal();
+      return;
+    }
+    // Click on the overlay backdrop (but not on the modal card itself)
+    // closes too — matches the convention from native <dialog>.
+    if (ev.target.id === 'codexInviteModal') {
+      ev.preventDefault();
+      closeCodexInviteModal();
+      return;
+    }
+    // Bindings popup close: × button or backdrop click.
+    if (ev.target.id === 'bmCloseBtn' || ev.target.id === 'bindingsModal') {
+      ev.preventDefault();
+      closeBindingsModal();
+    }
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && !$('bindingsModal').hidden) {
+      closeBindingsModal();
+      return;
+    }
+    if (ev.key === 'Escape' && !$('codexInviteModal').hidden) {
+      closeCodexInviteModal();
+      return;
+    }
+    // Ctrl/Cmd+Enter in the textarea submits — the keyboard shortcut
+    // operators expect when a textarea is the primary input.
+    if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter' &&
+        document.activeElement && document.activeElement.id === 'ciEmails') {
+      ev.preventDefault();
+      sendCodexInvite();
+    }
+  });
 
   // parseForceCooldownInput accepts the same strings the prompt
   // suggests. Returns null when the input is unparseable.
@@ -2129,6 +3547,42 @@
     if (forceBtn) {
       ev.preventDefault();
       forceCooldownOne(forceBtn.getAttribute('data-cooldown-force'), forceBtn);
+      return;
+    }
+    const inviteBtn = ev.target.closest('button[data-codex-invite]');
+    if (inviteBtn) {
+      ev.preventDefault();
+      inviteCodexOne(inviteBtn.getAttribute('data-codex-invite'), inviteBtn);
+      return;
+    }
+    const prioBtn = ev.target.closest('button[data-prio-set]');
+    if (prioBtn) {
+      ev.preventDefault();
+      setPriorityOne(prioBtn.getAttribute('data-prio-set'), prioBtn.getAttribute('data-prio-cur'), prioBtn);
+      return;
+    }
+    const grokToggle = ev.target.closest('button[data-grok-toggle]');
+    if (grokToggle) {
+      ev.preventDefault();
+      toggleGrokBuildOne(grokToggle.getAttribute('data-grok-toggle'), grokToggle.getAttribute('data-using-api') === '1', grokToggle);
+      return;
+    }
+    const releaseBtn = ev.target.closest('button[data-release-bindings]');
+    if (releaseBtn) {
+      ev.preventDefault();
+      releaseBindingsOne(releaseBtn.getAttribute('data-release-bindings'), releaseBtn);
+      return;
+    }
+    const bindingsBtn = ev.target.closest('button[data-bindings-popup]');
+    if (bindingsBtn) {
+      ev.preventDefault();
+      openBindingsModal(bindingsBtn.getAttribute('data-bindings-popup'));
+      return;
+    }
+    const deleteBtn = ev.target.closest('button[data-delete-account]');
+    if (deleteBtn) {
+      ev.preventDefault();
+      deleteAccountOne(deleteBtn.getAttribute('data-delete-account'), deleteBtn);
     }
   });
 
@@ -2185,13 +3639,12 @@
     loadSettings();
     loadHistory();
     loadRecentErrors();
-    loadBindings();
     loadAccountQuota();
-    loadCooldowns();
+    loadAutoRelease429();
   }
 
   $('connectBtn').addEventListener('click', connect);
-  $('refreshBtn').addEventListener('click', () => { refresh(); loadHistory(); loadRecentErrors(); loadBindings(); loadAccountQuota(); loadCooldowns(); });
+  $('refreshBtn').addEventListener('click', () => { refresh(); loadHistory(); loadRecentErrors(); loadAccountQuota(); });
   $('saveSettingsBtn').addEventListener('click', saveSettings);
   tbody.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-cancel]');
@@ -2220,13 +3673,42 @@
     refresh();
     loadHistory();
     loadRecentErrors();
-    loadBindings();
     loadAccountQuota();
-    loadCooldowns();
   }, 10000);
 
   // Live-update the duration column even when no events arrive.
   setInterval(() => { if (entries.size > 0) render(); }, 1000);
+
+  // Persist <details> open/closed state across page reloads. Each
+  // details.history panel remembers whether the operator had it
+  // expanded, so a Ctrl+F5 doesn't collapse everything they'd opened.
+  // Keyed by element id; panels without an id are not tracked.
+  const DETAILS_KEY = 'cpa_details_open';
+  function loadDetailsState() {
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem(DETAILS_KEY) || '{}'); } catch (_) {}
+    document.querySelectorAll('details[id]').forEach(d => {
+      const want = saved[d.id];
+      // Only set when explicitly stored — leave the HTML default alone
+      // for ids we've never seen before (e.g. ciHistoryWrap starts
+      // hidden and should stay that way until the user opens it).
+      if (want === true) d.open = true;
+      else if (want === false) d.open = false;
+    });
+  }
+  function saveDetailsState() {
+    const state = {};
+    document.querySelectorAll('details[id]').forEach(d => {
+      // Store both true and false so an explicit close is remembered
+      // too, not just opens.
+      state[d.id] = d.open;
+    });
+    try { localStorage.setItem(DETAILS_KEY, JSON.stringify(state)); } catch (_) {}
+  }
+  loadDetailsState();
+  document.querySelectorAll('details[id]').forEach(d => {
+    d.addEventListener('toggle', saveDetailsState);
+  });
 
   if (keyEl.value) connect();
 })();

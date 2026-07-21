@@ -19,6 +19,17 @@ type Settings struct {
 	// no response activity (no new response bytes) for at least this many
 	// seconds. Zero disables auto-cancel.
 	StallTimeoutSeconds int `json:"stall_timeout_seconds"`
+
+	// SlowWindowSeconds and SlowMinBytes form the throughput floor for the
+	// slow-stream watchdog. Once a streaming response has begun producing
+	// bytes, any rolling window of SlowWindowSeconds during which fewer than
+	// SlowMinBytes new response bytes arrive causes the request to be
+	// auto-cancelled (ReasonSlow). This catches "trickle" streams that never
+	// go silent long enough to trip StallTimeoutSeconds but deliver almost
+	// nothing over time. Both must be > 0 for the watchdog to run; either at
+	// zero disables it.
+	SlowWindowSeconds int `json:"slow_window_seconds"`
+	SlowMinBytes      int `json:"slow_min_bytes"`
 }
 
 // SettingsStore loads and persists Settings to a JSON file.
@@ -70,6 +81,12 @@ func (s *SettingsStore) Get() Settings {
 func (s *SettingsStore) Set(v Settings) error {
 	if v.StallTimeoutSeconds < 0 {
 		v.StallTimeoutSeconds = 0
+	}
+	if v.SlowWindowSeconds < 0 {
+		v.SlowWindowSeconds = 0
+	}
+	if v.SlowMinBytes < 0 {
+		v.SlowMinBytes = 0
 	}
 	s.mu.Lock()
 	s.values = v

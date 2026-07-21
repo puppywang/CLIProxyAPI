@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -73,6 +74,26 @@ func TestRegistry_RecentErrors_CapturesNon2xx(t *testing.T) {
 		if r.Entry.ID == "ok-1" {
 			t.Fatalf("200 OK leaked into recent errors: %+v", r)
 		}
+	}
+}
+
+// TestRegistry_RecentErrors_CarriesErrorSnippet verifies the captured error
+// body reaches the recent-errors ring, so the operator can see WHY a request
+// failed (e.g. "unknown provider for model X") without opening logs.
+func TestRegistry_RecentErrors_CarriesErrorSnippet(t *testing.T) {
+	reg := NewRegistry()
+	cancel := func() {}
+	entry := reg.Register("errsnip-1", "POST", "", "/v1/responses", "127.0.0.1", "codex", 0, cancel)
+	reg.SetStatusCode(entry, 502)
+	reg.SetErrorSnippet(entry, `{"error":{"message":"unknown provider for model gpt-5.6-sol"}}`)
+	reg.Finish(entry)
+
+	got := reg.RecentErrors(10)
+	if len(got) != 1 {
+		t.Fatalf("RecentErrors: got %d, want 1", len(got))
+	}
+	if !strings.Contains(got[0].Entry.ErrorSnippet, "unknown provider for model gpt-5.6-sol") {
+		t.Errorf("ErrorSnippet = %q, want the captured upstream message", got[0].Entry.ErrorSnippet)
 	}
 }
 
@@ -290,6 +311,111 @@ func TestRegistryAutoCancelOnStall(t *testing.T) {
 	}
 }
 
+func TestRegistryAutoCancelOnSlowStream(t *testing.T) {
+	reg := NewRegistry()
+	dir := t.TempDir()
+	store := NewSettingsStore(dir + "/settings.json")
+	// Stall disabled so only the throughput floor can fire; window 1s, floor 1000 bytes.
+	_ = store.Set(Settings{StallTimeoutSeconds: 0, SlowWindowSeconds: 1, SlowMinBytes: 1000})
+	reg.AttachSettings(store)
+	reg.AttachHistoryLog(dir + "/cancels.jsonl")
+
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entry := reg.Register("slowid001", "POST", "", "/v1/responses", "127.0.0.1", "", 0, cancel)
+	entry.streaming.Store(true)
+	now := time.Now()
+	// First byte long ago, recent activity (so stall would not apply even if enabled),
+	// window anchor backdated past the window with a baseline of 0 bytes, but only
+	// 500 bytes delivered over the whole window -> below the 1000-byte floor.
+	entry.firstChunkAt.Store(now.Add(-10 * time.Second).UnixNano())
+	entry.lastActivity.Store(now.UnixNano())
+	entry.slowAnchorAt.Store(now.Add(-2 * time.Second).UnixNano())
+	entry.slowAnchorBytes.Store(0)
+	entry.responseBytes.Store(500)
+
+	reg.scanStalled()
+
+	snap := reg.Snapshot()
+	if len(snap) != 1 || snap[0].Status != StatusCanceling {
+		t.Fatalf("expected slow stream to be auto-cancelled (canceling), got %+v", snap)
+	}
+	hist := reg.History(10)
+	if len(hist) != 1 {
+		t.Fatalf("expected 1 history record, got %d", len(hist))
+	}
+	if hist[0].Reason != ReasonSlow {
+		t.Errorf("expected reason %q, got %q", ReasonSlow, hist[0].Reason)
+	}
+	if hist[0].Detail == "" {
+		t.Errorf("expected slow-stream detail to be populated, got empty")
+	}
+}
+
+func TestRegistrySlowStreamHealthyNotCancelled(t *testing.T) {
+	reg := NewRegistry()
+	dir := t.TempDir()
+	store := NewSettingsStore(dir + "/settings.json")
+	_ = store.Set(Settings{StallTimeoutSeconds: 0, SlowWindowSeconds: 1, SlowMinBytes: 1000})
+	reg.AttachSettings(store)
+
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entry := reg.Register("slowid002", "POST", "", "/v1/responses", "127.0.0.1", "", 0, cancel)
+	entry.streaming.Store(true)
+	now := time.Now()
+	entry.firstChunkAt.Store(now.Add(-10 * time.Second).UnixNano())
+	entry.lastActivity.Store(now.UnixNano())
+	entry.slowAnchorAt.Store(now.Add(-2 * time.Second).UnixNano())
+	entry.slowAnchorBytes.Store(0)
+	// 4000 bytes over the window is well above the 1000-byte floor.
+	entry.responseBytes.Store(4000)
+
+	reg.scanStalled()
+
+	snap := reg.Snapshot()
+	if len(snap) != 1 || snap[0].Status != StatusRunning {
+		t.Fatalf("expected healthy stream to keep running, got %+v", snap)
+	}
+	// The anchor should have slid forward to the current byte count.
+	if got := entry.slowAnchorBytes.Load(); got != 4000 {
+		t.Errorf("expected anchor bytes to advance to 4000, got %d", got)
+	}
+}
+
+func TestRegistrySlowStreamFirstObservationAnchorsOnly(t *testing.T) {
+	reg := NewRegistry()
+	dir := t.TempDir()
+	store := NewSettingsStore(dir + "/settings.json")
+	_ = store.Set(Settings{StallTimeoutSeconds: 0, SlowWindowSeconds: 1, SlowMinBytes: 1000})
+	reg.AttachSettings(store)
+
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entry := reg.Register("slowid003", "POST", "", "/v1/responses", "127.0.0.1", "", 0, cancel)
+	entry.streaming.Store(true)
+	now := time.Now()
+	entry.firstChunkAt.Store(now.Add(-10 * time.Second).UnixNano())
+	entry.lastActivity.Store(now.UnixNano())
+	// No anchor yet (0) and few bytes: the first observation must only set the
+	// anchor, never cancel — otherwise a stream would be judged before a full
+	// window has been observed.
+	entry.responseBytes.Store(100)
+
+	reg.scanStalled()
+
+	snap := reg.Snapshot()
+	if len(snap) != 1 || snap[0].Status != StatusRunning {
+		t.Fatalf("expected first observation to leave stream running, got %+v", snap)
+	}
+	if entry.slowAnchorAt.Load() == 0 {
+		t.Errorf("expected anchor to be initialised on first observation")
+	}
+	if got := entry.slowAnchorBytes.Load(); got != 100 {
+		t.Errorf("expected anchor baseline 100, got %d", got)
+	}
+}
+
 func TestRegistryForceFinishStuckCancelingEntry(t *testing.T) {
 	reg := NewRegistry()
 	dir := t.TempDir()
@@ -316,6 +442,39 @@ func TestRegistryForceFinishStuckCancelingEntry(t *testing.T) {
 	}
 	if snap[0].Status != StatusCanceled {
 		t.Errorf("expected force-finish to produce status %q, got %q", StatusCanceled, snap[0].Status)
+	}
+}
+
+func TestRegistryHistoryLogReplaysOnAttach(t *testing.T) {
+	dir := t.TempDir()
+	logPath := dir + "/cancels.jsonl"
+
+	// First registry: attach the log and record two cancellations.
+	reg1 := NewRegistry()
+	reg1.AttachHistoryLog(logPath)
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for _, id := range []string{"histrec01", "histrec02"} {
+		reg1.Register(id, "POST", "", "/v1/responses", "127.0.0.1", "", 0, cancel)
+		if !reg1.Cancel(id, "operator", ReasonManual) {
+			t.Fatalf("Cancel(%s) failed", id)
+		}
+	}
+	if got := len(reg1.History(10)); got != 2 {
+		t.Fatalf("reg1 History: got %d, want 2", got)
+	}
+
+	// Second registry (simulating a restart): attaching the same log must
+	// replay the persisted records into the fresh ring, newest-first.
+	reg2 := NewRegistry()
+	reg2.AttachHistoryLog(logPath)
+	hist := reg2.History(10)
+	if len(hist) != 2 {
+		t.Fatalf("reg2 History after replay: got %d, want 2", len(hist))
+	}
+	if hist[0].Entry.ID != "histrec02" || hist[1].Entry.ID != "histrec01" {
+		t.Errorf("replay order wrong: got [%s, %s], want [histrec02, histrec01]",
+			hist[0].Entry.ID, hist[1].Entry.ID)
 	}
 }
 

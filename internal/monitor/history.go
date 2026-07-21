@@ -14,6 +14,7 @@ import (
 const (
 	ReasonManual = "manual"
 	ReasonStall  = "auto-stall"
+	ReasonSlow   = "auto-slow"
 )
 
 // CancelRecord captures a cancellation event for the operator history view.
@@ -22,6 +23,12 @@ type CancelRecord struct {
 	Reason     string    `json:"reason"`
 	CanceledBy string    `json:"canceled_by"`
 	CanceledAt time.Time `json:"canceled_at"`
+	// Detail is a human-readable description of the specific situation that
+	// triggered the cancellation. Currently populated for ReasonStall to
+	// record whether the stall was an initial wait or a mid-stream gap, how
+	// long the silence lasted, and how many response bytes had arrived
+	// before it. Empty for manual cancels.
+	Detail string `json:"detail,omitempty"`
 }
 
 // historyRing is a bounded in-memory ring of recent cancellation records.
@@ -154,6 +161,48 @@ func (h *historyLog) append(rec CancelRecord) {
 	if _, errWrite := f.Write(append(data, '\n')); errWrite != nil {
 		log.WithError(errWrite).WithField("path", h.path).Warn("monitor: failed to write history record")
 	}
+}
+
+// loadRecent streams the JSONL file once and returns up to limit records in
+// OLDEST-FIRST order so the caller can replay them into the ring buffer
+// without inverting the sequence. Returns nil for missing files (first boot
+// before any cancellation) or when the file cannot be opened. Malformed lines
+// are skipped with a warning. Mirrors errorsLog.loadRecent so the "Recent
+// cancellations" panel survives CPA restarts just like the "Errors" panel.
+func (h *historyLog) loadRecent(limit int) []CancelRecord {
+	if h == nil || h.path == "" || limit <= 0 {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	f, err := os.Open(h.path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.WithError(err).WithField("path", h.path).Warn("monitor: failed to open history log for replay")
+		}
+		return nil
+	}
+	defer func() {
+		if errClose := f.Close(); errClose != nil {
+			log.WithError(errClose).WithField("path", h.path).Warn("monitor: failed to close history log after replay")
+		}
+	}()
+	decoder := json.NewDecoder(f)
+	buf := make([]CancelRecord, 0, limit)
+	for decoder.More() {
+		var rec CancelRecord
+		if errDec := decoder.Decode(&rec); errDec != nil {
+			log.WithError(errDec).WithField("path", h.path).Warn("monitor: skipped malformed history-log line")
+			continue
+		}
+		if len(buf) < limit {
+			buf = append(buf, rec)
+			continue
+		}
+		// Slide the window: drop oldest, append newest.
+		buf = append(buf[:0:limit], append(buf[1:], rec)...)
+	}
+	return buf
 }
 
 // errorsLog persists ErrorRecord entries to a JSONL file so the operator

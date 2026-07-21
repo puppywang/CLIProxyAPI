@@ -52,12 +52,26 @@ type Entry struct {
 	StatusCode    int       `json:"status_code,omitempty"`
 	LastActivity  time.Time `json:"last_activity"`
 	DurationMs    int64     `json:"duration_ms"`
-	CanceledBy    string    `json:"canceled_by,omitempty"`
-	CanceledAt    time.Time `json:"canceled_at,omitempty"`
-	FirstChunkAt  time.Time `json:"first_chunk_at,omitempty"`
-	InputTokens   int64     `json:"input_tokens,omitempty"`
-	OutputTokens  int64     `json:"output_tokens,omitempty"`
-	TotalTokens   int64     `json:"total_tokens,omitempty"`
+	// BodyReceiveMs is how long the request body took to arrive off the wire
+	// (from request arrival to the body's EOF). It exposes the previously
+	// invisible upload phase — for slow client connections this can be tens
+	// of seconds. ReceivingBody is true while the body is still arriving.
+	BodyReceiveMs int64 `json:"body_receive_ms,omitempty"`
+	ReceivingBody bool  `json:"receiving_body,omitempty"`
+	// BodyReceivedBytes is how many request-body bytes have arrived so far.
+	// With BodyReceiveMs it yields the (live) upload speed; a partial count
+	// while ReceivingBody, otherwise the full body size.
+	BodyReceivedBytes int64     `json:"body_received_bytes,omitempty"`
+	CanceledBy        string    `json:"canceled_by,omitempty"`
+	CanceledAt        time.Time `json:"canceled_at,omitempty"`
+	FirstChunkAt      time.Time `json:"first_chunk_at,omitempty"`
+	// SlowWindowBytes is the response-byte delta observed in the rolling
+	// window that tripped the slow-stream watchdog. Only meaningful on a
+	// ReasonSlow cancellation; zero/omitted otherwise.
+	SlowWindowBytes int64 `json:"slow_window_bytes,omitempty"`
+	InputTokens     int64 `json:"input_tokens,omitempty"`
+	OutputTokens    int64 `json:"output_tokens,omitempty"`
+	TotalTokens     int64 `json:"total_tokens,omitempty"`
 
 	// Window / conversation metadata extracted from request headers
 	// (currently X-Codex-Turn-Metadata for Codex clients, with fallbacks
@@ -78,6 +92,11 @@ type Entry struct {
 	// The UI ellipsis-truncates the path to its trailing segment(s)
 	// and shows the full value on hover.
 	Workspace string `json:"workspace,omitempty"`
+	// ErrorSnippet is a bounded prefix of the error response body, captured
+	// only for >=400 outcomes. It lets the operator see WHY a request failed
+	// (e.g. "unknown provider for model X", context_too_large, engine
+	// overloaded) directly in the monitor instead of digging through logs.
+	ErrorSnippet string `json:"error_snippet,omitempty"`
 }
 
 // trackedRequest is the mutable runtime representation behind a registry entry.
@@ -96,9 +115,19 @@ type trackedRequest struct {
 	lastActivity  atomic.Int64
 	lastBroadcast atomic.Int64
 	firstChunkAt  atomic.Int64
-	inputTokens   atomic.Int64
-	outputTokens  atomic.Int64
-	totalTokens   atomic.Int64
+	// slowAnchorAt / slowAnchorBytes are the rolling-window baseline for the
+	// slow-stream throughput watchdog. They are read and written exclusively
+	// by the single watcher goroutine (scanStalled), so their pairing needs
+	// no cross-field locking; atomics keep them race-free against any future
+	// reader. Zero slowAnchorAt means "not yet anchored".
+	slowAnchorAt    atomic.Int64
+	slowAnchorBytes atomic.Int64
+	// slowWindowBytes records the window delta that tripped the slow-stream
+	// watchdog, captured just before Cancel so it lands in the snapshot.
+	slowWindowBytes atomic.Int64
+	inputTokens     atomic.Int64
+	outputTokens    atomic.Int64
+	totalTokens     atomic.Int64
 
 	mu           sync.RWMutex
 	model        string
@@ -115,6 +144,10 @@ type trackedRequest struct {
 	turnID       string
 	threadSource string
 	workspace    string
+	errorSnippet string
+	// bodyTiming measures how long the request body took to arrive. Set once
+	// by the monitor middleware right after Register; read in snapshot().
+	bodyTiming *bodyTimer
 }
 
 func (t *trackedRequest) snapshot() Entry {
@@ -128,38 +161,60 @@ func (t *trackedRequest) snapshot() Entry {
 	if fc := t.firstChunkAt.Load(); fc > 0 {
 		firstChunk = time.Unix(0, fc)
 	}
-	return Entry{
-		ID:            t.id,
-		Method:        t.method,
-		Transport:     t.transport,
-		Path:          t.path,
-		ClientIP:      t.clientIP,
-		UserAgent:     t.userAgent,
-		StartedAt:     t.startedAt,
-		Model:         t.model,
-		AuthID:        t.authID,
-		AuthLabel:     t.authLabel,
-		Provider:      t.provider,
-		AuthProxy:     t.authProxy,
-		Streaming:     t.streaming.Load(),
-		RequestBytes:  t.requestBytes.Load(),
-		ResponseBytes: t.responseBytes.Load(),
-		Status:        t.status,
-		StatusCode:    int(t.statusCode.Load()),
-		LastActivity:  last,
-		DurationMs:    time.Since(t.startedAt).Milliseconds(),
-		CanceledBy:    t.canceledBy,
-		CanceledAt:    t.canceledAt,
-		FirstChunkAt:  firstChunk,
-		InputTokens:   t.inputTokens.Load(),
-		OutputTokens:  t.outputTokens.Load(),
-		TotalTokens:   t.totalTokens.Load(),
-		SessionID:     t.sessionID,
-		ThreadID:      t.threadID,
-		TurnID:        t.turnID,
-		ThreadSource:  t.threadSource,
-		Workspace:     t.workspace,
+	var bodyReceiveMs, bodyReceivedBytes int64
+	var receivingBody bool
+	if t.bodyTiming != nil {
+		ms, done := t.bodyTiming.receiveMillis(time.Now())
+		bodyReceiveMs = ms
+		receivingBody = !done
+		bodyReceivedBytes = t.bodyTiming.received()
 	}
+	return Entry{
+		ID:                t.id,
+		Method:            t.method,
+		Transport:         t.transport,
+		Path:              t.path,
+		ClientIP:          t.clientIP,
+		UserAgent:         t.userAgent,
+		StartedAt:         t.startedAt,
+		Model:             t.model,
+		AuthID:            t.authID,
+		AuthLabel:         t.authLabel,
+		Provider:          t.provider,
+		AuthProxy:         t.authProxy,
+		Streaming:         t.streaming.Load(),
+		RequestBytes:      t.requestBytes.Load(),
+		ResponseBytes:     t.responseBytes.Load(),
+		Status:            t.status,
+		StatusCode:        int(t.statusCode.Load()),
+		LastActivity:      last,
+		DurationMs:        time.Since(t.startedAt).Milliseconds(),
+		BodyReceiveMs:     bodyReceiveMs,
+		ReceivingBody:     receivingBody,
+		BodyReceivedBytes: bodyReceivedBytes,
+		CanceledBy:        t.canceledBy,
+		CanceledAt:        t.canceledAt,
+		FirstChunkAt:      firstChunk,
+		SlowWindowBytes:   t.slowWindowBytes.Load(),
+		InputTokens:       t.inputTokens.Load(),
+		OutputTokens:      t.outputTokens.Load(),
+		TotalTokens:       t.totalTokens.Load(),
+		SessionID:         t.sessionID,
+		ThreadID:          t.threadID,
+		TurnID:            t.turnID,
+		ThreadSource:      t.threadSource,
+		Workspace:         t.workspace,
+		ErrorSnippet:      t.errorSnippet,
+	}
+}
+
+// isReceivingBody reports whether the request body is still arriving (timer
+// attached, no EOF yet). Used by the watcher to push live upload progress.
+func (t *trackedRequest) isReceivingBody() bool {
+	t.mu.RLock()
+	bt := t.bodyTiming
+	t.mu.RUnlock()
+	return bt != nil && !bt.done()
 }
 
 // AuthLookup is an optional callback that enriches an auth ID with a
@@ -250,11 +305,23 @@ func (r *Registry) AttachSettings(store *SettingsStore) {
 	r.mu.Unlock()
 }
 
-// AttachHistoryLog wires a JSONL writer that records every cancellation.
+// AttachHistoryLog wires a JSONL writer that records every cancellation. On
+// attach, the most recent `history.capacity` lines are streamed back into the
+// ring buffer so the "Recent cancellations" panel survives CPA restarts,
+// matching AttachErrorsLog's behaviour (previously only the errors panel
+// replayed, so cancellations appeared to vanish on every restart).
 func (r *Registry) AttachHistoryLog(path string) {
 	r.mu.Lock()
 	r.histLog = newHistoryLog(path)
+	ring := r.history
 	r.mu.Unlock()
+	if ring == nil {
+		return
+	}
+	replay := r.histLog.loadRecent(ring.capacity)
+	for _, rec := range replay {
+		ring.add(rec)
+	}
 }
 
 // AttachErrorsLog wires a JSONL writer that persists every non-2xx
@@ -532,6 +599,13 @@ func (r *Registry) recordCancel(snap Entry, reason, by string) {
 		CanceledBy: by,
 		CanceledAt: time.Now(),
 	}
+	switch reason {
+	case ReasonStall:
+		rec.Detail = stallDetail(snap, rec.CanceledAt)
+	case ReasonSlow:
+		s := r.Settings()
+		rec.Detail = slowDetail(snap, rec.CanceledAt, s.SlowWindowSeconds, s.SlowMinBytes)
+	}
 	r.mu.RLock()
 	hist := r.history
 	log := r.histLog
@@ -541,6 +615,67 @@ func (r *Registry) recordCancel(snap Entry, reason, by string) {
 	}
 	if log != nil {
 		log.append(rec)
+	}
+}
+
+// stallDetail builds the human-readable "specific situation" recorded on a
+// stall cancellation. It distinguishes the two cases the watchdog covers:
+//
+//   - initial wait: the upstream produced no response bytes at all before
+//     the stall threshold elapsed (TTFB never happened); and
+//   - mid-stream gap: bytes were flowing, then the stream went silent for
+//     longer than the threshold.
+//
+// The gap is measured from the last observed activity (last byte written to
+// the client, or the start time when nothing was ever sent) to the moment of
+// cancellation, matching exactly what scanStalled tested.
+func stallDetail(snap Entry, canceledAt time.Time) string {
+	ref := snap.LastActivity
+	if ref.IsZero() {
+		ref = snap.StartedAt
+	}
+	gap := canceledAt.Sub(ref)
+	if gap < 0 {
+		gap = 0
+	}
+	gapStr := gap.Round(time.Second).String()
+	if snap.ResponseBytes <= 0 {
+		return fmt.Sprintf("initial wait: no response bytes for %s after connect", gapStr)
+	}
+	return fmt.Sprintf("mid-stream gap: silent for %s after %s received", gapStr, formatStallBytes(snap.ResponseBytes))
+}
+
+// slowDetail builds the "specific situation" recorded on a slow-stream
+// cancellation. It reports the number that actually tripped the rule — the
+// bytes delivered in the last window — alongside the whole-request total, so
+// an operator can tell a genuinely-slow stream apart from an initial burst
+// followed by near-silence (whose whole-request average would look fast and
+// contradict the "slow" verdict). SlowWindowBytes is captured by scanSlow at
+// cancel time; it falls back to a total-throughput description if unset.
+func slowDetail(snap Entry, canceledAt time.Time, windowSeconds, minBytes int) string {
+	start := snap.FirstChunkAt
+	if start.IsZero() {
+		start = snap.StartedAt
+	}
+	total := canceledAt.Sub(start)
+	if total <= 0 {
+		total = time.Second
+	}
+	return fmt.Sprintf("slow stream: only %s in last %ds window (floor %s); %s total over %s",
+		formatStallBytes(snap.SlowWindowBytes), windowSeconds, formatStallBytes(int64(minBytes)),
+		formatStallBytes(snap.ResponseBytes), total.Round(time.Second).String())
+}
+
+// formatStallBytes renders a byte count in the same B/KB/MB style the operator
+// UI uses, so stall records read consistently with the live in-flight view.
+func formatStallBytes(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
 	}
 }
 
@@ -763,6 +898,27 @@ func (r *Registry) SetStatusCode(t *trackedRequest, code int) {
 		return
 	}
 	t.statusCode.Store(int32(code))
+}
+
+// SetErrorSnippet records a bounded prefix of an error response body so the
+// operator UI can show why a request failed. Intended to be called once at
+// finish for a >=400 outcome, just before Finish snapshots the entry. No-op
+// for an empty snippet.
+func (r *Registry) SetErrorSnippet(t *trackedRequest, snippet string) {
+	if t == nil {
+		return
+	}
+	snippet = strings.TrimSpace(snippet)
+	if snippet == "" {
+		return
+	}
+	const maxLen = 2048
+	if len(snippet) > maxLen {
+		snippet = snippet[:maxLen]
+	}
+	t.mu.Lock()
+	t.errorSnippet = snippet
+	t.mu.Unlock()
 }
 
 // terminalLingerDuration keeps finished/canceled entries visible briefly so

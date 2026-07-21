@@ -45,6 +45,8 @@ func (r *Registry) watcherLoop(stop <-chan struct{}) {
 func (r *Registry) scanStalled() {
 	settings := r.Settings()
 	stallThreshold := time.Duration(settings.StallTimeoutSeconds) * time.Second
+	slowWindow := time.Duration(settings.SlowWindowSeconds) * time.Second
+	slowMinBytes := int64(settings.SlowMinBytes)
 	now := time.Now()
 
 	r.mu.RLock()
@@ -62,17 +64,42 @@ func (r *Registry) scanStalled() {
 
 		switch status {
 		case StatusRunning:
-			if stallThreshold <= 0 {
-				continue
+			// 1) Stall watchdog: no response activity at all for the whole
+			//    threshold. Covers the initial wait (no first byte yet) and
+			//    any fully-silent mid-stream gap.
+			if stallThreshold > 0 {
+				last := time.Unix(0, t.lastActivity.Load())
+				if last.IsZero() {
+					last = t.startedAt
+				}
+				if now.Sub(last) >= stallThreshold {
+					// Emit a structured line before cancelling so a stall is
+					// visible in the service journal (the Cancel path itself
+					// is silent for the auto case). The persisted CancelRecord
+					// carries the same detail for the operator history view.
+					log.WithField("request_id", t.id).
+						WithField("gap", now.Sub(last).Round(time.Second).String()).
+						WithField("threshold", stallThreshold.String()).
+						WithField("response_bytes", t.responseBytes.Load()).
+						Warn("monitor: auto-cancelling stalled request; no response activity within stall threshold")
+					r.Cancel(t.id, "auto", ReasonStall)
+					continue
+				}
 			}
-			last := time.Unix(0, t.lastActivity.Load())
-			if last.IsZero() {
-				last = t.startedAt
+
+			// 2) Slow-stream watchdog (throughput floor): a streaming response
+			//    that never goes silent long enough to trip the stall timeout
+			//    but delivers fewer than SlowMinBytes over a full
+			//    SlowWindowSeconds window is a "trickle" and gets cancelled.
+			r.scanSlow(t, now, slowWindow, slowMinBytes)
+
+			// 3) Live upload progress: while the request body is still
+			//    arriving, no other event fires (no response bytes yet), so
+			//    push a snapshot each tick so the UI can render real-time
+			//    upload speed/progress for slow client links.
+			if t.isReceivingBody() {
+				r.broadcast(Event{Type: "updated", Entry: t.snapshot()})
 			}
-			if now.Sub(last) < stallThreshold {
-				continue
-			}
-			r.Cancel(t.id, "auto", ReasonStall)
 		case StatusCanceling:
 			if canceledAt.IsZero() || now.Sub(canceledAt) < forceFinishGrace {
 				continue
@@ -83,4 +110,54 @@ func (r *Registry) scanStalled() {
 			r.Finish(t)
 		}
 	}
+}
+
+// scanSlow applies the throughput-floor watchdog to a single running entry.
+// It maintains a rolling window anchored to the entry: once a full window has
+// elapsed since the anchor, it measures how many response bytes arrived during
+// that window. Below the floor -> cancel as a slow stream; at or above ->
+// slide the anchor forward and keep watching. The watchdog only engages after
+// the stream has produced its first byte, so the initial TTFB (handled by the
+// stall watchdog) never counts against throughput. No-ops when either knob is
+// unset or the entry is not a streaming response.
+func (r *Registry) scanSlow(t *trackedRequest, now time.Time, window time.Duration, minBytes int64) {
+	if window <= 0 || minBytes <= 0 {
+		return
+	}
+	if !t.streaming.Load() {
+		return
+	}
+	if t.firstChunkAt.Load() == 0 {
+		// No bytes yet; the stall watchdog owns this phase.
+		return
+	}
+	curBytes := t.responseBytes.Load()
+	anchorAt := t.slowAnchorAt.Load()
+	if anchorAt == 0 {
+		// First observation after first byte: start the window here.
+		t.slowAnchorAt.Store(now.UnixNano())
+		t.slowAnchorBytes.Store(curBytes)
+		return
+	}
+	if now.Sub(time.Unix(0, anchorAt)) < window {
+		return
+	}
+	delta := curBytes - t.slowAnchorBytes.Load()
+	if delta < minBytes {
+		// Capture the triggering window delta before Cancel so the snapshot
+		// (and thus the recorded detail) reports the number that actually
+		// tripped the rule, not a whole-request average.
+		t.slowWindowBytes.Store(delta)
+		log.WithField("request_id", t.id).
+			WithField("window", window.String()).
+			WithField("bytes_in_window", delta).
+			WithField("floor", minBytes).
+			WithField("response_bytes", curBytes).
+			Warn("monitor: auto-cancelling slow stream; response throughput below floor for a full window")
+		r.Cancel(t.id, "auto", ReasonSlow)
+		return
+	}
+	// Healthy window: slide the anchor forward.
+	t.slowAnchorAt.Store(now.UnixNano())
+	t.slowAnchorBytes.Store(curBytes)
 }
