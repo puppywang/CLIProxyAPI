@@ -14,6 +14,7 @@ import (
 
 	"github.com/tidwall/gjson"
 
+	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 )
@@ -95,7 +96,10 @@ func (f *CodexWhamFetcher) Fetch(ctx context.Context, auth *coreauth.Auth) (core
 		return coreauth.QuotaSnapshot{}, false, nil
 	}
 	accessToken := metaString(auth.Metadata, "access_token")
-	if accessToken == "" {
+	// K12 / agent-identity codex accounts have no bearer access token — they
+	// authenticate (chat AND wham/usage) with a per-request ed25519 assertion.
+	agentIdentity := codexauth.IsAgentIdentityMetadata(auth.Metadata)
+	if accessToken == "" && !agentIdentity {
 		return coreauth.QuotaSnapshot{}, false, nil
 	}
 
@@ -116,7 +120,15 @@ func (f *CodexWhamFetcher) Fetch(ctx context.Context, auth *coreauth.Auth) (core
 		return coreauth.QuotaSnapshot{}, false, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
+	if agentIdentity {
+		assertion, errAssert := codexauth.AgentAssertionFromMetadata(auth.Metadata, time.Now())
+		if errAssert != nil {
+			return coreauth.QuotaSnapshot{}, false, errAssert
+		}
+		req.Header.Set("Authorization", assertion)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+	}
 	req.Header.Set("User-Agent", defaultUserAgent)
 	if accountID := metaString(auth.Metadata, "account_id"); accountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", accountID)
