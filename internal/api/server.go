@@ -302,6 +302,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Add middleware
 	engine.Use(logging.GinLogrusLogger())
 	engine.Use(logging.GinLogrusRecovery())
+	// Time the request-body read before the request-logging middleware (which
+	// eagerly drains the body) so the monitor can report the upload phase.
+	engine.Use(monitor.RequestBodyTimingMiddleware())
 	for _, mw := range optionState.extraMiddleware {
 		engine.Use(mw)
 	}
@@ -384,6 +387,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
+	auth.SetAutoReleaseOn429(cfg.AutoReleaseOn429)
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
@@ -859,6 +863,29 @@ func (s *Server) registerManagementRoutes() {
 		// auth out of rotation by hand. See
 		// coreauth.Manager.ForceCooldown for semantics.
 		mgmt.POST("/auth-cooldowns/:id/force", s.mgmt.ForceAuthCooldown)
+		// Release all session-affinity bindings on an account so its
+		// stranded conversations re-pick a fresh account on their next
+		// turn — the server-side equivalent of forking each conversation,
+		// without the heavy client-side thread duplication. Used after an
+		// account hits its quota.
+		mgmt.POST("/auth-cooldowns/:id/release-bindings", s.mgmt.ReleaseAuthBindings)
+		// Auto-release-on-429 toggle. When on, the conductor drops the
+		// 429'd account's session-affinity bindings immediately and
+		// converts the 429 into a 500 so the client retries onto a fresh
+		// account — transparent failover with no client-side fork.
+		mgmt.GET("/auto-release-429", s.mgmt.GetAutoRelease429)
+		mgmt.PUT("/auto-release-429", s.mgmt.SetAutoRelease429)
+		// Codex referral invite. Sends invites from the selected codex
+		// auth via chatgpt.com wham/referrals/invite; defaults mirror
+		// LTbinglingfeng/cpa-plugin-codex-invite. Body is a JSON
+		// {emails, emails_text?, referral_key?, base_url?, proxy_url?,
+		// language?, cookie?}.
+		mgmt.POST("/codex-invite/:id", s.mgmt.InviteCodex)
+		// Read-only status aggregator: bundles wham/usage + referral rules +
+		// history + credit ledger + eligibility reason in one trip, used by
+		// the monitor invite modal to replace the previous localStorage
+		// counter with authoritative upstream data.
+		mgmt.GET("/codex-invite/:id/status", s.mgmt.InviteCodexStatus)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
 		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
@@ -866,6 +893,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
+		mgmt.POST("/auth-files/import-sub2api", s.mgmt.ImportSub2api)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
 		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
@@ -1718,6 +1746,10 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 
 	if oldCfg == nil || oldCfg.DisableCooling != cfg.DisableCooling {
 		auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
+	}
+
+	if oldCfg == nil || oldCfg.AutoReleaseOn429 != cfg.AutoReleaseOn429 {
+		auth.SetAutoReleaseOn429(cfg.AutoReleaseOn429)
 	}
 
 	if oldCfg != nil && oldCfg.DisableImageGeneration != cfg.DisableImageGeneration {

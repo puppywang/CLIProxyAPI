@@ -115,6 +115,11 @@ type Service struct {
 	// from applyConfigUpdate when the selector chain is rebuilt.
 	quotaRefresher *quota.Refresher
 
+	// xaiBilling polls grok /v1/billing for xai auths and serves cached
+	// monthly-usage snapshots to the management UI. Display-only; entirely
+	// separate from the codex quota selector. Lifecycle mirrors quotaRefresher.
+	xaiBilling *quota.XAIBillingPoller
+
 	// shutdownOnce ensures shutdown is called only once.
 	shutdownOnce sync.Once
 
@@ -894,6 +899,16 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 	s.quotaRefresher = refresher
 	log.Infof("quota refresher started (interval=%s, concurrency=%d)", quota.DefaultRefreshInterval, quota.DefaultConcurrency)
 
+	// Grok billing poller: display-only monthly-usage snapshots for xai auths.
+	// Independent of the codex selector so it can never affect selection.
+	if s.xaiBilling != nil {
+		s.xaiBilling.Stop()
+		s.xaiBilling = nil
+	}
+	xaiPoller := quota.NewXAIBillingPoller(func() []*coreauth.Auth { return mgr.List() }, quota.DefaultRefreshInterval)
+	xaiPoller.Start(ctx)
+	s.xaiBilling = xaiPoller
+
 	// Expose the snapshot + synchronous refresh to the management API so
 	// the operator UI can render quota state next to each credential and
 	// drive a per-account "refresh now" button. The wiring goes through
@@ -923,13 +938,32 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 			}
 		}
 		snapshotFn := func(authID string) (managementHandlers.QuotaSnapshotData, bool) {
-			snap, ok := selector.Snapshot(authID)
-			if !ok {
-				return managementHandlers.QuotaSnapshotData{}, false
+			if snap, ok := selector.Snapshot(authID); ok {
+				return toManagement(snap), true
 			}
-			return toManagement(snap), true
+			// Fall back to the grok billing cache for xai auths, which the
+			// codex selector never has a snapshot for.
+			if xaiPoller != nil {
+				if snap, ok := xaiPoller.Snapshot(authID); ok {
+					return toManagement(snap), true
+				}
+			}
+			return managementHandlers.QuotaSnapshotData{}, false
 		}
 		refreshFn := func(ctx context.Context, authID string) (managementHandlers.QuotaSnapshotData, bool, error) {
+			// Route "refresh now" by provider: xai auths go to the billing
+			// poller, everything else to the codex wham refresher.
+			if existing, ok := mgr.GetByID(authID); ok && existing != nil &&
+				strings.EqualFold(strings.TrimSpace(existing.Provider), "xai") {
+				if xaiPoller == nil {
+					return managementHandlers.QuotaSnapshotData{}, false, nil
+				}
+				snap, ok, err := xaiPoller.RefreshNow(ctx, authID)
+				if err != nil || !ok {
+					return managementHandlers.QuotaSnapshotData{}, ok, err
+				}
+				return toManagement(snap), true, nil
+			}
 			snap, ok, err := refresher.RefreshNow(ctx, authID)
 			if err != nil || !ok {
 				return managementHandlers.QuotaSnapshotData{}, ok, err
@@ -952,7 +986,14 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 
 // stopQuotaRefresher stops the background refresher if running. Idempotent.
 func (s *Service) stopQuotaRefresher() {
-	if s == nil || s.quotaRefresher == nil {
+	if s == nil {
+		return
+	}
+	if s.xaiBilling != nil {
+		s.xaiBilling.Stop()
+		s.xaiBilling = nil
+	}
+	if s.quotaRefresher == nil {
 		return
 	}
 	s.quotaRefresher.Stop()

@@ -259,3 +259,51 @@ func TestCodexIdentityConfuseKeepsClientBodySeparateFromUpstreamBody(t *testing.
 		t.Fatalf("client prompt_cache_key = %q, want cache-1", gotKey)
 	}
 }
+
+// TestCodexIdentityConfuseUUIDFormat verifies the confused ids match the UUID
+// version real codex emits per field (v7 for thread/session/turn/prompt-cache,
+// v4 for installation), are deterministic + account-scoped, reuse the
+// original's v7 timestamp, and never equal the original. A v5 output (the old
+// behaviour) would be a fingerprint tell and must never occur.
+func TestCodexIdentityConfuseUUIDFormat(t *testing.T) {
+	// A genuine codex v7 id (019... ms-timestamp prefix).
+	origV7 := "019f20ed-3b0a-7301-abc2-a94d3b476f13"
+
+	for _, kind := range []string{"turn", "prompt-cache", "thread", "session"} {
+		got := codexIdentityConfuseUUID("auth-A", kind, origV7)
+		u, err := uuid.Parse(got)
+		if err != nil {
+			t.Fatalf("kind=%s: not a valid UUID: %v", kind, err)
+		}
+		if u.Version() != 7 {
+			t.Errorf("kind=%s: version = %d, want 7 (%s)", kind, u.Version(), got)
+		}
+		if u.Variant() != uuid.RFC4122 {
+			t.Errorf("kind=%s: variant = %v, want RFC4122", kind, u.Variant())
+		}
+		// v7 must reuse the original's 48-bit ms timestamp (first 6 bytes).
+		orig := uuid.MustParse(origV7)
+		if got6, orig6 := u[:6], orig[:6]; string(got6) != string(orig6) {
+			t.Errorf("kind=%s: timestamp bytes not reused: got %x want %x", kind, got6, orig6)
+		}
+		if got == origV7 {
+			t.Errorf("kind=%s: confused id equals original", kind)
+		}
+	}
+
+	// installation_id is UUIDv4 in codex.
+	inst := codexIdentityConfuseUUID("auth-A", "installation", "41a7c984-ebd1-45d5-97d0-fa4ba9b80d44")
+	iu, err := uuid.Parse(inst)
+	if err != nil || iu.Version() != 4 {
+		t.Errorf("installation: version = %v (err=%v), want 4 (%s)", iu.Version(), err, inst)
+	}
+
+	// Deterministic: same inputs -> same output.
+	if a, b := codexIdentityConfuseUUID("auth-A", "turn", origV7), codexIdentityConfuseUUID("auth-A", "turn", origV7); a != b {
+		t.Errorf("not deterministic: %s != %s", a, b)
+	}
+	// Account-scoped: different authID -> different output (unlinkable).
+	if a, b := codexIdentityConfuseUUID("auth-A", "turn", origV7), codexIdentityConfuseUUID("auth-B", "turn", origV7); a == b {
+		t.Errorf("accounts A and B produced the SAME confused id (%s) — would be linkable", a)
+	}
+}

@@ -26,6 +26,26 @@ type utlsRoundTripper struct {
 	dialer      proxy.Dialer
 }
 
+// HTTP/2 keepalive for the utls transport. Without these, a silently-dead
+// upstream connection (packets stop but no RST — common when a shared egress
+// IP is throttled/tarpitted, which is exactly the "many accounts, one direct
+// IP" case) is never detected: the SSE stream blocks with no bytes until the
+// OS TCP timeout (10+ minutes). ReadIdleTimeout makes the client send a PING
+// once a connection has received no frames for that long; if no PONG arrives
+// within PingTimeout the connection is torn down and the in-flight stream
+// errors, so the caller can retry / fail over instead of hanging.
+//
+// This is a liveness probe, NOT a request deadline: a legitimately slow
+// (reasoning) stream keeps its connection alive via the PING/PONG round-trip
+// and is never reaped, so a healthy request's duration is not capped. That
+// keeps it consistent with the AGENTS.md "no timeouts after the connection is
+// established" rule, which already carves out liveness deadlines for the
+// websocket path. Package vars so they can be tuned/tested.
+var (
+	utlsReadIdleTimeout = 30 * time.Second
+	utlsPingTimeout     = 15 * time.Second
+)
+
 func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
 	var dialer proxy.Dialer = proxy.Direct
 	if proxyURL != "" {
@@ -93,7 +113,10 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		return nil, err
 	}
 
-	tr := &http2.Transport{}
+	tr := &http2.Transport{
+		ReadIdleTimeout: utlsReadIdleTimeout,
+		PingTimeout:     utlsPingTimeout,
+	}
 	h2Conn, err := tr.NewClientConn(tlsConn)
 	if err != nil {
 		tlsConn.Close()
