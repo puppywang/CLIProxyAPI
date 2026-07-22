@@ -18,6 +18,7 @@ import (
 	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -772,6 +773,49 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	return httpClient.Do(httpReq)
 }
 
+// codexDowngradedCtxKey marks that a model_not_supported downgrade has already
+// fired for this request, capping the retry at one hop regardless of config.
+type codexDowngradedCtxKey struct{}
+
+func codexDowngradeApplied(ctx context.Context) bool {
+	applied, _ := ctx.Value(codexDowngradedCtxKey{}).(bool)
+	return applied
+}
+
+func markCodexDowngradeApplied(ctx context.Context) context.Context {
+	return context.WithValue(ctx, codexDowngradedCtxKey{}, true)
+}
+
+// codexDowngradeModel handles an upstream model_not_supported response. When a
+// downgrade is configured for the request's base model, it (1) marks the
+// account as unentitled for that model via the registry — a durable marker the
+// selector consults so future requests for the model route to accounts that
+// support it, and which ClearCooldown does not wipe — and (2) returns the
+// downgraded req.Model to retry with on the SAME account. Returns "" when no
+// downgrade applies (wrong error, no mapping, or already downgraded once).
+func (e *CodexExecutor) codexDowngradeModel(ctx context.Context, auth *cliproxyauth.Auth, reqModel string, status int, body []byte) string {
+	if codexDowngradeApplied(ctx) {
+		return ""
+	}
+	if !helps.IsCodexModelNotSupportedError(status, body) {
+		return ""
+	}
+	downgraded := helps.ResolveCodexModelDowngrade(e.cfg, reqModel)
+	if downgraded == "" {
+		return ""
+	}
+	base := helps.CodexModelBase(reqModel)
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
+	if authID != "" && base != "" {
+		registry.GetGlobalRegistry().SuspendClientModel(authID, base, "model_not_supported")
+	}
+	helps.LogWithRequestID(ctx).Infof("codex: model %s not supported for auth %s; downgrading to %s", base, authID, helps.CodexModelBase(downgraded))
+	return downgraded
+}
+
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
@@ -865,6 +909,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		clearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, b)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		if dm := e.codexDowngradeModel(ctx, auth, req.Model, httpResp.StatusCode, b); dm != "" {
+			retryReq := req
+			retryReq.Model = dm
+			return e.Execute(markCodexDowngradeApplied(ctx), auth, retryReq, opts)
+		}
 		err = newCodexStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
@@ -1031,6 +1080,11 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		b = applyCodexIdentityConfuseResponsePayload(b, identityState)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		if dm := e.codexDowngradeModel(ctx, auth, req.Model, httpResp.StatusCode, b); dm != "" {
+			retryReq := req
+			retryReq.Model = dm
+			return e.executeCompact(markCodexDowngradeApplied(ctx), auth, retryReq, opts)
+		}
 		err = newCodexStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
@@ -1145,6 +1199,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		clearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, data)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		if dm := e.codexDowngradeModel(ctx, auth, req.Model, httpResp.StatusCode, data); dm != "" {
+			retryReq := req
+			retryReq.Model = dm
+			return e.ExecuteStream(markCodexDowngradeApplied(ctx), auth, retryReq, opts)
+		}
 		err = newCodexStatusErr(httpResp.StatusCode, data)
 		return nil, err
 	}

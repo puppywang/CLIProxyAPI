@@ -274,6 +274,15 @@ type CodexHeaderDefaults struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	// ModelDowngrades maps an upstream model to a fallback model, used when an
+	// account lacks entitlement for the requested model (upstream 400 "The
+	// '<model>' model is not supported when using Codex with a ChatGPT
+	// account."). The request is retried on the SAME account with the mapped
+	// model instead of failing. When this map is nil/empty a built-in default
+	// applies (gpt-5.6-sol -> gpt-5.6-terra); set it in config to override or
+	// extend. A model that is only a value (never a key) is a terminal target,
+	// which bounds the downgrade chain.
+	ModelDowngrades map[string]string `yaml:"model-downgrades" json:"model-downgrades"`
 }
 
 // XAIConfig configures provider-wide xAI/Grok request behavior.

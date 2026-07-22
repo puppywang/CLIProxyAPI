@@ -754,6 +754,28 @@ func (r *ModelRegistry) ResumeClientModel(clientID, modelID string) {
 	log.Debugf("Resumed client %s for model %s", clientID, modelID)
 }
 
+// IsClientModelSuspended reports whether the client currently carries a
+// SuspendClientModel marker for modelID. Selection consults this so an account
+// learned to be unentitled for a model (e.g. gpt-5.6-sol on a ChatGPT account
+// that returned "model is not supported") is excluded as a candidate for that
+// model. This marker lives only in the registration (not on the Auth's
+// ModelState), so ClearCooldown — which resets ModelStates — does not wipe it.
+func (r *ModelRegistry) IsClientModelSuspended(clientID, modelID string) bool {
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
+	if clientID == "" || modelID == "" {
+		return false
+	}
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	registration, exists := r.models[modelID]
+	if !exists || registration == nil || registration.SuspendedClients == nil {
+		return false
+	}
+	_, suspended := registration.SuspendedClients[clientID]
+	return suspended
+}
+
 // ClientSupportsModel reports whether the client registered support for modelID.
 func (r *ModelRegistry) ClientSupportsModel(clientID, modelID string) bool {
 	clientID = strings.TrimSpace(clientID)
