@@ -528,6 +528,15 @@
     cursor: pointer;
   }
   .quota-refresh-all:hover { background: rgba(143,198,255,0.22); }
+  /* Red sibling of .quota-refresh-all — bulk-deletes every deactivated
+     account. Only shown when at least one dead account exists. */
+  .quota-delete-dead {
+    color: #ff5c5c;
+    background: rgba(255,92,92,0.12);
+    border-color: rgba(255,92,92,0.5);
+    font-weight: 600;
+  }
+  .quota-delete-dead:hover { background: rgba(255,92,92,0.22); }
   /* Auto-release-on-429/402 toggle. Lives in the quota panel summary so
      an operator flipping it after seeing a 429 or 402 (deactivated
      workspace) has the control right next to the affected accounts. The
@@ -1346,6 +1355,7 @@
     <summary>
       Account quota — Codex &amp; Grok (<span id="quotaCount">0</span>)
       <button type="button" id="quotaRefreshAllBtn" class="quota-refresh-all" title="Refresh every codex account's wham/usage snapshot now">Refresh all</button>
+      <button type="button" id="deleteDeadBtn" class="quota-refresh-all quota-delete-dead" title="Delete every account flagged deactivated (terminal 4XX from quota refresh). A confirmation lists all of them first." hidden>🗑 Delete deactivated</button>
       <button type="button" id="registerAgentBtn" class="quota-refresh-all" title="Import an account from a one-time access_token via Agent Identity — no refresh_token / SMS code needed">+ Import via token</button>
       <label class="auto-release-429-toggle" title="When on, an upstream 429 or 402 (deactivated workspace / billing) auto-releases that account's session bindings and converts the error into a 500 so the client retries onto a fresh account — transparent failover with no client-side fork">
         <input type="checkbox" id="autoRelease429Checkbox">
@@ -2459,6 +2469,9 @@
   // table on every poll.
   const quotaRows = new Map();
   let quotaInflight = false;
+  // Last-rendered account list, so the "Delete deactivated" bulk action can
+  // enumerate the dead accounts without re-fetching. Refreshed every render.
+  let lastQuotaFiles = [];
   // Session-affinity bindings joined into each account row (keyed by
   // auth_id). Populated by loadAccountQuota from /session-affinity/bindings
   // so the account panel shows each account's live bindings inline — the
@@ -2493,6 +2506,15 @@
         return p === 'codex' || p === 'xai';
       });
       $('quotaCount').textContent = String(files.length);
+      lastQuotaFiles = files;
+      // Show the bulk-delete button (with a live count) only when there is
+      // at least one deactivated account to clean up.
+      const deadCount = files.filter(a => a.quota && a.quota.dead_reason).length;
+      const deadBtn = $('deleteDeadBtn');
+      if (deadBtn) {
+        deadBtn.hidden = deadCount === 0;
+        deadBtn.textContent = '🗑 Delete deactivated (' + deadCount + ')';
+      }
       const body = $('quotaBody');
       const seen = new Set();
       // Ordering buckets, top to bottom:
@@ -3147,6 +3169,53 @@
     }
   }
 
+  // deleteAllDeactivated bulk-removes every account currently flagged
+  // deactivated (quota.dead_reason set — a terminal 4XX from the quota
+  // fetcher). Guarded by a confirm that lists EVERY account by name +
+  // reason so the operator sees exactly what is about to be nuked. Deletes
+  // run sequentially via the same DELETE endpoint the single-row 🗑 uses;
+  // per-account failures are collected and reported without aborting the
+  // rest.
+  async function deleteAllDeactivated(btnEl) {
+    // Re-read from the last render so we act on the freshest known state.
+    const dead = (lastQuotaFiles || []).filter(a => a && a.quota && a.quota.dead_reason);
+    if (!dead.length) {
+      setStatus('没有 deactivated 账号需要清理', false);
+      return;
+    }
+    const lines = dead.map((a, i) => {
+      const who = a.label || a.email || a.name || a.id;
+      const reason = a.quota.dead_reason;
+      return '  ' + (i + 1) + '. ' + who + '  [' + reason + ']';
+    });
+    if (!window.confirm(
+      '删除以下 ' + dead.length + ' 个 deactivated 账号?\n\n' +
+      lines.join('\n') + '\n\n' +
+      '会把它们的认证文件从磁盘删除,立即移出池子,不可恢复。'
+    )) return;
+    const originalText = btnEl ? btnEl.textContent : '';
+    if (btnEl) { btnEl.disabled = true; }
+    let ok = 0;
+    const failed = [];
+    for (let i = 0; i < dead.length; i++) {
+      const a = dead[i];
+      if (btnEl) btnEl.textContent = '删除中… ' + (i + 1) + '/' + dead.length;
+      try {
+        await apiFetch('/v0/management/auth-files?name=' + encodeURIComponent(a.id), { method: 'DELETE' });
+        ok++;
+      } catch (err) {
+        failed.push((a.email || a.id) + ': ' + (err && err.message ? err.message : err));
+      }
+    }
+    if (failed.length) {
+      setStatus('已删除 ' + ok + '/' + dead.length + ' 个,失败 ' + failed.length + ' 个: ' + failed.join(' | '), true);
+    } else {
+      setStatus('已删除全部 ' + ok + ' 个 deactivated 账号', false);
+    }
+    if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || '🗑 Delete deactivated'; }
+    await loadAccountQuota();
+  }
+
   // Auto-release-on-429 toggle. Loads the current conductor state once
   // on connect and mirrors flips to PUT /v0/management/auto-release-429.
   // When on, an upstream 429 auto-drops that account's session bindings
@@ -3686,6 +3755,12 @@
       // /auth-files. Per-row refresh is the one that actually triggers
       // an inline fetch.
       loadAccountQuota();
+      return;
+    }
+    const deleteDead = ev.target.closest('#deleteDeadBtn');
+    if (deleteDead) {
+      ev.preventDefault();
+      deleteAllDeactivated(deleteDead);
       return;
     }
     const oneBtn = ev.target.closest('button[data-quota-refresh]');
