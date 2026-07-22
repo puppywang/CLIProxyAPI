@@ -810,7 +810,11 @@ func (e *CodexExecutor) codexDowngradeModel(ctx context.Context, auth *cliproxya
 		authID = auth.ID
 	}
 	if authID != "" && base != "" {
-		registry.GetGlobalRegistry().SuspendClientModel(authID, base, registry.ModelNotSupportedReason)
+		// Durable, self-healing flag (not SuspendClientModel): this request will
+		// be transparently downgraded and thus look like a success for `base` to
+		// the conductor — whose ResumeClientModel would immediately wipe a
+		// SuspendClientModel marker. MarkClientModelUnsupported survives that.
+		registry.GetGlobalRegistry().MarkClientModelUnsupported(authID, base)
 	}
 	helps.LogWithRequestID(ctx).Infof("codex: model %s not supported for auth %s; downgrading to %s", base, authID, helps.CodexModelBase(downgraded))
 	return downgraded

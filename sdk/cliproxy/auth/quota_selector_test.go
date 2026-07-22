@@ -627,8 +627,7 @@ func TestLeastRemainingQuotaSelector_SoftModelSupportIsolation(t *testing.T) {
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient("softiso-sol", "codex", []*registry.ModelInfo{{ID: model}})
 	reg.RegisterClient("softiso-nosol", "codex", []*registry.ModelInfo{{ID: model}})
-	reg.SuspendClientModel("softiso-nosol", model, registry.ModelNotSupportedReason)
-	defer reg.ResumeClientModel("softiso-nosol", model)
+	reg.MarkClientModelUnsupported("softiso-nosol", model)
 
 	auths := []*Auth{
 		{ID: "softiso-sol", Provider: "codex"},

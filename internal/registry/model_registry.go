@@ -131,6 +131,13 @@ type ModelRegistry struct {
 	availableModelsCache map[string]availableModelsCacheEntry
 	// hook is an optional callback sink for model registration changes
 	hook ModelRegistryHook
+	// learnedUnsupported records, per model ID, the clients that have LEARNED
+	// they cannot serve that model (upstream model_not_supported), each with an
+	// expiry. This is DELIBERATELY separate from SuspendedClients: a downgraded
+	// request looks like a success for the original model to the conductor, so
+	// its ResumeClientModel would wipe a SuspendedClients marker — but must not
+	// wipe this durable, self-healing flag. Guarded by mutex; lazily allocated.
+	learnedUnsupported map[string]map[string]time.Time
 }
 
 // Global model registry instance
@@ -754,22 +761,51 @@ func (r *ModelRegistry) ResumeClientModel(clientID, modelID string) {
 	log.Debugf("Resumed client %s for model %s", clientID, modelID)
 }
 
-// ModelNotSupportedReason is the SuspendClientModel reason recorded when an
-// account is learned to lack entitlement for a model (upstream "model is not
-// supported when using Codex with a ChatGPT account"). Set by the codex
-// executor's downgrade path and the conductor's model-support branch; queried
-// by IsClientModelUnsupported for soft, reason-scoped selection deprioritization.
+// ModelNotSupportedReason is the SuspendClientModel reason string recorded on
+// the model-support branch (upstream "model is not supported when using Codex
+// with a ChatGPT account"). Kept for the cooldown-panel display / diagnostics;
+// the durable soft-isolation flag lives in learnedUnsupported (see below), not
+// in SuspendedClients.
 const ModelNotSupportedReason = "model_not_supported"
 
-// IsClientModelUnsupported reports whether the client carries a
-// model_not_supported marker for modelID specifically — i.e. it has LEARNED it
-// lacks entitlement for this model (durable), as distinct from a transient
-// quota/auth suspension. Selection uses this to softly DEPRIORITIZE such
-// accounts for that model (prefer accounts that can serve it) WITHOUT
-// hard-excluding them, so they remain a downgrade-eligible fallback and
-// priority fall-through is unaffected. Reason-scoped on purpose: gating
-// candidacy on the generic (any-reason) suspension marker previously excluded
-// accounts that had merely hit a transient 429, which broke fall-through.
+// learnedUnsupportedTTL bounds how long a learned model_not_supported flag
+// stays in effect before the account is retried for that model. Matches the
+// conductor's 12h model-support cooldown. Long enough to be a stable routing
+// preference; short enough that an account which later gains entitlement
+// recovers on its own.
+const learnedUnsupportedTTL = 12 * time.Hour
+
+// MarkClientModelUnsupported records that clientID has LEARNED it cannot serve
+// modelID (upstream model_not_supported), with a TTL. Unlike SuspendClientModel
+// this flag is NOT cleared by ResumeClientModel — so a request that the
+// executor transparently downgrades (and which therefore looks like a success
+// for the original model to the conductor, triggering ResumeClientModel) does
+// not wipe it. It self-heals after the TTL so an account that later gains
+// entitlement is retried.
+func (r *ModelRegistry) MarkClientModelUnsupported(clientID, modelID string) {
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
+	if clientID == "" || modelID == "" {
+		return
+	}
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	if r.learnedUnsupported == nil {
+		r.learnedUnsupported = make(map[string]map[string]time.Time)
+	}
+	byClient := r.learnedUnsupported[modelID]
+	if byClient == nil {
+		byClient = make(map[string]time.Time)
+		r.learnedUnsupported[modelID] = byClient
+	}
+	byClient[clientID] = time.Now().Add(learnedUnsupportedTTL)
+}
+
+// IsClientModelUnsupported reports whether clientID has a non-expired
+// model_not_supported flag for modelID (see MarkClientModelUnsupported).
+// Selection uses this to softly DEPRIORITIZE such accounts for that model
+// (prefer accounts that can serve it) WITHOUT hard-excluding them, so they
+// remain a downgrade-eligible fallback and priority fall-through is unaffected.
 func (r *ModelRegistry) IsClientModelUnsupported(clientID, modelID string) bool {
 	clientID = strings.TrimSpace(clientID)
 	modelID = strings.TrimSpace(modelID)
@@ -777,13 +813,24 @@ func (r *ModelRegistry) IsClientModelUnsupported(clientID, modelID string) bool 
 		return false
 	}
 	r.mutex.RLock()
-	defer r.mutex.RUnlock()
-	registration, exists := r.models[modelID]
-	if !exists || registration == nil || registration.SuspendedClients == nil {
+	expiry, ok := r.learnedUnsupported[modelID][clientID]
+	r.mutex.RUnlock()
+	if !ok {
 		return false
 	}
-	reason, ok := registration.SuspendedClients[clientID]
-	return ok && reason == ModelNotSupportedReason
+	if time.Now().After(expiry) {
+		// Expired — drop it lazily under the write lock (re-checking so we do
+		// not race a concurrent re-mark).
+		r.mutex.Lock()
+		if byClient := r.learnedUnsupported[modelID]; byClient != nil {
+			if exp, still := byClient[clientID]; still && time.Now().After(exp) {
+				delete(byClient, clientID)
+			}
+		}
+		r.mutex.Unlock()
+		return false
+	}
+	return true
 }
 
 // IsClientModelSuspended reports whether the client currently carries a
