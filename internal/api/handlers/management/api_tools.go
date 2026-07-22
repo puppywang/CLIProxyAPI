@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -142,8 +143,35 @@ func (h *Handler) APICall(c *gin.Context) {
 	var token string
 	var tokenResolved bool
 	var tokenErr error
+	// Agent-identity (K12 / ed-token) codex accounts have no bearer access
+	// token — they authenticate with a per-request ed25519 assertion. Build it
+	// once and use it wherever the caller's template expects $TOKEN$, so the
+	// management quota / recharge tools work for these accounts too instead of
+	// failing the $TOKEN$ substitution with "auth token not found".
+	agentIdentity := auth != nil && codexauth.IsAgentIdentityMetadata(auth.Metadata)
+	var agentAssertion string
+	if agentIdentity {
+		assertion, errAssert := codexauth.AgentAssertionFromMetadata(auth.Metadata, time.Now())
+		if errAssert != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "agent identity assertion failed: " + errAssert.Error()})
+			return
+		}
+		agentAssertion = assertion
+	}
 	for key, value := range reqHeaders {
 		if !strings.Contains(value, "$TOKEN$") {
+			continue
+		}
+		if agentIdentity {
+			// The assertion carries its own "AgentAssertion" scheme, so replace
+			// the whole Authorization value rather than splicing into a
+			// "Bearer $TOKEN$" template; any other header gets a plain
+			// substitution.
+			if strings.EqualFold(strings.TrimSpace(key), "Authorization") {
+				reqHeaders[key] = agentAssertion
+			} else {
+				reqHeaders[key] = strings.ReplaceAll(value, "$TOKEN$", agentAssertion)
+			}
 			continue
 		}
 		if !tokenResolved {
@@ -162,6 +190,13 @@ func (h *Handler) APICall(c *gin.Context) {
 			continue
 		}
 		reqHeaders[key] = strings.ReplaceAll(value, "$TOKEN$", token)
+	}
+	// chatgpt.com endpoints (wham/usage, billing) key on the account header;
+	// inject it for agent-identity calls when the caller's template did not.
+	if agentIdentity {
+		if accountID := agentIdentityAccountID(auth); accountID != "" && !hasHeaderFold(reqHeaders, "Chatgpt-Account-Id") {
+			reqHeaders["Chatgpt-Account-Id"] = accountID
+		}
 	}
 
 	var requestBody io.Reader
@@ -246,6 +281,32 @@ func tokenValueForAuth(auth *coreauth.Auth) string {
 		}
 	}
 	return ""
+}
+
+// agentIdentityAccountID returns the ChatGPT account id for an agent-identity
+// auth, used for the Chatgpt-Account-Id header on chatgpt.com calls.
+func agentIdentityAccountID(auth *coreauth.Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	for _, key := range []string{"account_id", "chatgpt_account_id"} {
+		if v, ok := auth.Metadata[key].(string); ok {
+			if v = strings.TrimSpace(v); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// hasHeaderFold reports whether headers already contains name (case-insensitive).
+func hasHeaderFold(headers map[string]string, name string) bool {
+	for k := range headers {
+		if strings.EqualFold(strings.TrimSpace(k), name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth) (string, error) {
