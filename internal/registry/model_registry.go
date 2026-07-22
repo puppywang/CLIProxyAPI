@@ -754,12 +754,42 @@ func (r *ModelRegistry) ResumeClientModel(clientID, modelID string) {
 	log.Debugf("Resumed client %s for model %s", clientID, modelID)
 }
 
+// ModelNotSupportedReason is the SuspendClientModel reason recorded when an
+// account is learned to lack entitlement for a model (upstream "model is not
+// supported when using Codex with a ChatGPT account"). Set by the codex
+// executor's downgrade path and the conductor's model-support branch; queried
+// by IsClientModelUnsupported for soft, reason-scoped selection deprioritization.
+const ModelNotSupportedReason = "model_not_supported"
+
+// IsClientModelUnsupported reports whether the client carries a
+// model_not_supported marker for modelID specifically — i.e. it has LEARNED it
+// lacks entitlement for this model (durable), as distinct from a transient
+// quota/auth suspension. Selection uses this to softly DEPRIORITIZE such
+// accounts for that model (prefer accounts that can serve it) WITHOUT
+// hard-excluding them, so they remain a downgrade-eligible fallback and
+// priority fall-through is unaffected. Reason-scoped on purpose: gating
+// candidacy on the generic (any-reason) suspension marker previously excluded
+// accounts that had merely hit a transient 429, which broke fall-through.
+func (r *ModelRegistry) IsClientModelUnsupported(clientID, modelID string) bool {
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
+	if clientID == "" || modelID == "" {
+		return false
+	}
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	registration, exists := r.models[modelID]
+	if !exists || registration == nil || registration.SuspendedClients == nil {
+		return false
+	}
+	reason, ok := registration.SuspendedClients[clientID]
+	return ok && reason == ModelNotSupportedReason
+}
+
 // IsClientModelSuspended reports whether the client currently carries a
-// SuspendClientModel marker for modelID. Selection consults this so an account
-// learned to be unentitled for a model (e.g. gpt-5.6-sol on a ChatGPT account
-// that returned "model is not supported") is excluded as a candidate for that
-// model. This marker lives only in the registration (not on the Auth's
-// ModelState), so ClearCooldown — which resets ModelStates — does not wipe it.
+// SuspendClientModel marker for modelID (any reason). NOTE: not used to gate
+// selection candidacy — see IsClientModelUnsupported for why. Retained for
+// diagnostics / potential callers.
 func (r *ModelRegistry) IsClientModelSuspended(clientID, modelID string) bool {
 	clientID = strings.TrimSpace(clientID)
 	modelID = strings.TrimSpace(modelID)

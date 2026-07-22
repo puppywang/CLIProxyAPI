@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -610,5 +611,58 @@ func TestCodexAuthPriority_ReadsBothSources(t *testing.T) {
 		if got := codexAuthPriority(tc.auth); got != tc.want {
 			t.Errorf("%s: codexAuthPriority = %d, want %d", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestLeastRemainingQuotaSelector_SoftModelSupportIsolation verifies the soft
+// isolation for a model that some accounts have learned they cannot serve
+// (registry model_not_supported marker): the selector prefers a sol-capable
+// account for a sol request, but falls back to the learned-unsupported account
+// (which the executor downgrades) when no capable account is usable — instead
+// of stranding the request. This is the safe replacement for the reverted hard
+// candidacy gate (b8fbab1e), and it must NOT strand.
+func TestLeastRemainingQuotaSelector_SoftModelSupportIsolation(t *testing.T) {
+	// Not parallel: mutates the process-global model registry.
+	const model = "gpt-test-softiso"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("softiso-sol", "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient("softiso-nosol", "codex", []*registry.ModelInfo{{ID: model}})
+	reg.SuspendClientModel("softiso-nosol", model, registry.ModelNotSupportedReason)
+	defer reg.ResumeClientModel("softiso-nosol", model)
+
+	auths := []*Auth{
+		{ID: "softiso-sol", Provider: "codex"},
+		{ID: "softiso-nosol", Provider: "codex"},
+	}
+	selector := NewLeastRemainingQuotaSelector(LeastRemainingQuotaConfig{
+		Inner:   &RoundRobinSelector{cursors: map[string]int{"codex:" + model: 0}},
+		Fetcher: newFakeQuotaFetcher(nil),
+		TTL:     time.Minute,
+		Async:   true,
+	})
+	// The no-sol account is FRESHER (1%) than the sol account (30%). Soft
+	// isolation must still prefer the sol-capable account for a sol request.
+	selector.PushSnapshot("softiso-sol", QuotaSnapshot{UsedPercentPrimary: 30, UsedPercentSecondary: 10})
+	selector.PushSnapshot("softiso-nosol", QuotaSnapshot{UsedPercentPrimary: 1, UsedPercentSecondary: 1})
+
+	for i := 0; i < 5; i++ {
+		got, err := selector.Pick(context.Background(), "codex", model, cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("pick %d error: %v", i, err)
+		}
+		if got == nil || got.ID != "softiso-sol" {
+			t.Fatalf("pick %d = %v, want softiso-sol (capable preferred over fresher no-sol)", i, got)
+		}
+	}
+
+	// Exhaust the sol-capable account -> must fall back to the no-sol account
+	// (the executor will downgrade it), NOT strand the request.
+	selector.PushSnapshot("softiso-sol", QuotaSnapshot{UsedPercentPrimary: 0, LimitReached: true})
+	got, err := selector.Pick(context.Background(), "codex", model, cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("fallback pick error: %v", err)
+	}
+	if got == nil || got.ID != "softiso-nosol" {
+		t.Fatalf("fallback pick = %v, want softiso-nosol (no usable sol-capable account -> downgrade fallback)", got)
 	}
 }

@@ -12,6 +12,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -413,25 +414,62 @@ func (s *LeastRemainingQuotaSelector) Pick(ctx context.Context, provider, model 
 	// by hand. Non-codex auths always pass through (priority is a
 	// codex-quota concept). When no priority is set anywhere every codex
 	// auth shares level 0 and this is a no-op.
-	gated := s.gateByPriority(auths, model, now)
+	// Soft model-support isolation (unbound path only — a bound session is
+	// served by the affinity layer before it reaches here). For a model some
+	// accounts have LEARNED they cannot serve (durable registry
+	// model_not_supported marker, e.g. gpt-5.6-sol on a ChatGPT account that
+	// lacks it), prefer accounts that CAN serve it. The learned-unsupported
+	// ones stay selectable as a fallback (the executor downgrades them, e.g.
+	// sol->terra) but only when no supporting account is usable. Reason-scoped
+	// to model_not_supported — NEVER the generic suspension marker — so a
+	// transient 429/401 account is not split out here, and priority
+	// fall-through within each phase is intact.
+	capable, unsupported := s.splitByModelSupport(auths, model)
+	if len(capable) > 0 && len(unsupported) > 0 {
+		picked, errCap := s.selectFromPool(ctx, provider, model, opts, capable, now, entry, false)
+		if errCap != nil {
+			return nil, errCap
+		}
+		if picked != nil {
+			return picked, nil
+		}
+		entry.Infof("quota-selector: no usable %s-capable account (pool=%d); falling back to downgrade-eligible pool (%d) | provider=%s", model, len(capable), len(unsupported), provider)
+		picked, errUns := s.selectFromPool(ctx, provider, model, opts, unsupported, now, entry, false)
+		if errUns != nil {
+			return nil, errUns
+		}
+		if picked != nil {
+			return picked, nil
+		}
+		// Neither pool has a usable tier — fall through to the last-ditch
+		// selection over the full candidate list (original behaviour).
+	}
+	return s.selectFromPool(ctx, provider, model, opts, auths, now, entry, true)
+}
+
+// selectFromPool runs the priority gate + quota partition + inner selection
+// over one candidate pool. allowExhaustedFallback controls the "everything is
+// exhausted" tail: when true it mirrors the original last-ditch behaviour (let
+// the inner selector try the whole pool anyway — one of the exhausted accounts
+// may still serve a turn, and refusing would force a 503 when the request could
+// still succeed); when false it returns (nil, nil) so a caller running a
+// multi-pool preference (see Pick) can move on to the next pool instead of
+// force-picking an exhausted account.
+func (s *LeastRemainingQuotaSelector) selectFromPool(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, poolAuths []*Auth, now time.Time, entry *log.Entry, allowExhaustedFallback bool) (*Auth, error) {
+	gated := s.gateByPriority(poolAuths, model, now)
 	healthy, stressed, excluded := s.partitionByQuota(gated, model, now)
 
-	// Pick from the healthiest tier that has any candidates. Falling
-	// back to the stressed tier (50-89% used) before draining the
-	// healthy tier matches the operator intent: prefer the freshest
-	// credentials for new bindings, only reach into the half-spent
-	// ones when no fresh accounts remain.
+	// Pick from the healthiest tier that has any candidates. Falling back to
+	// the stressed tier (50-89% used) before draining the healthy tier matches
+	// the operator intent: prefer the freshest credentials for new bindings,
+	// only reach into the half-spent ones when no fresh accounts remain.
 	pool := healthy
 	tier := "healthy"
-	// Adaptive floor. With a small candidate set the hard 50%-used tier
-	// gate can strand capacity: one fresh account soaks up every new
-	// binding while a half-spent sibling sits idle (the operator-reported
-	// 2-account case — a 9%-used account got all traffic while an
-	// 80%-used one was never picked). When the healthy tier has fewer
-	// than the floor, promote the least-5h-used stressed accounts to fill
-	// it so the inner score-based selector can spread across both. With a
-	// large healthy tier (>= floor) this never fires and the original
-	// "reserve half-spent accounts" behaviour is preserved.
+	// Adaptive floor: with a small candidate set the hard 50%-used tier gate
+	// can strand capacity (a 9%-used account soaks up all traffic while an
+	// 80%-used sibling sits idle). When healthy has fewer than the floor,
+	// promote the least-5h-used stressed accounts so the inner selector can
+	// spread across both. With a large healthy tier this never fires.
 	if len(pool) < quotaSelectorHealthyFloor && len(stressed) > 0 {
 		promoted := promoteLeastUsedStressed(stressed, quotaSelectorHealthyFloor-len(pool), now, s.cache)
 		if len(promoted) > 0 {
@@ -444,13 +482,11 @@ func (s *LeastRemainingQuotaSelector) Pick(ctx context.Context, provider, model 
 		tier = "stressed"
 	}
 	if len(pool) == 0 {
-		// Every codex credential is at or above UnhealthyUsedPercent
-		// (or limit_reached). Let the inner selector pick from the
-		// original list anyway — at least one of these accounts may
-		// still serve a turn, and refusing here would force a 503
-		// when the request could still succeed.
+		if !allowExhaustedFallback {
+			return nil, nil
+		}
 		entry.Warnf("quota-selector: no healthy candidates | excluded=%d provider=%s model=%s", excluded, provider, model)
-		return s.inner.Pick(ctx, provider, model, opts, auths)
+		return s.inner.Pick(ctx, provider, model, opts, poolAuths)
 	}
 
 	picked, errInner := s.inner.Pick(ctx, provider, model, opts, pool)
@@ -469,6 +505,32 @@ func (s *LeastRemainingQuotaSelector) Pick(ctx context.Context, provider, model 
 			picked.ID, tier, codexAuthPriority(picked), len(pool), excluded, provider, model)
 	}
 	return picked, nil
+}
+
+// splitByModelSupport partitions the candidate auths by whether a codex account
+// has LEARNED it cannot serve `model` (durable registry model_not_supported
+// marker). Non-codex auths and unmarked codex auths go to capable; marked codex
+// auths go to unsupported. Reason-scoped: only the model_not_supported marker
+// moves an account to unsupported — a transient quota/401 suspension does NOT
+// (that is handled by the ModelState-driven partition, which recovers on
+// cooldown), so this never breaks priority fall-through.
+func (s *LeastRemainingQuotaSelector) splitByModelSupport(auths []*Auth, model string) (capable, unsupported []*Auth) {
+	reg := registry.GetGlobalRegistry()
+	modelKey := canonicalModelKey(model)
+	if reg == nil || modelKey == "" {
+		return auths, nil
+	}
+	for _, a := range auths {
+		if a == nil {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(a.Provider), "codex") && reg.IsClientModelUnsupported(a.ID, modelKey) {
+			unsupported = append(unsupported, a)
+			continue
+		}
+		capable = append(capable, a)
+	}
+	return capable, unsupported
 }
 
 // partitionByQuota splits the inbound auth list into three groups based
