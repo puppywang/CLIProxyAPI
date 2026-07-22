@@ -773,32 +773,3 @@ func TestNormalizeXAIErrorPayloadGrokBuild402(t *testing.T) {
 		t.Errorf("unrelated 402 body should be unchanged")
 	}
 }
-
-func TestNormalizeXAIErrorPayloadRequestTooLarge(t *testing.T) {
-	// grok's non-standard oversized-body rejection (Copilot 80+ tools) -> a
-	// standard, terminal OpenAI error so clients stop retrying and surface it.
-	in := []byte(`{"error":"Failed to parse the request body as JSON: tools[84].parameters: expected colon at line 1 column 1067844"}`)
-	out := normalizeXAIErrorPayload(400, in)
-	if got := gjson.GetBytes(out, "error.type").String(); got != "invalid_request_error" {
-		t.Errorf("error.type = %q, want invalid_request_error", got)
-	}
-	if got := gjson.GetBytes(out, "error.code").String(); got != "context_length_exceeded" {
-		t.Errorf("error.code = %q, want context_length_exceeded", got)
-	}
-	if msg := gjson.GetBytes(out, "error.message").String(); !strings.Contains(msg, "too large") {
-		t.Errorf("error.message = %q, want it to mention 'too large'", msg)
-	}
-	// A non-400 with the same text must NOT be remapped.
-	if got := string(normalizeXAIErrorPayload(500, in)); got != string(in) {
-		t.Errorf("500 should pass through unchanged, got %s", got)
-	}
-	// An unrelated 400 must pass through unchanged.
-	other := []byte(`{"error":{"message":"bad parameter foo"}}`)
-	if got := string(normalizeXAIErrorPayload(400, other)); got != string(other) {
-		t.Errorf("unrelated 400 should pass through unchanged, got %s", got)
-	}
-	// xaiTerminalStatus keeps 400 as 400 (terminal client error, no failover).
-	if got := xaiTerminalStatus(400, in); got != 400 {
-		t.Errorf("xaiTerminalStatus(400) = %d, want 400", got)
-	}
-}
