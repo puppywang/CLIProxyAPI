@@ -985,26 +985,22 @@ func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, au
 	if routeKey == "" {
 		return true
 	}
-	// Exclude accounts learned to be unentitled for this model (durable
-	// SuspendClientModel marker set when a model_not_supported response was
-	// downgraded). This keeps e.g. gpt-5.6-sol traffic off ChatGPT accounts
-	// that lack sol and routes it to accounts that actually have it. The
-	// marker lives in the registry (not on the ModelState), so ClearCooldown
-	// does not wipe it.
-	if registryRef.IsClientModelSuspended(auth.ID, routeKey) {
-		return false
-	}
+	// NOTE: do NOT gate candidacy on registry.IsClientModelSuspended here.
+	// SuspendClientModel is set for transient reasons too (quota/401/402/404),
+	// and that registry marker is not cleared the moment a 429 cooldown ends
+	// (only the per-model ModelState recovers). Consulting it here excluded
+	// accounts from candidacy long after they became usable again, which broke
+	// priority fall-through: when the high-priority accounts 429'd, the
+	// lower-priority ones were still registry-suspended from earlier 429s, so
+	// no fall-through happened. Transient unavailability is handled downstream
+	// by the selector (partitionByQuota / isExcludedNow via ModelState), and
+	// per-account model-entitlement (e.g. gpt-5.6-sol) is handled reactively by
+	// the executor's sol->terra downgrade — neither needs a candidacy gate here.
 	if registryRef.ClientSupportsModel(auth.ID, routeKey) {
 		return true
 	}
 	selectionKey := m.selectionModelKeyForAuth(auth, routeModel)
-	if selectionKey == "" || selectionKey == routeKey {
-		return false
-	}
-	if registryRef.IsClientModelSuspended(auth.ID, selectionKey) {
-		return false
-	}
-	return registryRef.ClientSupportsModel(auth.ID, selectionKey)
+	return selectionKey != "" && selectionKey != routeKey && registryRef.ClientSupportsModel(auth.ID, selectionKey)
 }
 
 func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
