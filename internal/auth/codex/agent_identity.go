@@ -102,5 +102,12 @@ func AgentAssertionFromMetadata(meta map[string]any, now time.Time) (string, err
 	if err != nil {
 		return "", err
 	}
-	return BuildAgentAssertion(str("agent_runtime_id"), str("task_id"), priv, now)
+	runtimeID := str("agent_runtime_id")
+	taskID := str("task_id")
+	// A run task that was re-registered after an invalid_task_id 401 supersedes
+	// the (now stale) on-disk task_id for the lifetime of the process.
+	if recovered := recoveredTaskID(runtimeID); recovered != "" {
+		taskID = recovered
+	}
+	return BuildAgentAssertion(runtimeID, taskID, priv, now)
 }

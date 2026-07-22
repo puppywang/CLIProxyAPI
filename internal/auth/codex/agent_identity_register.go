@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/curve25519"
@@ -359,4 +360,118 @@ func truncateForError(payload []byte, max int) string {
 		return string(payload)
 	}
 	return string(payload[:max]) + "..."
+}
+
+// --- Ephemeral run-task auto-recovery ---
+//
+// Agent-identity run tasks (task_id) are ephemeral and expire; upstream then
+// returns 401 invalid_task_id. The credential itself is fine — only the task
+// must be re-registered. We cache the re-registered id by agent_runtime_id so
+// every subsequent assertion (executor requests AND the quota fetcher, both via
+// AgentAssertionFromMetadata) uses it without rewriting the on-disk task_id or
+// re-registering per request. Session-scoped: the cache is lost on restart and
+// re-learned on the next 401.
+
+var (
+	recoveredAgentTasks sync.Map // runtimeID(string) -> taskID(string)
+	agentTaskLocks      sync.Map // runtimeID(string) -> *sync.Mutex
+)
+
+func metaString(meta map[string]any, key string) string {
+	if meta == nil {
+		return ""
+	}
+	if v, ok := meta[key].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+// SetRecoveredTaskID records a freshly re-registered task id for a runtime.
+func SetRecoveredTaskID(runtimeID, taskID string) {
+	runtimeID = strings.TrimSpace(runtimeID)
+	taskID = strings.TrimSpace(taskID)
+	if runtimeID == "" || taskID == "" {
+		return
+	}
+	recoveredAgentTasks.Store(runtimeID, taskID)
+}
+
+func recoveredTaskID(runtimeID string) string {
+	runtimeID = strings.TrimSpace(runtimeID)
+	if runtimeID == "" {
+		return ""
+	}
+	if v, ok := recoveredAgentTasks.Load(runtimeID); ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// CurrentTaskID returns the effective task id for the credential: the recovered
+// (cached) id when present, otherwise the id stored in metadata.
+func CurrentTaskID(meta map[string]any) string {
+	if c := recoveredTaskID(metaString(meta, "agent_runtime_id")); c != "" {
+		return c
+	}
+	return metaString(meta, "task_id")
+}
+
+// IsTaskInvalidResponse reports whether an upstream response indicates the run
+// task id is invalid/expired (a recoverable 401 — re-register the task, do NOT
+// treat the credential as dead). Mirrors sub2api
+// isAgentIdentityTaskInvalidHTTPResponse.
+func IsTaskInvalidResponse(status int, body []byte) bool {
+	if status != http.StatusUnauthorized {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	compact := strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "").Replace(lower)
+	for _, m := range []string{`"code":"invalid_task_id"`, `"code":"task_not_found"`, `"code":"task_expired"`, `"error":"invalid_task_id"`} {
+		if strings.Contains(compact, m) {
+			return true
+		}
+	}
+	for _, m := range []string{"invalid task_id", "invalid task id", "task_id is invalid", "task id is invalid", "task not found", "task expired", "unknown task_id", "unknown task id"} {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// RecoverAgentTask re-registers the run task after an invalid_task_id response
+// and caches the new id. expectedTaskID is the (stale) id the failing request
+// used; if another goroutine already recovered a newer id this returns it
+// without re-registering. Serialized per runtime to avoid a stampede when many
+// in-flight requests fail at once.
+func RecoverAgentTask(ctx context.Context, client *http.Client, baseURL string, meta map[string]any, expectedTaskID string, now time.Time) (string, error) {
+	runtimeID := metaString(meta, "agent_runtime_id")
+	if runtimeID == "" {
+		return "", errors.New("codex agent identity: runtime id is missing")
+	}
+	priv, err := ParseAgentPrivateKey(metaString(meta, "agent_private_key"))
+	if err != nil {
+		return "", err
+	}
+	muAny, _ := agentTaskLocks.LoadOrStore(runtimeID, &sync.Mutex{})
+	if mu, ok := muAny.(*sync.Mutex); ok && mu != nil {
+		mu.Lock()
+		defer mu.Unlock()
+	}
+	// Another goroutine may have recovered a fresh id while we waited on the lock.
+	if cur := recoveredTaskID(runtimeID); cur != "" && cur != strings.TrimSpace(expectedTaskID) {
+		return cur, nil
+	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = AgentIdentityAuthAPIBaseURL
+	}
+	newTaskID, err := RegisterAgentTask(ctx, client, baseURL, runtimeID, priv, now)
+	if err != nil {
+		return "", err
+	}
+	SetRecoveredTaskID(runtimeID, newTaskID)
+	return newTaskID, nil
 }

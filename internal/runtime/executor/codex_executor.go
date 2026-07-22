@@ -816,6 +816,50 @@ func (e *CodexExecutor) codexDowngradeModel(ctx context.Context, auth *cliproxya
 	return downgraded
 }
 
+// codexTaskRecoveredCtxKey caps agent-identity task re-registration at one hop
+// per request.
+type codexTaskRecoveredCtxKey struct{}
+
+func codexTaskRecovered(ctx context.Context) bool {
+	recovered, _ := ctx.Value(codexTaskRecoveredCtxKey{}).(bool)
+	return recovered
+}
+
+func markCodexTaskRecovered(ctx context.Context) context.Context {
+	return context.WithValue(ctx, codexTaskRecoveredCtxKey{}, true)
+}
+
+// codexRecoverAgentTask handles an upstream invalid_task_id 401 for an
+// agent-identity credential. Agent run tasks are ephemeral: the credential is
+// still valid, only the task_id expired. It re-registers the task (caching the
+// new id so the retry — and every later request/quota fetch via
+// AgentAssertionFromMetadata — signs with it) and reports whether the caller
+// should retry. Because a successful retry returns 200, the conductor never
+// sees the 401 and does not apply its 30-minute "unauthorized" cooldown.
+// Returns false when not applicable (not agent identity, not a task-invalid
+// error, already recovered once this request, or re-registration failed).
+func (e *CodexExecutor) codexRecoverAgentTask(ctx context.Context, auth *cliproxyauth.Auth, status int, body []byte) bool {
+	if codexTaskRecovered(ctx) {
+		return false
+	}
+	if auth == nil || !codexauth.IsAgentIdentityMetadata(auth.Metadata) {
+		return false
+	}
+	if !codexauth.IsTaskInvalidResponse(status, body) {
+		return false
+	}
+	expected := codexauth.CurrentTaskID(auth.Metadata)
+	// A timeout is permitted here — this is credential (run-task) acquisition,
+	// not steady-state request traffic.
+	client := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 30*time.Second)
+	if _, errRecover := codexauth.RecoverAgentTask(ctx, client, codexauth.AgentIdentityAuthAPIBaseURL, auth.Metadata, expected, time.Now()); errRecover != nil {
+		helps.LogWithRequestID(ctx).Warnf("codex: agent task recovery failed for auth %s: %v", auth.ID, errRecover)
+		return false
+	}
+	helps.LogWithRequestID(ctx).Infof("codex: re-registered expired agent task for auth %s; retrying", auth.ID)
+	return true
+}
+
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
@@ -913,6 +957,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			retryReq := req
 			retryReq.Model = dm
 			return e.Execute(markCodexDowngradeApplied(ctx), auth, retryReq, opts)
+		}
+		if e.codexRecoverAgentTask(ctx, auth, httpResp.StatusCode, b) {
+			return e.Execute(markCodexTaskRecovered(ctx), auth, req, opts)
 		}
 		err = newCodexStatusErr(httpResp.StatusCode, b)
 		return resp, err
@@ -1085,6 +1132,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 			retryReq.Model = dm
 			return e.executeCompact(markCodexDowngradeApplied(ctx), auth, retryReq, opts)
 		}
+		if e.codexRecoverAgentTask(ctx, auth, httpResp.StatusCode, b) {
+			return e.executeCompact(markCodexTaskRecovered(ctx), auth, req, opts)
+		}
 		err = newCodexStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
@@ -1203,6 +1253,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			retryReq := req
 			retryReq.Model = dm
 			return e.ExecuteStream(markCodexDowngradeApplied(ctx), auth, retryReq, opts)
+		}
+		if e.codexRecoverAgentTask(ctx, auth, httpResp.StatusCode, data) {
+			return e.ExecuteStream(markCodexTaskRecovered(ctx), auth, req, opts)
 		}
 		err = newCodexStatusErr(httpResp.StatusCode, data)
 		return nil, err
