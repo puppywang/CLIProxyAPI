@@ -972,6 +972,19 @@
     resize: vertical;
     min-height: 100px;
   }
+  .ra-field {
+    width: 100%;
+    box-sizing: border-box;
+    background: #0f1114;
+    color: rgba(255,255,255,0.9);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 4px;
+    padding: 8px 12px;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 12px;
+    margin-bottom: 6px;
+  }
+  textarea.ra-field { resize: vertical; min-height: 72px; }
   #ciEmails:focus {
     outline: none;
     border-color: rgba(127,212,212,0.5);
@@ -1311,6 +1324,7 @@
     <summary>
       Account quota — Codex &amp; Grok (<span id="quotaCount">0</span>)
       <button type="button" id="quotaRefreshAllBtn" class="quota-refresh-all" title="Refresh every codex account's wham/usage snapshot now">Refresh all</button>
+      <button type="button" id="registerAgentBtn" class="quota-refresh-all" title="Import an account from a one-time access_token via Agent Identity — no refresh_token / SMS code needed">+ Import via token</button>
       <label class="auto-release-429-toggle" title="When on, an upstream 429 or 402 (deactivated workspace / billing) auto-releases that account's session bindings and converts the error into a 500 so the client retries onto a fresh account — transparent failover with no client-side fork">
         <input type="checkbox" id="autoRelease429Checkbox">
         <span>Auto-release on 429/402</span>
@@ -1415,6 +1429,39 @@
     <div class="ci-actions">
       <button type="button" class="ci-btn ci-btn-secondary" id="ciCancelBtn">Cancel</button>
       <button type="button" class="ci-btn ci-btn-primary" id="ciSendBtn">Send invite</button>
+    </div>
+  </div>
+</div>
+
+<!-- Import-account (Agent Identity) modal. Registers an account from a
+     one-time access_token via POST /v0/management/auth-files/register-agent-identity.
+     Lives in the monitor UI (not CPA's upstream management.html) to avoid merge churn. -->
+<div id="registerAgentModal" class="ci-overlay" hidden>
+  <div class="ci-modal" role="dialog" aria-modal="true" aria-labelledby="raTitle">
+    <div class="ci-header">
+      <div class="ci-title" id="raTitle">Import account via Agent Identity</div>
+      <button type="button" class="ci-close" id="raCloseBtn" title="Close (Esc)">×</button>
+    </div>
+    <div class="ci-rules-warn">
+      One-time access_token → permanent ed25519 credential (no refresh_token, no SMS code).
+      The token is sent once to register and is <b>not stored</b>. Register each account only once.
+    </div>
+    <label class="ci-label" for="raToken">Access token
+      <span class="ci-hint">from the account's /auth/session · used once, never saved</span>
+    </label>
+    <textarea id="raToken" class="ra-field" rows="4" spellcheck="false" placeholder="eyJhbGci…"></textarea>
+    <label class="ci-label" for="raProxy">Proxy URL
+      <span class="ci-hint">the account's egress — same IP it will chat from</span>
+    </label>
+    <input type="text" id="raProxy" class="ra-field" spellcheck="false" placeholder="socks5://10.129.150.14:10146">
+    <label class="ci-label" for="raPlan">Plan type
+      <span class="ci-hint">optional · auto-detected from the token when blank</span>
+    </label>
+    <input type="text" id="raPlan" class="ra-field" spellcheck="false" placeholder="(auto)">
+    <div class="ci-result" id="raResult" hidden style="white-space:pre-wrap"></div>
+    <div class="ci-actions">
+      <button type="button" class="ci-btn ci-btn-secondary" id="raCancelBtn">Cancel</button>
+      <button type="button" class="ci-btn ci-btn-primary" id="raSubmitBtn">Register</button>
     </div>
   </div>
 </div>
@@ -3456,6 +3503,61 @@
     } catch (_) {}
     openCodexInviteModal(authID, label, btnEl);
   }
+
+  // ---- Import account via Agent Identity (register-agent-identity) ----
+  // Self-contained: its own open/close/submit + delegated listeners, so it
+  // touches none of the existing handlers. Calls the management endpoint via
+  // apiFetch (browser -> /v0/management with the operator's key).
+  function openRegisterAgentModal() {
+    $('raToken').value = '';
+    $('raProxy').value = '';
+    $('raPlan').value = '';
+    const r = $('raResult'); r.hidden = true; r.className = 'ci-result'; r.textContent = '';
+    $('raSubmitBtn').disabled = false;
+    $('registerAgentModal').hidden = false;
+    setTimeout(() => { try { $('raToken').focus(); } catch (_) {} }, 0);
+  }
+  function closeRegisterAgentModal() { $('registerAgentModal').hidden = true; }
+  async function submitRegisterAgent() {
+    const token = $('raToken').value.trim();
+    const proxy = $('raProxy').value.trim();
+    const plan = $('raPlan').value.trim();
+    const r = $('raResult');
+    if (!token) { r.hidden = false; r.className = 'ci-result fail'; r.textContent = 'Access token is required.'; return; }
+    const btn = $('raSubmitBtn'); btn.disabled = true;
+    r.hidden = false; r.className = 'ci-result'; r.textContent = 'Registering… (one upstream round-trip)';
+    try {
+      const body = { access_token: token, harness_id: 'codex-cli' };
+      if (proxy) body.proxy_url = proxy;
+      if (plan) body.plan_type = plan;
+      const res = await apiFetch('/v0/management/auth-files/register-agent-identity', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      r.className = 'ci-result ok';
+      r.textContent = 'OK — ' + (data.email || '(unknown)') +
+        '\nfile: ' + (data.file || '') +
+        '\nagent_runtime_id: ' + (data.agent_runtime_id || '') +
+        '\nplan: ' + (data.plan_type || '(auto)');
+      $('raToken').value = ''; // scrub the token from the field on success
+      try { loadAccountQuota(); } catch (_) {}
+    } catch (e) {
+      r.className = 'ci-result fail';
+      r.textContent = String((e && e.message) || e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  document.addEventListener('click', (ev) => {
+    if (ev.target.id === 'registerAgentBtn') { ev.preventDefault(); openRegisterAgentModal(); return; }
+    if (ev.target.id === 'raSubmitBtn') { ev.preventDefault(); submitRegisterAgent(); return; }
+    if (ev.target.id === 'raCancelBtn' || ev.target.id === 'raCloseBtn' || ev.target.id === 'registerAgentModal') {
+      ev.preventDefault(); closeRegisterAgentModal();
+    }
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && $('registerAgentModal') && !$('registerAgentModal').hidden) { closeRegisterAgentModal(); }
+  });
 
   // Wire the modal's controls once on first interaction. Defers DOM
   // lookups so they survive the modal not yet being parsed when this
