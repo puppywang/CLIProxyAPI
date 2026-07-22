@@ -124,6 +124,12 @@ func (h *Handler) RegisterAgentIdentity(c *gin.Context) {
 	if planType != "" {
 		out["plan_type"] = planType
 	}
+	// Persist the proxy so the account egresses through the same IP it
+	// registered from — an edu/plus account switching to the server's raw IP
+	// for chat is exactly the fingerprint mismatch that gets accounts flagged.
+	if px := strings.TrimSpace(body.ProxyURL); px != "" {
+		out["proxy_url"] = px
+	}
 	fileData, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
