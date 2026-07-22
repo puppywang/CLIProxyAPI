@@ -595,21 +595,26 @@
   .status-pill.disabled { color: rgba(255,255,255,0.4); border-color: rgba(255,255,255,0.15); background: rgba(255,255,255,0.03); }
   .status-pill.dead     { color: #ff5c5c; border-color: rgba(255,92,92,0.6); background: rgba(255,92,92,0.14); font-weight: 700; }
   /* Front-of-row flag for a credential the quota fetcher found permanently
-     unusable (e.g. wham/usage 402 deactivated_workspace). Pinned before the
-     email and never shrinks, so dead accounts jump out for cleanup. */
+     unusable (e.g. wham/usage 402 deactivated_workspace). A compact icon-only
+     badge pinned before the email — the STATUS column already spells out
+     "deactivated", so the full reason lives in the hover tooltip instead of
+     eating the account-name column. Never shrinks, so it stays a clean anchor
+     for scanning dead rows. */
   .dead-flag {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     flex: 0 0 auto;
-    padding: 0 6px;
-    margin-right: 4px;
-    border-radius: 3px;
-    font-size: 10px;
+    width: 15px;
+    height: 15px;
+    margin-right: 5px;
+    border-radius: 50%;
+    font-size: 9px;
     font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
+    line-height: 1;
     color: #ff5c5c;
     background: rgba(255,92,92,0.14);
-    border: 1px solid rgba(255,92,92,0.55);
+    border: 1px solid rgba(255,92,92,0.6);
     cursor: help;
   }
   /* Subtle red wash across a dead account's whole quota row. */
@@ -2730,8 +2735,10 @@
         (q && validTime(q.dead_since) ? ' (since ' + fmtAgo(q.dead_since) + ')' : '') +
         ' — quota refresh failed with a terminal 4XX. Safe to delete.'
       : '';
+    // Icon-only: the reason (workspace vs account deactivated) is in the
+    // tooltip and the STATUS column shows "deactivated" in words.
     const deadFlag = deadReason
-      ? '<span class="dead-flag" title="' + escapeAttr(deadTitle) + '">✖ ' + escapeHtml(deadReason) + '</span>'
+      ? '<span class="dead-flag" title="' + escapeAttr(deadTitle) + '">✕</span>'
       : '';
     // Line 1 is a flex row: the priority pill never shrinks (always visible),
     // the email truncates with an ellipsis when the (now narrow) column can't
