@@ -71,11 +71,27 @@ type Refresher struct {
 	done     chan struct{}
 	triggers chan string
 	started  bool
+
+	// deadMu guards dead. dead records auths whose most recent fetch
+	// returned a terminal "account unusable" upstream signal (see
+	// classifyDeadAccount). It is purely informational — surfaced to the
+	// monitor quota panel so an operator can spot and delete dead
+	// credentials — and never gates selection. Entries clear on the next
+	// successful fetch (the account recovered).
+	deadMu sync.RWMutex
+	dead   map[string]deadMarker
 }
 
 type backoffState struct {
 	nextAt   time.Time
 	failures int
+}
+
+// deadMarker records why and when an auth was last observed permanently
+// unusable by the quota fetcher.
+type deadMarker struct {
+	reason string
+	since  time.Time
 }
 
 // StaleCooldownClearer is the optional hook the refresher invokes when a
@@ -177,6 +193,7 @@ func NewRefresher(fetcher coreauth.QuotaFetcher, lister AuthLister, pusher Snaps
 		concurrency: DefaultConcurrency,
 		backoffs:    map[string]*backoffState{},
 		triggers:    make(chan string, 32),
+		dead:        map[string]deadMarker{},
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -273,6 +290,7 @@ func (r *Refresher) RefreshNow(ctx context.Context, authID string) (coreauth.Quo
 		return coreauth.QuotaSnapshot{}, false, fmt.Errorf("refresher: auth %q is not a codex provider", authID)
 	}
 	snap, ok, err := r.fetcher.Fetch(ctx, target)
+	r.noteFetchOutcome(authID, ok, err)
 	if err != nil {
 		r.recordFailure(authID)
 		return coreauth.QuotaSnapshot{}, false, err
@@ -446,6 +464,7 @@ func (r *Refresher) refreshByID(ctx context.Context, authID string) {
 // owned by the cycle and should not be perturbed.
 func (r *Refresher) refresh(ctx context.Context, a *coreauth.Auth, scheduleNext bool) {
 	snap, ok, err := r.fetcher.Fetch(ctx, a)
+	r.noteFetchOutcome(a.ID, ok, err)
 	if err != nil {
 		r.recordFailure(a.ID)
 		log.Debugf("quota-refresher: fetch failed | auth=%s err=%v", a.ID, err)
@@ -602,6 +621,56 @@ func (r *Refresher) alignCooldownEnd(authID string, cooldownEnd time.Time) {
 // failures and the distant future on others, effectively silencing the
 // refresher for that auth indefinitely.
 const maxBackoffExponent = 20
+
+// noteFetchOutcome updates the per-auth dead-account marker from a fetch
+// result. A terminal upstream signal (classifyDeadAccount) records/refreshes
+// the marker; any successful fetch clears it (the account recovered). Callers
+// pass err from the fetch — a non-terminal error leaves an existing marker
+// untouched (a throttled dead account keeps its flag across transient blips)
+// but never creates one.
+func (r *Refresher) noteFetchOutcome(authID string, ok bool, err error) {
+	if err != nil {
+		reason, dead := classifyDeadAccount(err)
+		if !dead {
+			return
+		}
+		r.deadMu.Lock()
+		if _, exists := r.dead[authID]; !exists {
+			r.dead[authID] = deadMarker{reason: reason, since: time.Now()}
+		} else {
+			// Keep the original "since" but refresh the reason label.
+			m := r.dead[authID]
+			m.reason = reason
+			r.dead[authID] = m
+		}
+		r.deadMu.Unlock()
+		return
+	}
+	if !ok {
+		return
+	}
+	r.deadMu.Lock()
+	delete(r.dead, authID)
+	r.deadMu.Unlock()
+}
+
+// DeadMarker reports whether authID's most recent quota fetch signalled a
+// terminal "account unusable" condition, returning the reason label and the
+// time the marker was first set. ok=false when the account is not flagged.
+// Purely informational: the monitor uses it to badge dead credentials for
+// cleanup; it does not influence credential selection.
+func (r *Refresher) DeadMarker(authID string) (string, time.Time, bool) {
+	if r == nil {
+		return "", time.Time{}, false
+	}
+	r.deadMu.RLock()
+	defer r.deadMu.RUnlock()
+	m, ok := r.dead[authID]
+	if !ok {
+		return "", time.Time{}, false
+	}
+	return m.reason, m.since, true
+}
 
 // recordFailure increments the auth's failure count and pushes the next
 // allowed time forward exponentially: 30s, 60s, 120s, 240s ... capped at

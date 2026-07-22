@@ -88,6 +88,13 @@ type QuotaSnapshotData struct {
 	ResetAtPrimary       *time.Time `json:"reset_at_primary,omitempty"`
 	ResetAtSecondary     *time.Time `json:"reset_at_secondary,omitempty"`
 	FetchedAt            *time.Time `json:"fetched_at,omitempty"`
+	// DeadReason / DeadSince surface a terminal "account unusable" signal
+	// observed by the quota fetcher (e.g. wham/usage 402 deactivated_workspace).
+	// Set only for permanently-dead credentials the operator should clean up;
+	// empty for healthy or merely-throttled accounts. Informational only — the
+	// selector never reads these.
+	DeadReason string     `json:"dead_reason,omitempty"`
+	DeadSince  *time.Time `json:"dead_since,omitempty"`
 }
 
 // QuotaSnapshotFunc returns the cached snapshot for authID. ok=false when

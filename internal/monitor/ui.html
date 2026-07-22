@@ -584,6 +584,28 @@
   .status-pill.limit    { color: #ff8a8a; border-color: rgba(255,138,138,0.35); background: rgba(255,138,138,0.08); }
   .status-pill.unavail  { color: #f5c98a; border-color: rgba(245,201,138,0.35); background: rgba(245,201,138,0.08); }
   .status-pill.disabled { color: rgba(255,255,255,0.4); border-color: rgba(255,255,255,0.15); background: rgba(255,255,255,0.03); }
+  .status-pill.dead     { color: #ff5c5c; border-color: rgba(255,92,92,0.6); background: rgba(255,92,92,0.14); font-weight: 700; }
+  /* Front-of-row flag for a credential the quota fetcher found permanently
+     unusable (e.g. wham/usage 402 deactivated_workspace). Pinned before the
+     email and never shrinks, so dead accounts jump out for cleanup. */
+  .dead-flag {
+    display: inline-block;
+    flex: 0 0 auto;
+    padding: 0 6px;
+    margin-right: 4px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: #ff5c5c;
+    background: rgba(255,92,92,0.14);
+    border: 1px solid rgba(255,92,92,0.55);
+    cursor: help;
+  }
+  /* Subtle red wash across a dead account's whole quota row. */
+  tr.quota-row-dead > td { background: rgba(255,92,92,0.07); }
+  tr.quota-row-dead:hover > td { background: rgba(255,92,92,0.12); }
   .quota-refresh-btn,
   .cooldown-force-btn,
   .codex-invite-btn {
@@ -2490,6 +2512,10 @@
       files.sort((x, y) => {
         if (x.disabled !== y.disabled) return x.disabled ? 1 : -1;
         const xq = x.quota || {}, yq = y.quota || {};
+        // Dead accounts (terminal 4XX from quota refresh) float to the very
+        // top of the non-disabled rows — they exist only to be cleaned up.
+        const xDead = !!xq.dead_reason, yDead = !!yq.dead_reason;
+        if (xDead !== yDead) return xDead ? -1 : 1;
         const xLimit = !!xq.limit_reached, yLimit = !!yq.limit_reached;
         if (xLimit !== yLimit) return xLimit ? -1 : 1;
         // Use the busier of the two windows so grok rows (monthly usage in
@@ -2672,15 +2698,32 @@
     const prioPill = priority > 0
       ? '<span class="prio-pill" title="Drain priority ' + priority + ' — higher drains first">⚑' + priority + '</span>'
       : '';
+    // Dead-account flag: the quota fetcher saw a terminal "account unusable"
+    // signal (e.g. wham/usage 402 deactivated_workspace). Purely informational
+    // — pinned at the very front of the row so the operator can find and
+    // delete dead credentials. `dead_since` is when it was first observed.
+    const deadReason = q && q.dead_reason ? String(q.dead_reason) : '';
+    const deadTitle = deadReason
+      ? 'Account unusable: ' + deadReason +
+        (q && validTime(q.dead_since) ? ' (since ' + fmtAgo(q.dead_since) + ')' : '') +
+        ' — quota refresh failed with a terminal 4XX. Safe to delete.'
+      : '';
+    const deadFlag = deadReason
+      ? '<span class="dead-flag" title="' + escapeAttr(deadTitle) + '">✖ ' + escapeHtml(deadReason) + '</span>'
+      : '';
     // Line 1 is a flex row: the priority pill never shrinks (always visible),
     // the email truncates with an ellipsis when the (now narrow) column can't
     // fit it. The pill used to be appended after the email and got pushed out
     // of view once the column shrank — this keeps it pinned at the front.
-    const nameCell = '<div class="qc-acct-line1">' + prioPill + providerPill + buildPill +
+    const nameCell = '<div class="qc-acct-line1">' + deadFlag + prioPill + providerPill + buildPill +
       '<span class="qc-acct-email" title="' + escapeAttr(a.label || a.email || a.name || a.id) + '">' + label + '</span></div>';
 
     let statusPill;
-    if (a.disabled) statusPill = '<span class="status-pill disabled">disabled</span>';
+    // Dead takes precedence: a deactivated account would otherwise render
+    // "active" (it isn't disabled and may have no fresh quota), hiding the
+    // very state the operator is trying to spot.
+    if (deadReason) statusPill = '<span class="status-pill dead" title="' + escapeAttr(deadTitle) + '">deactivated</span>';
+    else if (a.disabled) statusPill = '<span class="status-pill disabled">disabled</span>';
     else if (q && q.limit_reached) statusPill = '<span class="status-pill limit">limit_reached</span>';
     else if (a.unavailable) statusPill = '<span class="status-pill unavail">unavailable</span>';
     else statusPill = '<span class="status-pill active">active</span>';
@@ -2743,6 +2786,7 @@
         ' ' + deleteBtn;
     }
 
+    if (deadReason) tr.classList.add('quota-row-dead');
     tr.innerHTML =
       '<td>' + nameCell + sub + '</td>' +
       '<td>' + statusPill + '</td>' +
@@ -2930,6 +2974,11 @@
       await loadAccountQuota();
     } catch (err) {
       setStatus('quota refresh failed: ' + (err && err.message ? err.message : err), true);
+      // A terminal 4XX (e.g. deactivated_workspace) throws here, but the
+      // backend still recorded the dead marker on this attempt — reload so
+      // the row gets its badge immediately instead of waiting for the next
+      // auto-refresh tick.
+      try { await loadAccountQuota(); } catch (_) { /* best-effort */ }
     } finally {
       if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || '↻'; }
     }

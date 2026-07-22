@@ -938,15 +938,37 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 			}
 		}
 		snapshotFn := func(authID string) (managementHandlers.QuotaSnapshotData, bool) {
+			// Overlay the codex refresher's dead-account marker (if any) onto
+			// whatever quota snapshot we have. A permanently-dead credential
+			// (e.g. wham/usage 402 deactivated_workspace) may carry a stale
+			// snapshot or none at all; in the latter case we still return the
+			// marker alone so the monitor can badge it for cleanup. xai auths
+			// never carry a dead marker (it comes from the wham refresher).
+			deadReason, deadSince, dead := "", time.Time{}, false
+			if refresher != nil {
+				deadReason, deadSince, dead = refresher.DeadMarker(authID)
+			}
+			attachDead := func(d managementHandlers.QuotaSnapshotData) managementHandlers.QuotaSnapshotData {
+				if dead {
+					d.DeadReason = deadReason
+					d.DeadSince = optTime(deadSince)
+				}
+				return d
+			}
 			if snap, ok := selector.Snapshot(authID); ok {
-				return toManagement(snap), true
+				return attachDead(toManagement(snap)), true
 			}
 			// Fall back to the grok billing cache for xai auths, which the
 			// codex selector never has a snapshot for.
 			if xaiPoller != nil {
 				if snap, ok := xaiPoller.Snapshot(authID); ok {
-					return toManagement(snap), true
+					return attachDead(toManagement(snap)), true
 				}
+			}
+			// No quota snapshot, but the account is flagged dead — surface the
+			// marker so the monitor renders the badge on a cold page load.
+			if dead {
+				return attachDead(managementHandlers.QuotaSnapshotData{}), true
 			}
 			return managementHandlers.QuotaSnapshotData{}, false
 		}
