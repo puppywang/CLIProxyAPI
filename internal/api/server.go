@@ -894,6 +894,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 		mgmt.POST("/auth-files/import-sub2api", s.mgmt.ImportSub2api)
+		mgmt.POST("/auth-files/register-agent-identity", s.mgmt.RegisterAgentIdentity)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
 		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
