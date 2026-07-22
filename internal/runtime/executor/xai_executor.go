@@ -606,6 +606,20 @@ func (e *XAIExecutor) recordXAIRequest(ctx context.Context, auth *cliproxyauth.A
 // ({"error":"Grok Build usage balance exhausted"}). Any other error passes
 // through unchanged.
 func normalizeXAIErrorPayload(status int, data []byte) []byte {
+	if xaiIsRequestTooLargeError(status, data) {
+		// grok returns a non-standard string error ("Failed to parse the request
+		// body as JSON: tools[..].parameters: ...") when the payload — typically
+		// a very large tool / MCP definition set — exceeds its request-body size
+		// limit. OpenAI clients (e.g. Copilot auto-pilot) cannot classify that
+		// string shape and retry it endlessly. Remap to the standard OpenAI
+		// "too large" error (invalid_request_error / context_length_exceeded),
+		// which clients treat as terminal (stop retrying) and surface to the user.
+		out := []byte(`{"error":{}}`)
+		out, _ = sjson.SetBytes(out, "error.message", "Request too large for grok: the tool / MCP definitions exceed grok's request-body size limit. Reduce the number of enabled tools or MCP servers, or run /compact, then retry.")
+		out, _ = sjson.SetBytes(out, "error.type", "invalid_request_error")
+		out, _ = sjson.SetBytes(out, "error.code", "context_length_exceeded")
+		return out
+	}
 	if !xaiIsQuotaExhaustedError(status, data) {
 		return data
 	}
@@ -637,6 +651,22 @@ func xaiIsQuotaExhaustedError(status int, data []byte) bool {
 	errStr := strings.ToLower(gjson.GetBytes(data, "error").String())
 	return strings.Contains(errStr, "usage balance exhausted") ||
 		strings.Contains(errStr, "run out of credits")
+}
+
+// xaiIsRequestTooLargeError reports whether a grok 400 is the request-body
+// parse rejection that occurs when the payload exceeds grok's size limit
+// (observed with GitHub Copilot sending 80+ tool/MCP definitions, ~1MB+). xAI
+// returns a non-standard string error whose text mentions parsing the request
+// body; we key on that so it can be remapped to a terminal invalid_request_error.
+func xaiIsRequestTooLargeError(status int, data []byte) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	errStr := strings.ToLower(gjson.GetBytes(data, "error").String())
+	if errStr == "" {
+		errStr = strings.ToLower(gjson.GetBytes(data, "error.message").String())
+	}
+	return strings.Contains(errStr, "parse the request body")
 }
 
 // xaiTerminalStatus remaps a recognized Grok quota-exhaustion 402 (the Grok
