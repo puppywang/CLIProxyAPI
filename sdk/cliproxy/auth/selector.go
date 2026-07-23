@@ -1175,6 +1175,24 @@ func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]a
 	return primary
 }
 
+// StableSessionAnchor returns the most stable per-conversation key for a
+// request — the one that does NOT drift once the first assistant reply appears.
+// For explicit session signals (headers / conversation_id) it equals
+// ExtractSessionID. For the message-content fallback it returns the
+// system+first-user short hash (constant across EVERY turn) instead of the
+// primary system+first-user+first-assistant hash, which only stabilizes from
+// turn 2 onward. Callers that need a stable UPSTREAM cache key (e.g. Grok's
+// x-grok-conv-id / prompt_cache_key) should use this rather than
+// ExtractSessionID so the emitted key is identical on turn 1 and every turn
+// after.
+func StableSessionAnchor(headers http.Header, payload []byte, metadata map[string]any) string {
+	primary, fallback, _ := extractSessionIDs(headers, payload, metadata)
+	if fallback != "" {
+		return fallback
+	}
+	return primary
+}
+
 // extractSessionIDs returns (primaryID, fallbackID, mirrorID) for session affinity.
 //
 //   - primaryID: the lookup/write key for this turn's binding. Cache reads

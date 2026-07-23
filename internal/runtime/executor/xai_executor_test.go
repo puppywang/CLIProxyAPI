@@ -773,3 +773,49 @@ func TestNormalizeXAIErrorPayloadGrokBuild402(t *testing.T) {
 		t.Errorf("unrelated 402 body should be unchanged")
 	}
 }
+
+// TestXAIExecutionSessionIDStableAcrossTurns verifies the content-hash fallback
+// (used when the client sends no explicit cache key, e.g. GitHub Copilot BYOK)
+// produces a STABLE x-grok-conv-id/prompt_cache_key across the turns of one
+// conversation — including the turn-1 -> turn-2 transition when the first
+// assistant reply appears. Drift here would reset Grok's cache mid-conversation.
+func TestXAIExecutionSessionIDStableAcrossTurns(t *testing.T) {
+	turn1 := []byte(`{"messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"First question about the weather."}]}`)
+	turn2 := []byte(`{"messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"First question about the weather."},{"role":"assistant","content":"It is sunny."},{"role":"user","content":"Second follow-up question."}]}`)
+
+	id1 := xaiExecutionSessionID(cliproxyexecutor.Request{Payload: turn1}, cliproxyexecutor.Options{})
+	id2 := xaiExecutionSessionID(cliproxyexecutor.Request{Payload: turn2}, cliproxyexecutor.Options{})
+
+	if id1 == "" {
+		t.Fatalf("expected non-empty session id from message-content fallback")
+	}
+	if id1 != id2 {
+		t.Fatalf("session id drifted across turns: turn1=%q turn2=%q (must be stable)", id1, id2)
+	}
+	if len(id1) != 36 || strings.Count(id1, "-") != 4 {
+		t.Fatalf("session id is not UUID-formatted: %q", id1)
+	}
+	// A different conversation (different first user message) must yield a
+	// different id so caches don't collide across conversations.
+	other := []byte(`{"messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"A completely unrelated topic entirely."}]}`)
+	if idOther := xaiExecutionSessionID(cliproxyexecutor.Request{Payload: other}, cliproxyexecutor.Options{}); idOther == id1 {
+		t.Fatalf("distinct conversations must produce distinct ids, both were %q", id1)
+	}
+}
+
+// TestXAIExecutionSessionIDExplicitKeyWins verifies an explicit body
+// prompt_cache_key is honored verbatim (existing behavior preserved).
+func TestXAIExecutionSessionIDExplicitKeyWins(t *testing.T) {
+	payload := []byte(`{"prompt_cache_key":"explicit-key-123","messages":[{"role":"user","content":"hi"}]}`)
+	if got := xaiExecutionSessionID(cliproxyexecutor.Request{Payload: payload}, cliproxyexecutor.Options{}); got != "explicit-key-123" {
+		t.Fatalf("explicit prompt_cache_key should be returned as-is, got %q", got)
+	}
+}
+
+// TestXAIExecutionSessionIDEmptyWhenNoSignal verifies no id is fabricated when
+// there is nothing stable to anchor on (so we never send a bogus conv-id).
+func TestXAIExecutionSessionIDEmptyWhenNoSignal(t *testing.T) {
+	if got := xaiExecutionSessionID(cliproxyexecutor.Request{Payload: []byte(`{}`)}, cliproxyexecutor.Options{}); got != "" {
+		t.Fatalf("expected empty session id when no signal, got %q", got)
+	}
+}

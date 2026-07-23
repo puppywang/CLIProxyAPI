@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -788,9 +790,39 @@ func xaiExecutionSessionID(req cliproxyexecutor.Request, opts cliproxyexecutor.O
 		return value
 	}
 	if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
-		return strings.TrimSpace(promptCacheKey.String())
+		if v := strings.TrimSpace(promptCacheKey.String()); v != "" {
+			return v
+		}
+	}
+	// Fallback: many clients (e.g. GitHub Copilot BYOK) send no explicit
+	// prompt_cache_key and no stable conversation id — only per-request
+	// correlation ids (X-Request-Id / X-Agent-Task-Id regenerated each turn).
+	// Reuse the session-affinity derivation (conversation_id in the body, or a
+	// stable hash of the first few messages) so we still emit a STABLE
+	// x-grok-conv-id / prompt_cache_key across the turns of one conversation.
+	// Grok Build caches by that conv-id regardless of plan tier, so this is
+	// what lets free-tier accounts — which lack the implicit, keyless prefix
+	// caching that paid SuperGrok gets — actually reach a nonzero cache rate.
+	// Prefer the original client request so the seed matches what the affinity
+	// layer saw; hash to a UUID so the emitted id is a well-formed conv-id.
+	payload := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		payload = opts.OriginalRequest
+	}
+	if seed := cliproxyauth.StableSessionAnchor(opts.Headers, payload, opts.Metadata); seed != "" {
+		return xaiConvIDFromSeed(seed)
 	}
 	return ""
+}
+
+// xaiConvIDFromSeed turns an opaque session-affinity seed (e.g. "conv:..." or a
+// content hash) into a stable UUID-formatted id suitable for x-grok-conv-id and
+// prompt_cache_key. Deterministic: the same seed always yields the same id, so
+// every turn of one conversation carries the same key.
+func xaiConvIDFromSeed(seed string) string {
+	sum := sha256.Sum256([]byte("cli-proxy-api:xai:conv:" + strings.TrimSpace(seed)))
+	h := hex.EncodeToString(sum[:16])
+	return fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
 }
 
 func xaiImageEndpointPath(opts cliproxyexecutor.Options) string {
