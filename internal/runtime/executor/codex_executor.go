@@ -820,6 +820,31 @@ func (e *CodexExecutor) codexDowngradeModel(ctx context.Context, auth *cliproxya
 	return downgraded
 }
 
+// codexProactiveDowngrade returns a downgraded req.Model when this auth is
+// ALREADY known — via the durable learned-unsupported marker a prior
+// codexDowngradeModel set — not to support reqModel's base tier (e.g.
+// gpt-5.6-sol on a ChatGPT account that lacks the sol entitlement). Downgrading
+// up front skips the doomed upstream probe that would otherwise 400 on every
+// request and burn a full round-trip (plus, during failover, an entire
+// credential slot's worth of latency) before the reactive downgrade kicks in.
+// Returns "" when the auth is not known-unsupported, the ctx is already flagged,
+// or no distinct downgrade target is configured.
+func (e *CodexExecutor) codexProactiveDowngrade(ctx context.Context, auth *cliproxyauth.Auth, reqModel string) string {
+	if codexDowngradeApplied(ctx) || auth == nil {
+		return ""
+	}
+	base := helps.CodexModelBase(reqModel)
+	if base == "" || !registry.GetGlobalRegistry().IsClientModelUnsupported(auth.ID, base) {
+		return ""
+	}
+	downgraded := helps.ResolveCodexModelDowngrade(e.cfg, reqModel)
+	if downgraded == "" || helps.CodexModelBase(downgraded) == base {
+		return ""
+	}
+	helps.LogWithRequestID(ctx).Infof("codex: auth %s known-unsupported for %s; pre-downgrading to %s", auth.ID, base, helps.CodexModelBase(downgraded))
+	return downgraded
+}
+
 // codexTaskRecoveredCtxKey caps agent-identity task re-registration at one hop
 // per request.
 type codexTaskRecoveredCtxKey struct{}
@@ -870,6 +895,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImage(ctx, auth, req, opts)
+	}
+	if dm := e.codexProactiveDowngrade(ctx, auth, req.Model); dm != "" {
+		ctx = markCodexDowngradeApplied(ctx)
+		req.Model = dm
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -1051,6 +1080,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 }
 
 func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	if dm := e.codexProactiveDowngrade(ctx, auth, req.Model); dm != "" {
+		ctx = markCodexDowngradeApplied(ctx)
+		req.Model = dm
+	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := codexCreds(auth)
@@ -1164,6 +1197,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImageStream(ctx, auth, req, opts)
+	}
+	if dm := e.codexProactiveDowngrade(ctx, auth, req.Model); dm != "" {
+		ctx = markCodexDowngradeApplied(ctx)
+		req.Model = dm
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
