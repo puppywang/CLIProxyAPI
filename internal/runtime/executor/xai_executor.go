@@ -1132,6 +1132,10 @@ func xaiSupportsReasoningEffort(model string) bool {
 		return true
 	case strings.HasPrefix(name, "grok-4.3"):
 		return true
+	case strings.HasPrefix(name, "grok-4.5"):
+		// xAI's own harness (xai-org/grok-build default_models.json) declares
+		// grok-4.5 supports_reasoning_effort with high (default) / medium / low.
+		return true
 	default:
 		return false
 	}
