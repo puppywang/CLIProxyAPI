@@ -2016,3 +2016,34 @@ func TestRoundRobinSelectorPick_RandomInitialCursor(t *testing.T) {
 		}
 	}
 }
+
+// TestExtractSessionID_ContentHashIsModelScoped verifies the message-content
+// fallback key (used by clients that send no explicit session id, e.g. GitHub
+// Copilot BYOK) is scoped by base model. Without this, switching models
+// mid-conversation kept the previous binding, so grok-4.5 requests were served
+// by the grok2api openai-compat credential the conversation had been bound to
+// while it was on grok-4.5-g2a.
+func TestExtractSessionID_ContentHashIsModelScoped(t *testing.T) {
+	body := func(model string) []byte {
+		return []byte(`{"model":"` + model + `","messages":[` +
+			`{"role":"system","content":"You are a helpful assistant."},` +
+			`{"role":"user","content":"Same opening question for every variant."}]}`)
+	}
+	native := ExtractSessionID(nil, body("grok-4.5"), nil)
+	viaGateway := ExtractSessionID(nil, body("grok-4.5-g2a"), nil)
+	if native == "" || viaGateway == "" {
+		t.Fatalf("expected non-empty content-hash session ids, got %q / %q", native, viaGateway)
+	}
+	if native == viaGateway {
+		t.Fatalf("different models must produce different session keys; both were %q", native)
+	}
+
+	// A thinking-suffix change is the SAME model and must keep one binding, so
+	// switching effort does not needlessly re-pick a credential.
+	if got, want := ExtractSessionID(nil, body("grok-4.5(low)"), nil), ExtractSessionID(nil, body("grok-4.5(high)"), nil); got != want {
+		t.Fatalf("suffix-only change must keep the same session key: %q != %q", got, want)
+	}
+	if got := ExtractSessionID(nil, body("grok-4.5(high)"), nil); got != native {
+		t.Fatalf("suffixed model must match its base model key: %q != %q", got, native)
+	}
+}

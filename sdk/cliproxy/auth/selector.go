@@ -1491,17 +1491,31 @@ func extractMessageHashIDs(payload []byte) (primaryID, fallbackID string) {
 		return "", ""
 	}
 
-	shortHash := computeSessionHash(systemPrompt, firstUserMsg, "")
+	// Scope the content hash by model. This is the fallback key for clients that
+	// send no explicit session id (e.g. GitHub Copilot BYOK). Without the model
+	// in the key, switching models mid-conversation keeps the previous binding,
+	// so a conversation started on one model stays pinned to that model's
+	// credential even after the client selects a different one — observed as
+	// grok-4.5 requests being served by the grok2api openai-compat auth after
+	// the client switched over from grok-4.5-g2a. Scope by BASE model so a
+	// thinking-suffix change (grok-4.5(high) -> grok-4.5(low)) keeps one
+	// binding, while a genuinely different model rebinds and re-picks.
+	modelScope := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(gjson.GetBytes(payload, "model").String()).ModelName))
+
+	shortHash := computeSessionHash(modelScope, systemPrompt, firstUserMsg, "")
 	if firstAssistantMsg == "" {
 		return shortHash, ""
 	}
 
-	fullHash := computeSessionHash(systemPrompt, firstUserMsg, firstAssistantMsg)
+	fullHash := computeSessionHash(modelScope, systemPrompt, firstUserMsg, firstAssistantMsg)
 	return fullHash, shortHash
 }
 
-func computeSessionHash(systemPrompt, userMsg, assistantMsg string) string {
+func computeSessionHash(modelScope, systemPrompt, userMsg, assistantMsg string) string {
 	h := fnv.New64a()
+	if modelScope != "" {
+		h.Write([]byte("mdl:" + modelScope + "\n"))
+	}
 	if systemPrompt != "" {
 		h.Write([]byte("sys:" + systemPrompt + "\n"))
 	}
