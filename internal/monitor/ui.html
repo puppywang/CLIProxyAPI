@@ -648,6 +648,10 @@
     z-index: 5;
   }
   .qc-tip[hidden] { display: none; }
+  /* The quota chart needs far more horizontal room than the other modals
+     (a 7-day curve at 480px is unreadable). It is a popup, so a wide box is
+     fine; max-width still keeps it inside the viewport. */
+  #quotaChartModal .ci-modal { width: 940px; }
   .qc-tip .k { color: rgba(255,255,255,0.5); }
   .qc-tip .vp { color: #8fc6ff; font-weight: 600; }
   .qc-tip .vs { color: #c58fff; font-weight: 600; }
@@ -3429,9 +3433,16 @@
           '<span class="k">7d/monthly</span> <span class="vs">' + s.s + '%</span>' +
           (s.l ? '<br><span class="lim">limit reached</span>' : '');
         const wrapRect = host.getBoundingClientRect();
-        tip.style.left = ((rect.left - wrapRect.left) + px * sx) + 'px';
-        tip.style.top = ((rect.top - wrapRect.top) + Math.min(pyP, pyS) * sy - 8) + 'px';
+        // Unhide before measuring — a display:none element reports zero size.
         tip.hidden = false;
+        const rawLeft = (rect.left - wrapRect.left) + px * sx;
+        const rawTop = (rect.top - wrapRect.top) + Math.min(pyP, pyS) * sy - 8;
+        // Keep the tooltip inside the wrapper. Near the right edge it would
+        // otherwise stick out and, because .ci-modal is overflow:auto, bring
+        // the horizontal scrollbar straight back.
+        const halfW = tip.offsetWidth / 2 + 4;
+        tip.style.left = Math.max(halfW, Math.min(wrapRect.width - halfW, rawLeft)) + 'px';
+        tip.style.top = Math.max(tip.offsetHeight + 4, rawTop) + 'px';
       });
       hit.addEventListener('mouseleave', () => {
         cross.style.display = 'none';
