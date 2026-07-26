@@ -369,6 +369,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.monitorRegistry.AttachSettings(monitor.NewSettingsStore(filepath.Join(configDir, "monitor-settings.json")))
 	s.monitorRegistry.AttachHistoryLog(filepath.Join(logging.ResolveLogDirectory(cfg), "monitor-cancels.jsonl"))
 	s.monitorRegistry.AttachErrorsLog(filepath.Join(logging.ResolveLogDirectory(cfg), "monitor-errors.jsonl"))
+	s.monitorRegistry.AttachQuotaHistory(filepath.Join(configDir, "quota-history.json"))
 	s.monitorStop = make(chan struct{})
 	s.monitorRegistry.StartWatcher(s.monitorStop)
 	// Install monitor middleware after request logging so it can rely on the
@@ -648,6 +649,16 @@ func (s *Server) SetMonitorBytesRecorder(rec monitor.AuthBytesRecorder) {
 		return
 	}
 	s.monitorRegistry.SetBytesRecorder(rec)
+}
+
+// RecordQuotaSample forwards one quota observation into the monitor's history
+// store so the quota panel can draw a usage curve. Called by the quota
+// subsystem whenever a fresh snapshot is fetched.
+func (s *Server) RecordQuotaSample(authID string, primary, secondary int, limitReached bool) {
+	if s == nil || s.monitorRegistry == nil {
+		return
+	}
+	s.monitorRegistry.RecordQuotaSample(authID, primary, secondary, limitReached)
 }
 
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.

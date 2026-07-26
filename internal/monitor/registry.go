@@ -246,6 +246,10 @@ type Registry struct {
 	errors    *errorsRing
 	errorsLog *errorsLog
 
+	// quotaHistory retains per-auth quota samples so the quota panel can draw
+	// a usage curve (and show what an account peaked at before a reset).
+	quotaHistory *quotaHistoryStore
+
 	// sessionWorkspaces remembers the last observed `<cwd>` value per
 	// session_id, independent of any tracked request lifetime. In-flight
 	// entries are removed 5 seconds after Finish, so a panel that wants

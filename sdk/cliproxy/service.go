@@ -827,10 +827,20 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 	// replaced by a new one bound to the new selector.
 	selector := s.quotaSelector
 	mgr := s.coreManager
+	// Mirror every pushed snapshot into the monitor's quota history so the
+	// operator UI can draw a usage curve (and see what an account peaked at
+	// before a window reset). Purely observational — the selector still
+	// receives the snapshot exactly as before.
+	pushSnapshot := func(authID string, snap coreauth.QuotaSnapshot) {
+		selector.PushSnapshot(authID, snap)
+		if s.server != nil {
+			s.server.RecordQuotaSample(authID, snap.UsedPercentPrimary, snap.UsedPercentSecondary, snap.LimitReached)
+		}
+	}
 	refresher := quota.NewRefresher(
 		s.quotaFetcher,
 		func() []*coreauth.Auth { return mgr.List() },
-		selector.PushSnapshot,
+		pushSnapshot,
 		// Auto-clear stale cooldown markers when wham confirms the
 		// auth is healthy upstream. Bridges the gap between the
 		// conductor's "recover on next success call" path and the
@@ -906,6 +916,12 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 		s.xaiBilling = nil
 	}
 	xaiPoller := quota.NewXAIBillingPoller(func() []*coreauth.Auth { return mgr.List() }, quota.DefaultRefreshInterval)
+	// Same history mirroring as the codex refresher, so grok rows get a curve too.
+	if s.server != nil {
+		xaiPoller.SetObserver(func(authID string, snap coreauth.QuotaSnapshot) {
+			s.server.RecordQuotaSample(authID, snap.UsedPercentPrimary, snap.UsedPercentSecondary, snap.LimitReached)
+		})
+	}
 	xaiPoller.Start(ctx)
 	s.xaiBilling = xaiPoller
 

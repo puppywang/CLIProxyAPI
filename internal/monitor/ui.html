@@ -617,6 +617,47 @@
     border: 1px solid rgba(255,92,92,0.6);
     cursor: help;
   }
+  /* Quota trend sparkline: a compact 7-day usage curve per account. Clicking
+     opens the full chart. Drawn as inline SVG so the page stays self-contained. */
+  .qh-spark {
+    display: block;
+    cursor: pointer;
+    border-radius: 3px;
+    padding: 1px 2px;
+  }
+  .qh-spark:hover { background: rgba(143,198,255,0.10); }
+  .qh-spark-empty { color: rgba(255,255,255,0.25); font-size: 10px; }
+  /* Full-size quota history chart modal. */
+  .qc-chart-wrap { padding: 4px 2px 2px; overflow-x: auto; }
+  .qc-chart-legend {
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    font-size: 11px;
+    color: rgba(255,255,255,0.65);
+    margin: 2px 0 8px;
+    flex-wrap: wrap;
+  }
+  .qc-chart-legend .swatch {
+    display: inline-block;
+    width: 10px;
+    height: 3px;
+    border-radius: 2px;
+    margin-right: 5px;
+    vertical-align: middle;
+  }
+  .qc-range-btn {
+    padding: 1px 8px;
+    font-size: 11px;
+    background: rgba(143,198,255,0.10);
+    color: #8fc6ff;
+    border: 1px solid rgba(143,198,255,0.28);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .qc-range-btn.active { background: rgba(143,198,255,0.30); color: #fff; }
+  .qc-stat { color: rgba(255,255,255,0.5); }
+  .qc-stat b { color: #ffd479; font-weight: 600; }
   /* Subtle red wash across a dead account's whole quota row. */
   tr.quota-row-dead > td { background: rgba(255,92,92,0.07); }
   tr.quota-row-dead:hover > td { background: rgba(255,92,92,0.12); }
@@ -1394,6 +1435,7 @@
             <th>Status</th>
             <th title="Shorter-horizon limit — codex: 5h · grok: weekly">5h window</th>
             <th title="Longer-horizon limit — codex: 7d · grok: monthly">Weekly window</th>
+            <th title="Usage curve over the retained history (click for the full chart, peaks and resets)">Trend</th>
             <th>Resets</th>
             <th>Last fetched</th>
             <th>Bindings</th>
@@ -1507,6 +1549,27 @@
      modal's overlay/card styling; opened from the quota panel's Bindings
      cell so the full uuids + workspace paths get room to breathe instead of
      cramming into a narrow table cell. -->
+<div id="quotaChartModal" class="ci-overlay" hidden>
+  <div class="ci-modal" role="dialog" aria-modal="true" aria-labelledby="qcTitle">
+    <div class="ci-header">
+      <div class="ci-title" id="qcTitle">Quota history</div>
+      <button type="button" class="ci-close" id="qcCloseBtn" title="Close (Esc)">×</button>
+    </div>
+    <div class="ci-account" id="qcAccount"></div>
+    <div class="qc-chart-legend">
+      <span><span class="swatch" style="background:#8fc6ff"></span>5h / weekly</span>
+      <span><span class="swatch" style="background:#c58fff"></span>7d / monthly</span>
+      <span style="margin-left:auto">
+        <button type="button" class="qc-range-btn" data-qc-range="6">6h</button>
+        <button type="button" class="qc-range-btn" data-qc-range="24">24h</button>
+        <button type="button" class="qc-range-btn active" data-qc-range="48">48h</button>
+        <button type="button" class="qc-range-btn" data-qc-range="168">7d</button>
+      </span>
+    </div>
+    <div class="qc-chart-wrap" id="qcChart"></div>
+  </div>
+</div>
+
 <div id="bindingsModal" class="ci-overlay" hidden>
   <div class="ci-modal" role="dialog" aria-modal="true" aria-labelledby="bmTitle">
     <div class="ci-header">
@@ -2477,6 +2540,51 @@
   // Last-rendered account list, so the "Delete deactivated" bulk action can
   // enumerate the dead accounts without re-fetching. Refreshed every render.
   let lastQuotaFiles = [];
+  // Per-auth quota history ({authID: [{t,p,s,l}, ...]}), refreshed alongside
+  // the quota table and used for the Trend sparkline + the full chart.
+  let quotaHistoryByAuth = {};
+
+  // sparklineSVG renders a compact primary-usage curve. Returns an em-dash
+  // placeholder until at least two samples exist (one point is not a trend).
+  function sparklineSVG(authID, series) {
+    if (!series || series.length < 2) {
+      return '<span class="qh-spark-empty" title="Collecting — the curve appears once a couple of quota refreshes have been recorded">—</span>';
+    }
+    const W = 88, H = 22, pad = 2;
+    const t0 = series[0].t, t1 = series[series.length - 1].t;
+    const span = Math.max(1, t1 - t0);
+    const x = (t) => pad + ((t - t0) / span) * (W - pad * 2);
+    const y = (v) => H - pad - (Math.max(0, Math.min(100, v)) / 100) * (H - pad * 2);
+    let d = '';
+    for (let i = 0; i < series.length; i++) {
+      d += (i === 0 ? 'M' : 'L') + x(series[i].t).toFixed(1) + ' ' + y(series[i].p).toFixed(1);
+    }
+    const last = series[series.length - 1].p;
+    const peak = series.reduce((m, s) => Math.max(m, s.p), 0);
+    const stroke = last >= 90 ? '#ff8a8a' : (last >= 50 ? '#ffd479' : '#7ee787');
+    const title = 'now ' + last + '% · peak ' + peak + '% over ' + fmtSpanShort(span) + ' — click for the full chart';
+    return '<svg class="qh-spark" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" ' +
+      'data-quota-chart="' + escapeAttr(authID) + '"><title>' + escapeHtml(title) + '</title>' +
+      '<line x1="' + pad + '" y1="' + y(100) + '" x2="' + (W - pad) + '" y2="' + y(100) + '" stroke="rgba(255,255,255,0.10)" stroke-width="1"/>' +
+      '<path d="' + d + '" fill="none" stroke="' + stroke + '" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>' +
+      '</svg>';
+  }
+
+  function fmtSpanShort(seconds) {
+    if (seconds >= 86400) return (seconds / 86400).toFixed(seconds >= 172800 ? 0 : 1) + 'd';
+    if (seconds >= 3600) return Math.round(seconds / 3600) + 'h';
+    return Math.max(1, Math.round(seconds / 60)) + 'm';
+  }
+
+  // loadQuotaHistory refreshes the cached series. Best-effort: a failure just
+  // means the Trend column shows placeholders, never a broken quota table.
+  async function loadQuotaHistory() {
+    try {
+      const res = await apiFetch('/v0/management/quota-history?hours=168');
+      const data = await res.json();
+      quotaHistoryByAuth = data.accounts || {};
+    } catch (_) { /* keep the previous series */ }
+  }
   // Session-affinity bindings joined into each account row (keyed by
   // auth_id). Populated by loadAccountQuota from /session-affinity/bindings
   // so the account panel shows each account's live bindings inline — the
@@ -2494,6 +2602,7 @@
       const [res, bindingsRes] = await Promise.all([
         apiFetch('/v0/management/auth-files'),
         apiFetch('/v0/management/session-affinity/bindings').catch(() => null),
+        loadQuotaHistory(),
       ]);
       quotaBindingsByAuth = {};
       if (bindingsRes) {
@@ -2821,6 +2930,7 @@
       '<td>' + statusPill + '</td>' +
       '<td>' + primaryCell + '</td>' +
       '<td>' + secondaryCell + '</td>' +
+      '<td>' + sparklineSVG(a.id, quotaHistoryByAuth[a.id]) + '</td>' +
       '<td>' + resetsCell + '</td>' +
       '<td>' + fetchedCell + '</td>' +
       '<td>' + renderQuotaBindingsCell(a.id) + '</td>' +
@@ -3174,6 +3284,87 @@
       setStatus('delete failed: ' + (err && err.message ? err.message : err), true);
       if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || '🗑'; }
     }
+  }
+
+  // ---- Quota history chart -------------------------------------------------
+  // Full-size view of one account's usage curve: both windows, gridlines, a
+  // time axis, and the peak-before-last-reset callout (the number you want
+  // after a window resets and the live gauge is already back at 0%).
+  let qcAuthID = null;
+  let qcRangeHours = 48;
+
+  function openQuotaChart(authID) {
+    qcAuthID = authID;
+    const modal = $('quotaChartModal');
+    if (!modal) return;
+    const acct = (lastQuotaFiles || []).find(a => a.id === authID);
+    $('qcAccount').textContent = (acct && (acct.label || acct.email || acct.name)) || authID;
+    modal.hidden = false;
+    renderQuotaChart();
+  }
+  function closeQuotaChart() {
+    const modal = $('quotaChartModal');
+    if (modal) modal.hidden = true;
+    qcAuthID = null;
+  }
+
+  function renderQuotaChart() {
+    const host = $('qcChart');
+    if (!host || !qcAuthID) return;
+    const all = quotaHistoryByAuth[qcAuthID] || [];
+    const cutoff = (Date.now() / 1000) - qcRangeHours * 3600;
+    const series = all.filter(s => s.t >= cutoff);
+    if (series.length < 2) {
+      host.innerHTML = '<div class="muted" style="padding:18px 4px">Not enough samples in this range yet. ' +
+        'History is recorded on every quota refresh (~10 min) and kept for 7 days.</div>';
+      return;
+    }
+    const W = 760, H = 240, L = 34, R = 10, T = 10, B = 22;
+    const t0 = series[0].t, t1 = series[series.length - 1].t;
+    const span = Math.max(1, t1 - t0);
+    const x = (t) => L + ((t - t0) / span) * (W - L - R);
+    const y = (v) => T + (1 - Math.max(0, Math.min(100, v)) / 100) * (H - T - B);
+    const path = (key) => series.map((s, i) => (i ? 'L' : 'M') + x(s.t).toFixed(1) + ' ' + y(s[key]).toFixed(1)).join('');
+
+    let grid = '';
+    [0, 25, 50, 75, 100].forEach(v => {
+      grid += '<line x1="' + L + '" y1="' + y(v) + '" x2="' + (W - R) + '" y2="' + y(v) +
+        '" stroke="rgba(255,255,255,' + (v === 100 ? '0.18' : '0.07') + ')" stroke-width="1"/>' +
+        '<text x="' + (L - 6) + '" y="' + (y(v) + 3.5) + '" text-anchor="end" fill="rgba(255,255,255,0.4)" font-size="10">' + v + '</text>';
+    });
+    // Time axis: a few evenly spaced labels across the window.
+    let axis = '';
+    for (let i = 0; i <= 4; i++) {
+      const t = t0 + (span * i) / 4;
+      const d = new Date(t * 1000);
+      const lbl = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+      axis += '<text x="' + x(t).toFixed(1) + '" y="' + (H - 6) + '" text-anchor="middle" fill="rgba(255,255,255,0.4)" font-size="10">' + lbl + '</text>';
+    }
+    // Peak before the most recent reset (a drop of >=25 points between samples).
+    let resetAt = -1, peakBefore = 0;
+    for (let i = 1; i < series.length; i++) {
+      if (series[i - 1].p - series[i].p >= 25) { resetAt = i; peakBefore = series[i - 1].p; }
+    }
+    let marker = '';
+    let statLine = '';
+    if (resetAt > 0) {
+      const rx = x(series[resetAt].t).toFixed(1);
+      marker = '<line x1="' + rx + '" y1="' + T + '" x2="' + rx + '" y2="' + (H - B) +
+        '" stroke="#ff8a8a" stroke-width="1" stroke-dasharray="3 3"/>';
+      statLine = 'Last reset ' + ciFmtTime(new Date(series[resetAt].t * 1000).toISOString()) +
+        ' — peak before it <b>' + peakBefore + '%</b>';
+    } else {
+      statLine = 'No reset in this range — peak <b>' + series.reduce((m, s) => Math.max(m, s.p), 0) + '%</b>';
+    }
+
+    host.innerHTML =
+      '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">' +
+      grid + axis + marker +
+      '<path d="' + path('s') + '" fill="none" stroke="#c58fff" stroke-width="1.5" opacity="0.85"/>' +
+      '<path d="' + path('p') + '" fill="none" stroke="#8fc6ff" stroke-width="1.8"/>' +
+      '</svg>' +
+      '<div class="qc-stat" style="margin-top:6px">' + statLine +
+      ' · ' + series.length + ' samples over ' + fmtSpanShort(span) + '</div>';
   }
 
   // deleteAllDeactivated bulk-removes every account currently flagged
@@ -3710,6 +3901,10 @@
     }
   });
   document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && $('quotaChartModal') && !$('quotaChartModal').hidden) {
+      closeQuotaChart();
+      return;
+    }
     if (ev.key === 'Escape' && !$('bindingsModal').hidden) {
       closeBindingsModal();
       return;
@@ -3762,6 +3957,25 @@
       // /auth-files. Per-row refresh is the one that actually triggers
       // an inline fetch.
       loadAccountQuota();
+      return;
+    }
+    const spark = ev.target.closest('[data-quota-chart]');
+    if (spark) {
+      ev.preventDefault();
+      openQuotaChart(spark.getAttribute('data-quota-chart'));
+      return;
+    }
+    const qcRange = ev.target.closest('[data-qc-range]');
+    if (qcRange) {
+      ev.preventDefault();
+      qcRangeHours = Number(qcRange.getAttribute('data-qc-range')) || 48;
+      document.querySelectorAll('[data-qc-range]').forEach(b => b.classList.toggle('active', b === qcRange));
+      renderQuotaChart();
+      return;
+    }
+    if (ev.target.id === 'qcCloseBtn' || ev.target.id === 'quotaChartModal') {
+      ev.preventDefault();
+      closeQuotaChart();
       return;
     }
     const deleteDead = ev.target.closest('#deleteDeadBtn');

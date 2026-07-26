@@ -281,6 +281,34 @@ type XAIBillingPoller struct {
 	mu      sync.Mutex
 	cancel  context.CancelFunc
 	started bool
+
+	// observer, when set, receives every freshly fetched snapshot. Used to
+	// mirror grok billing into the monitor's quota history alongside codex.
+	observer func(authID string, snap coreauth.QuotaSnapshot)
+}
+
+// SetObserver installs a callback invoked with each freshly fetched snapshot.
+// Observational only; it must not block. Call before Start.
+func (p *XAIBillingPoller) SetObserver(fn func(authID string, snap coreauth.QuotaSnapshot)) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.observer = fn
+	p.mu.Unlock()
+}
+
+// notifyObserver fans a snapshot out to the observer if one is installed.
+func (p *XAIBillingPoller) notifyObserver(authID string, snap coreauth.QuotaSnapshot) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	fn := p.observer
+	p.mu.Unlock()
+	if fn != nil {
+		fn(authID, snap)
+	}
 }
 
 // NewXAIBillingPoller constructs a poller. interval<=0 uses the default.
@@ -352,6 +380,7 @@ func (p *XAIBillingPoller) RefreshNow(ctx context.Context, authID string) (corea
 			return coreauth.QuotaSnapshot{}, ok, err
 		}
 		p.cache.set(authID, snap)
+		p.notifyObserver(authID, snap)
 		return snap, true, nil
 	}
 	return coreauth.QuotaSnapshot{}, false, fmt.Errorf("xai billing: auth %q not found", authID)
@@ -423,6 +452,7 @@ func (p *XAIBillingPoller) runOnce(ctx context.Context) {
 				return
 			}
 			p.cache.set(a.ID, snap)
+			p.notifyObserver(a.ID, snap)
 			log.Debugf("xai-billing: fetch ok | auth=%s weekly_used=%d%% monthly_used=%d%%", a.ID, snap.UsedPercentPrimary, snap.UsedPercentSecondary)
 		}(target)
 	}

@@ -58,6 +58,7 @@ func RegisterRoutes(group *gin.RouterGroup, reg *Registry, bindingsFunc Bindings
 	group.PUT("/in-flight/settings", settingsPutHandler(reg))
 	group.GET("/in-flight/history", historyHandler(reg))
 	group.GET("/in-flight/recent-errors", recentErrorsHandler(reg))
+	group.GET("/quota-history", quotaHistoryHandler(reg))
 	if bindingsFunc != nil {
 		group.GET("/session-affinity/bindings", bindingsHandler(reg, bindingsFunc, authLookup))
 	}
@@ -96,6 +97,24 @@ func recentErrorsHandler(reg *Registry) gin.HandlerFunc {
 		c.JSON(http.StatusOK, gin.H{
 			"records": reg.RecentErrors(limit),
 			"now":     time.Now(),
+		})
+	}
+}
+
+// quotaHistoryHandler serves the retained per-auth quota series so the quota
+// panel can draw a usage curve. `hours` limits the window (default 48, 0 = all
+// retained history).
+func quotaHistoryHandler(reg *Registry) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		hours := 48
+		if v := strings.TrimSpace(c.Query("hours")); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				hours = n
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"accounts": reg.QuotaHistorySnapshot(hours),
+			"now":      time.Now(),
 		})
 	}
 }
