@@ -47,7 +47,25 @@ type quotaHistoryStore struct {
 func newQuotaHistoryStore(path string) *quotaHistoryStore {
 	s := &quotaHistoryStore{data: make(map[string][]QuotaSample), path: path}
 	s.load()
+	if path != "" {
+		go s.flushLoop()
+	}
 	return s
+}
+
+// flushLoop persists pending samples on a timer. record() alone is not enough:
+// its write is debounced, so the newest batch would sit unsaved until the NEXT
+// sample arrives — a full refresh cycle (~10 min) later, and lost entirely if
+// the process restarts first. The ticker bounds that exposure to the debounce
+// interval. Runs for the process lifetime; the store is a startup singleton.
+func (s *quotaHistoryStore) flushLoop() {
+	ticker := time.NewTicker(quotaHistorySaveEvery)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.mu.Lock()
+		s.saveLocked(time.Now())
+		s.mu.Unlock()
+	}
 }
 
 func (s *quotaHistoryStore) load() {
