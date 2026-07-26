@@ -2407,7 +2407,9 @@
   // pill, showing the human message with the full snippet on hover. Empty when
   // no snippet was captured.
   function errSnippetLine(e) {
-    const s = (e && e.error_snippet) ? String(e.error_snippet) : '';
+    // stream_failure carries the reason for a mid-stream failure, where the
+    // status line was already 200 and no error body was ever captured.
+    const s = (e && (e.error_snippet || e.stream_failure)) ? String(e.error_snippet || e.stream_failure) : '';
     if (!s) return '';
     const msg = extractErrMsg(s);
     const short = msg.length > 140 ? msg.slice(0, 140) + '…' : msg;

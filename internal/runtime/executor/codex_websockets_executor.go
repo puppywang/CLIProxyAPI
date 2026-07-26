@@ -603,6 +603,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				terminateReason = "read_error"
 				terminateErr = errRead
+				helps.LogWithRequestID(ctx).Warnf("codex websockets: read error before completion | err=%v", errRead)
+				helps.MarkStreamFailure(ctx, "codex websocket read error: "+errRead.Error())
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", errRead)
 				reporter.PublishFailure(ctx, errRead)
 				_ = send(cliproxyexecutor.StreamChunk{Err: errRead})
@@ -635,6 +637,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
+				// Log the raw upstream frame: it carries the provider's request
+				// id, the only handle on the failure, and no error dump is
+				// written because the HTTP side is a successful upgrade.
+				helps.LogWithRequestID(ctx).Warnf("codex websockets: upstream error before completion | body=%s",
+					helps.SummarizeErrorBody("application/json", payload))
+				helps.MarkStreamFailure(ctx, "codex websocket upstream error: "+helps.SummarizeErrorBody("application/json", payload))
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
 				reporter.PublishFailure(ctx, wsErr)
 				if sess != nil {

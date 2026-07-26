@@ -97,6 +97,13 @@ type Entry struct {
 	// (e.g. "unknown provider for model X", context_too_large, engine
 	// overloaded) directly in the monitor instead of digging through logs.
 	ErrorSnippet string `json:"error_snippet,omitempty"`
+	// StreamFailure describes a failure that happened AFTER the response
+	// status line was already written — an SSE/WebSocket stream that errored
+	// or ended before its terminal event. The HTTP status is stuck at 200 in
+	// that case, so without this the outcome is indistinguishable from a
+	// clean success (observed: codex reporting "stream disconnected before
+	// completion" for requests the monitor showed as 200 OK).
+	StreamFailure string `json:"stream_failure,omitempty"`
 }
 
 // trackedRequest is the mutable runtime representation behind a registry entry.
@@ -129,22 +136,23 @@ type trackedRequest struct {
 	outputTokens    atomic.Int64
 	totalTokens     atomic.Int64
 
-	mu           sync.RWMutex
-	model        string
-	authID       string
-	authLabel    string
-	provider     string
-	authProxy    string
-	status       Status
-	cancel       context.CancelFunc
-	canceledBy   string
-	canceledAt   time.Time
-	sessionID    string
-	threadID     string
-	turnID       string
-	threadSource string
-	workspace    string
-	errorSnippet string
+	mu            sync.RWMutex
+	model         string
+	authID        string
+	authLabel     string
+	provider      string
+	authProxy     string
+	status        Status
+	cancel        context.CancelFunc
+	canceledBy    string
+	canceledAt    time.Time
+	sessionID     string
+	threadID      string
+	turnID        string
+	threadSource  string
+	workspace     string
+	errorSnippet  string
+	streamFailure string
 	// bodyTiming measures how long the request body took to arrive. Set once
 	// by the monitor middleware right after Register; read in snapshot().
 	bodyTiming *bodyTimer
@@ -205,6 +213,7 @@ func (t *trackedRequest) snapshot() Entry {
 		ThreadSource:      t.threadSource,
 		Workspace:         t.workspace,
 		ErrorSnippet:      t.errorSnippet,
+		StreamFailure:     t.streamFailure,
 	}
 }
 
@@ -584,6 +593,11 @@ func classifyErrorReason(snap Entry) string {
 			return "client_4xx"
 		}
 	}
+	if snap.StreamFailure != "" {
+		// Status line already sent (typically 200) but the stream never
+		// completed — the failure is invisible to the status code alone.
+		return "stream_incomplete"
+	}
 	if code == 0 && snap.Status == StatusFinished {
 		// Finished without ever writing a status line — typically a
 		// connection drop or an internal short-circuit before any
@@ -923,6 +937,27 @@ func (r *Registry) SetErrorSnippet(t *trackedRequest, snippet string) {
 	t.mu.Lock()
 	t.errorSnippet = snippet
 	t.mu.Unlock()
+}
+
+// SetStreamFailure records that a streaming response failed after its status
+// line was already sent. classifyErrorReason promotes such an entry to an
+// error even though the HTTP status stays 200.
+func (r *Registry) SetStreamFailure(t *trackedRequest, reason string) {
+	if t == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return
+	}
+	const maxLen = 2048
+	if len(reason) > maxLen {
+		reason = reason[:maxLen]
+	}
+	t.mu.Lock()
+	t.streamFailure = reason
+	t.mu.Unlock()
+	r.touch(t)
 }
 
 // terminalLingerDuration keeps finished/canceled entries visible briefly so

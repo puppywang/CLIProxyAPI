@@ -1312,6 +1312,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		var sawCompleted bool
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
 		for scanner.Scan() {
@@ -1323,6 +1324,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				data := bytes.TrimSpace(line[5:])
 				if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
 					clearCodexReasoningReplayOnInvalidSignature(replayScope, streamErr.StatusCode(), terminalBody)
+					// Log the upstream payload: it carries the provider's own
+					// request id, which is the only handle support has on the
+					// failure and is otherwise unrecoverable — the response is
+					// a 200 stream, so no error dump is written for it.
+					helps.LogWithRequestID(ctx).Warnf("codex stream: upstream terminal error | auth=%s status=%d body=%s",
+						authID, streamErr.StatusCode(), helps.SummarizeErrorBody("application/json", terminalBody))
+					helps.MarkStreamFailure(ctx, "codex upstream stream error: "+helps.SummarizeErrorBody("application/json", terminalBody))
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
 					reporter.PublishFailure(ctx, streamErr)
 					select {
@@ -1335,6 +1343,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed":
+					sawCompleted = true
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
 					}
@@ -1356,10 +1365,31 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
+			helps.LogWithRequestID(ctx).Warnf("codex stream: read error before completion | auth=%s err=%v", authID, errScan)
+			helps.MarkStreamFailure(ctx, "codex stream read error: "+errScan.Error())
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		// The upstream body ended cleanly but never emitted response.completed:
+		// a truncated turn. The non-streaming path already fails this case; the
+		// streaming path used to close the channel as if the turn had
+		// succeeded, so the conductor recorded success, no failover happened,
+		// and the client was left to report the broken turn on its own (codex:
+		// "stream disconnected before completion"). Surface it as an error so
+		// it is retried/failed over and visible in the monitor.
+		if !sawCompleted && ctx.Err() == nil {
+			truncErr := statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
+			helps.LogWithRequestID(ctx).Warnf("codex stream: closed before response.completed | auth=%s", authID)
+			helps.MarkStreamFailure(ctx, "codex stream closed before response.completed")
+			helps.RecordAPIResponseError(ctx, e.cfg, truncErr)
+			reporter.PublishFailure(ctx, truncErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: truncErr}:
 			case <-ctx.Done():
 			}
 		}

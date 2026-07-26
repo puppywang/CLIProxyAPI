@@ -90,6 +90,17 @@ func (h *Handle) MarkFirstByte() {
 	h.t.firstChunkAt.CompareAndSwap(0, time.Now().UnixNano())
 }
 
+// MarkStreamFailure records that the response stream failed after its status
+// line was already written (SSE/WebSocket error event, or the stream ending
+// before its terminal event). The HTTP middleware cannot see this — the status
+// code stays 200 — so without it the request looks like a clean success.
+func (h *Handle) MarkStreamFailure(reason string) {
+	if !h.Active() {
+		return
+	}
+	h.r.SetStreamFailure(h.t, reason)
+}
+
 // Finish completes the underlying entry, broadcasting the terminal status
 // and scheduling removal after the linger window. Safe to call on a nil
 // handle.

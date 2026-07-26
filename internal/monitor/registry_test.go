@@ -537,3 +537,21 @@ func TestRegistrySubscribe(t *testing.T) {
 		t.Fatal("no event received within 1s")
 	}
 }
+
+// TestClassifyErrorReason_StreamFailureDespite200 locks in that a failure which
+// happens after the status line was sent is still classified as an error. A
+// streaming response commits 200 on its first byte, so without the
+// StreamFailure marker a truncated turn is indistinguishable from success —
+// exactly how "stream disconnected before completion" turns went unnoticed.
+func TestClassifyErrorReason_StreamFailureDespite200(t *testing.T) {
+	if got := classifyErrorReason(Entry{Status: StatusFinished, StatusCode: 200}); got != "" {
+		t.Fatalf("a clean 200 must not be an error, got %q", got)
+	}
+	if got := classifyErrorReason(Entry{Status: StatusFinished, StatusCode: 200, StreamFailure: "codex stream closed before response.completed"}); got != "stream_incomplete" {
+		t.Fatalf("mid-stream failure on a 200 must classify as stream_incomplete, got %q", got)
+	}
+	// A real HTTP error keeps its more specific classification.
+	if got := classifyErrorReason(Entry{Status: StatusFinished, StatusCode: 429, StreamFailure: "x"}); got != "quota" {
+		t.Fatalf("status-code classification must take precedence, got %q", got)
+	}
+}
