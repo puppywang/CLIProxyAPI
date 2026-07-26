@@ -628,7 +628,30 @@
   .qh-spark:hover { background: rgba(143,198,255,0.10); }
   .qh-spark-empty { color: rgba(255,255,255,0.25); font-size: 10px; }
   /* Full-size quota history chart modal. */
-  .qc-chart-wrap { padding: 4px 2px 2px; overflow-x: auto; }
+  /* The chart scales to the modal width via its viewBox, so it never needs a
+     horizontal scrollbar. position:relative anchors the hover tooltip. */
+  .qc-chart-wrap { padding: 4px 2px 2px; position: relative; }
+  .qc-chart-wrap svg { display: block; width: 100%; height: auto; }
+  .qc-tip {
+    position: absolute;
+    pointer-events: none;
+    transform: translate(-50%, -100%);
+    background: rgba(18,20,26,0.97);
+    border: 1px solid rgba(255,255,255,0.16);
+    border-radius: 5px;
+    padding: 5px 8px;
+    font-size: 11px;
+    line-height: 1.45;
+    color: #e8e8e8;
+    white-space: nowrap;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.45);
+    z-index: 5;
+  }
+  .qc-tip[hidden] { display: none; }
+  .qc-tip .k { color: rgba(255,255,255,0.5); }
+  .qc-tip .vp { color: #8fc6ff; font-weight: 600; }
+  .qc-tip .vs { color: #c58fff; font-weight: 600; }
+  .qc-tip .lim { color: #ff8a8a; }
   .qc-chart-legend {
     display: flex;
     gap: 14px;
@@ -3360,13 +3383,61 @@
     }
 
     host.innerHTML =
-      '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">' +
+      '<svg id="qcSvg" viewBox="0 0 ' + W + ' ' + H + '">' +
       grid + axis + marker +
       '<path d="' + path('s') + '" fill="none" stroke="#c58fff" stroke-width="1.5" opacity="0.85"/>' +
       '<path d="' + path('p') + '" fill="none" stroke="#8fc6ff" stroke-width="1.8"/>' +
+      '<g id="qcCross" style="display:none">' +
+        '<line id="qcCrossLine" y1="' + T + '" y2="' + (H - B) + '" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>' +
+        '<circle id="qcDotS" r="3" fill="#c58fff"/>' +
+        '<circle id="qcDotP" r="3.2" fill="#8fc6ff"/>' +
+      '</g>' +
+      // Transparent hit area over the plot so hover works anywhere in the
+      // chart, not just exactly on the 1.8px-wide line.
+      '<rect id="qcHit" x="' + L + '" y="' + T + '" width="' + (W - L - R) + '" height="' + (H - T - B) + '" fill="transparent"/>' +
       '</svg>' +
+      '<div class="qc-tip" id="qcTip" hidden></div>' +
       '<div class="qc-stat" style="margin-top:6px">' + statLine +
       ' · ' + series.length + ' samples over ' + fmtSpanShort(span) + '</div>';
+
+    // Hover readout: snap to the nearest sample and show its exact values.
+    const svgEl = $('qcSvg'), hit = $('qcHit'), cross = $('qcCross'), tip = $('qcTip');
+    const dotP = $('qcDotP'), dotS = $('qcDotS'), crossLine = $('qcCrossLine');
+    if (svgEl && hit) {
+      hit.addEventListener('mousemove', (ev) => {
+        const rect = svgEl.getBoundingClientRect();
+        if (!rect.width) return;
+        const sx = rect.width / W, sy = rect.height / H;
+        const vx = (ev.clientX - rect.left) / sx;
+        const tAt = t0 + ((vx - L) / (W - L - R)) * span;
+        let best = 0, bestDelta = Infinity;
+        for (let i = 0; i < series.length; i++) {
+          const delta = Math.abs(series[i].t - tAt);
+          if (delta < bestDelta) { bestDelta = delta; best = i; }
+        }
+        const s = series[best];
+        const px = x(s.t), pyP = y(s.p), pyS = y(s.s);
+        crossLine.setAttribute('x1', px); crossLine.setAttribute('x2', px);
+        dotP.setAttribute('cx', px); dotP.setAttribute('cy', pyP);
+        dotS.setAttribute('cx', px); dotS.setAttribute('cy', pyS);
+        cross.style.display = '';
+        const d = new Date(s.t * 1000);
+        const stamp = (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0') + ' ' +
+          String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+        tip.innerHTML = '<span class="k">' + stamp + '</span><br>' +
+          '<span class="k">5h/weekly</span> <span class="vp">' + s.p + '%</span> · ' +
+          '<span class="k">7d/monthly</span> <span class="vs">' + s.s + '%</span>' +
+          (s.l ? '<br><span class="lim">limit reached</span>' : '');
+        const wrapRect = host.getBoundingClientRect();
+        tip.style.left = ((rect.left - wrapRect.left) + px * sx) + 'px';
+        tip.style.top = ((rect.top - wrapRect.top) + Math.min(pyP, pyS) * sy - 8) + 'px';
+        tip.hidden = false;
+      });
+      hit.addEventListener('mouseleave', () => {
+        cross.style.display = 'none';
+        tip.hidden = true;
+      });
+    }
   }
 
   // deleteAllDeactivated bulk-removes every account currently flagged
