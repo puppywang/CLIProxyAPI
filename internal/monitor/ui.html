@@ -2571,32 +2571,122 @@
   // immediate wham/usage fetch without waiting for the next periodic
   // tick. Row-keyed cache so partial updates don't flash the entire
   // table on every poll.
-  const quotaRows = new Map();
+  //
+  // Performance notes (2026-07-27):
+  // - Do NOT wipe body.innerHTML on every poll. With multi-tab + 10s
+  //   refresh this was rebuilding every quota row (and every sparkline
+  //   SVG path) ~12 times/minute and made the page feel stuck.
+  // - Quota history is sampled every ~10 min server-side; polling it
+  //   every 10s only re-downloads multi-MB JSON and re-parses it.
+  // - Sparklines only need ~48 points for an 88px SVG; downsample.
+  const quotaRows = new Map(); // authID -> { tr, sig }
   let quotaInflight = false;
   // Last-rendered account list, so the "Delete deactivated" bulk action can
   // enumerate the dead accounts without re-fetching. Refreshed every render.
   let lastQuotaFiles = [];
-  // Per-auth quota history ({authID: [{t,p,s,l}, ...]}), refreshed alongside
-  // the quota table and used for the Trend sparkline + the full chart.
+  // Per-auth quota history ({authID: [{t,p,s,l}, ...]}), refreshed on a
+  // slower cadence than the quota table and used for Trend sparklines +
+  // the full chart modal.
   let quotaHistoryByAuth = {};
+  let quotaHistoryLoadedAt = 0;
+  let quotaHistoryInflight = null;
+  const QUOTA_HISTORY_TTL_MS = 5 * 60 * 1000; // history only changes ~10 min
+  const QUOTA_HISTORY_HOURS = 168;
+  const SPARKLINE_MAX_POINTS = 48;
+
+  // Downsample a dense series to at most `maxPoints` samples while always
+  // keeping the first and last points. Sparklines are 88px wide; feeding
+  // 300–600 raw samples per row is pure main-thread waste.
+  function downsampleSeries(series, maxPoints) {
+    if (!series || series.length <= maxPoints) return series || [];
+    const out = [];
+    const last = series.length - 1;
+    const step = last / (maxPoints - 1);
+    let prev = -1;
+    for (let i = 0; i < maxPoints; i++) {
+      const idx = i === maxPoints - 1 ? last : Math.round(i * step);
+      if (idx === prev) continue;
+      out.push(series[idx]);
+      prev = idx;
+    }
+    return out;
+  }
+
+  // Stable signature of everything a quota row renders. When unchanged we
+  // keep the existing <tr> (and its sparkline SVG) instead of tearing the
+  // DOM down. Relative "Xm ago" text is intentionally excluded — those
+  // labels only need to move when the underlying snapshot changes.
+  function quotaRowSignature(a) {
+    const q = a.quota || {};
+    const cd = a.cooldown || {};
+    const auth = cd.auth || {};
+    const models = cd.models || [];
+    const reg = cd.registry_suspended_models || [];
+    const b = quotaBindingsByAuth[a.id] || {};
+    const hist = quotaHistoryByAuth[a.id];
+    const histTail = (hist && hist.length)
+      ? (hist[hist.length - 1].t + ':' + hist[hist.length - 1].p + ':' + hist.length)
+      : '0';
+    return [
+      a.id,
+      a.disabled ? 1 : 0,
+      a.unavailable ? 1 : 0,
+      Number(a.priority) || 0,
+      a.xai_using_api ? 1 : 0,
+      a.label || a.email || a.name || '',
+      a.name || a.id || '',
+      a.provider || a.type || '',
+      q.dead_reason || '',
+      q.dead_since || '',
+      q.limit_reached ? 1 : 0,
+      q.used_percent_primary || 0,
+      q.used_percent_secondary || 0,
+      q.reset_at_primary || '',
+      q.reset_at_secondary || '',
+      q.fetched_at || '',
+      auth.unavailable ? 1 : 0,
+      auth.quota_exceeded ? 1 : 0,
+      auth.quota_recover_at || '',
+      auth.next_retry_after || '',
+      auth.quota_backoff_level || 0,
+      auth.quota_reason || '',
+      models.map(m => [
+        m.model || '',
+        m.quota_exceeded ? 1 : 0,
+        m.unavailable ? 1 : 0,
+        m.quota_recover_at || '',
+        m.next_retry_after || '',
+        m.status_message || '',
+      ].join('~')).join('|'),
+      reg.join(','),
+      b.active_count != null ? b.active_count : (b.windows_count || 0),
+      b.closed_count || 0,
+      (b.windows && b.windows.length) || 0,
+      histTail,
+    ].join('\x1f');
+  }
 
   // sparklineSVG renders a compact primary-usage curve. Returns an em-dash
   // placeholder until at least two samples exist (one point is not a trend).
   function sparklineSVG(authID, series) {
-    if (!series || series.length < 2) {
+    const pts = downsampleSeries(series, SPARKLINE_MAX_POINTS);
+    if (!pts || pts.length < 2) {
       return '<span class="qh-spark-empty" title="Collecting — the curve appears once a couple of quota refreshes have been recorded">—</span>';
     }
     const W = 88, H = 22, pad = 2;
-    const t0 = series[0].t, t1 = series[series.length - 1].t;
+    const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
     const span = Math.max(1, t1 - t0);
     const x = (t) => pad + ((t - t0) / span) * (W - pad * 2);
     const y = (v) => H - pad - (Math.max(0, Math.min(100, v)) / 100) * (H - pad * 2);
     let d = '';
-    for (let i = 0; i < series.length; i++) {
-      d += (i === 0 ? 'M' : 'L') + x(series[i].t).toFixed(1) + ' ' + y(series[i].p).toFixed(1);
+    for (let i = 0; i < pts.length; i++) {
+      d += (i === 0 ? 'M' : 'L') + x(pts[i].t).toFixed(1) + ' ' + y(pts[i].p).toFixed(1);
     }
-    const last = series[series.length - 1].p;
-    const peak = series.reduce((m, s) => Math.max(m, s.p), 0);
+    const last = pts[pts.length - 1].p;
+    // Peak over the full series (not just the downsampled path) so the
+    // tooltip still reflects the real high-water mark.
+    const peakSrc = series && series.length ? series : pts;
+    const peak = peakSrc.reduce((m, s) => Math.max(m, s.p), 0);
     const stroke = last >= 90 ? '#ff8a8a' : (last >= 50 ? '#ffd479' : '#7ee787');
     const title = 'now ' + last + '% · peak ' + peak + '% over ' + fmtSpanShort(span) + ' — click for the full chart';
     return '<svg class="qh-spark" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" ' +
@@ -2614,12 +2704,31 @@
 
   // loadQuotaHistory refreshes the cached series. Best-effort: a failure just
   // means the Trend column shows placeholders, never a broken quota table.
-  async function loadQuotaHistory() {
-    try {
-      const res = await apiFetch('/v0/management/quota-history?hours=168');
-      const data = await res.json();
-      quotaHistoryByAuth = data.accounts || {};
-    } catch (_) { /* keep the previous series */ }
+  // History is written ~every 10 min by the quota refresher, so a 5 min TTL
+  // is plenty; force=true bypasses the TTL (manual Refresh / first paint).
+  async function loadQuotaHistory(force) {
+    const now = Date.now();
+    if (!force && quotaHistoryLoadedAt && (now - quotaHistoryLoadedAt) < QUOTA_HISTORY_TTL_MS) {
+      return false;
+    }
+    if (quotaHistoryInflight) {
+      await quotaHistoryInflight;
+      return false;
+    }
+    quotaHistoryInflight = (async () => {
+      try {
+        const res = await apiFetch('/v0/management/quota-history?hours=' + QUOTA_HISTORY_HOURS);
+        const data = await res.json();
+        quotaHistoryByAuth = data.accounts || {};
+        quotaHistoryLoadedAt = Date.now();
+        return true;
+      } catch (_) {
+        return false; // keep the previous series
+      } finally {
+        quotaHistoryInflight = null;
+      }
+    })();
+    return quotaHistoryInflight;
   }
   // Session-affinity bindings joined into each account row (keyed by
   // auth_id). Populated by loadAccountQuota from /session-affinity/bindings
@@ -2627,18 +2736,23 @@
   // former standalone "Active bindings by account" panel folded in here.
   let quotaBindingsByAuth = {};
 
-  async function loadAccountQuota() {
+  async function loadAccountQuota(opts) {
     if (quotaInflight) return;
     quotaInflight = true;
+    const forceHistory = !!(opts && opts.forceHistory);
     try {
       // Fetch auth-files (quota) and session-affinity bindings together.
       // Bindings is best-effort — the endpoint only exists when a
       // SessionAffinitySelector is configured, so a failure just means
       // "no bindings column data", never a broken quota table.
+      //
+      // Quota history is intentionally NOT forced on every 10s tick: the
+      // series only grows on the ~10 min refresher, and re-downloading /
+      // re-parsing multi-thousand-point JSON was a major jank source.
       const [res, bindingsRes] = await Promise.all([
         apiFetch('/v0/management/auth-files'),
         apiFetch('/v0/management/session-affinity/bindings').catch(() => null),
-        loadQuotaHistory(),
+        loadQuotaHistory(forceHistory),
       ]);
       quotaBindingsByAuth = {};
       if (bindingsRes) {
@@ -2697,15 +2811,41 @@
         if (xp !== yp) return yp - xp;
         return String(x.id).localeCompare(String(y.id));
       });
-      body.innerHTML = '';
+
+      // Diff-render: reuse unchanged rows, only rebuild rows whose
+      // signature moved, and re-order with insertBefore. This used to
+      // wipe body.innerHTML on every poll, which destroyed every
+      // sparkline SVG and reflowed the whole table ~6×/min per tab.
+      let prevTr = null;
       for (const a of files) {
         seen.add(a.id);
-        const tr = renderQuotaRow(a);
-        body.appendChild(tr);
-        quotaRows.set(a.id, tr);
+        const sig = quotaRowSignature(a);
+        let entry = quotaRows.get(a.id);
+        if (!entry || entry.sig !== sig) {
+          const tr = renderQuotaRow(a);
+          if (entry && entry.tr && entry.tr.parentNode === body) {
+            body.replaceChild(tr, entry.tr);
+          } else if (prevTr && prevTr.parentNode === body) {
+            body.insertBefore(tr, prevTr.nextSibling);
+          } else {
+            body.insertBefore(tr, body.firstChild);
+          }
+          entry = { tr, sig };
+          quotaRows.set(a.id, entry);
+        }
+        // Keep DOM order aligned with the sorted files list.
+        const expectedPrev = prevTr;
+        if (entry.tr.previousElementSibling !== expectedPrev) {
+          const ref = expectedPrev ? expectedPrev.nextSibling : body.firstChild;
+          if (ref !== entry.tr) body.insertBefore(entry.tr, ref);
+        }
+        prevTr = entry.tr;
       }
-      for (const id of [...quotaRows.keys()]) {
-        if (!seen.has(id)) quotaRows.delete(id);
+      for (const [id, entry] of [...quotaRows.entries()]) {
+        if (!seen.has(id)) {
+          if (entry.tr && entry.tr.parentNode) entry.tr.remove();
+          quotaRows.delete(id);
+        }
       }
       renderQuotaAggregate(files);
     } catch (err) {
@@ -3376,7 +3516,11 @@
     const span = Math.max(1, t1 - t0);
     const x = (t) => L + ((t - t0) / span) * (W - L - R);
     const y = (v) => T + (1 - Math.max(0, Math.min(100, v)) / 100) * (H - T - B);
-    const path = (key) => series.map((s, i) => (i ? 'L' : 'M') + x(s.t).toFixed(1) + ' ' + y(s[key]).toFixed(1)).join('');
+    // Draw path from a downsampled series so a 7-day account with 600+
+    // samples doesn't build multi-KB path strings on every open. Hover
+    // still snaps against the full `series` for exact values.
+    const drawPts = downsampleSeries(series, 240);
+    const path = (key) => drawPts.map((s, i) => (i ? 'L' : 'M') + x(s.t).toFixed(1) + ' ' + y(s[key]).toFixed(1)).join('');
 
     let grid = '';
     [0, 25, 50, 75, 100].forEach(v => {
@@ -4061,9 +4205,9 @@
       ev.preventDefault();
       // Pull the latest snapshot — the periodic refresher already does
       // wham/usage in the background, so "refresh all" just re-fetches
-      // /auth-files. Per-row refresh is the one that actually triggers
-      // an inline fetch.
-      loadAccountQuota();
+      // /auth-files (+ force a history refresh so sparklines catch up).
+      // Per-row refresh is the one that actually triggers an inline fetch.
+      loadAccountQuota({ forceHistory: true });
       return;
     }
     const spark = ev.target.closest('[data-quota-chart]');
@@ -4193,12 +4337,18 @@
     loadSettings();
     loadHistory();
     loadRecentErrors();
-    loadAccountQuota();
+    // First paint must pull quota history; later 10s ticks reuse the TTL cache.
+    loadAccountQuota({ forceHistory: true });
     loadAutoRelease429();
   }
 
   $('connectBtn').addEventListener('click', connect);
-  $('refreshBtn').addEventListener('click', () => { refresh(); loadHistory(); loadRecentErrors(); loadAccountQuota(); });
+  $('refreshBtn').addEventListener('click', () => {
+    refresh();
+    loadHistory();
+    loadRecentErrors();
+    loadAccountQuota({ forceHistory: true });
+  });
   $('saveSettingsBtn').addEventListener('click', saveSettings);
   tbody.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-cancel]');
@@ -4222,12 +4372,16 @@
   // history every 10s. The SSE stream is still the primary update path,
   // but a dropped Critical event (subscriber channel saturated for >250ms)
   // would otherwise leave the UI stuck on a stale snapshot.
+  //
+  // Quota history is NOT force-refreshed here — it only changes on the
+  // ~10 min server refresher, and re-fetching 7d of samples every 10s
+  // (especially with multiple open tabs) was the main jank source.
   setInterval(() => {
     if (!keyEl.value) return;
     refresh();
     loadHistory();
     loadRecentErrors();
-    loadAccountQuota();
+    loadAccountQuota(); // history TTL-gated inside
   }, 10000);
 
   // Live-update the duration column even when no events arrive.
