@@ -7,16 +7,24 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
-// sub2apiExportType marks a sub2api "export accounts" JSON blob.
+// sub2apiExportType marks a legacy sub2api "export accounts" JSON blob.
+// Newer sub2api builds omit this field and instead ship:
+//
+//	{"exported_at":"...","proxies":[],"accounts":[...]}
+//
+// Detection therefore accepts either the explicit type or the accounts-array
+// shape (see isSub2apiExport).
 const sub2apiExportType = "sub2api-data"
 
 type sub2apiExport struct {
-	Type     string           `json:"type"`
-	Accounts []sub2apiAccount `json:"accounts"`
+	Type       string           `json:"type"`
+	ExportedAt string           `json:"exported_at"`
+	Accounts   []sub2apiAccount `json:"accounts"`
 }
 
 type sub2apiAccount struct {
@@ -24,6 +32,7 @@ type sub2apiAccount struct {
 	Platform    string         `json:"platform"`
 	Type        string         `json:"type"`
 	Credentials map[string]any `json:"credentials"`
+	Extra       map[string]any `json:"extra"`
 }
 
 type sub2apiConvertedFile struct {
@@ -40,14 +49,51 @@ type sub2apiSkip struct {
 var sub2apiNameUnsafe = regexp.MustCompile(`[^A-Za-z0-9._@-]`)
 
 // isSub2apiExport reports whether data is a sub2api accounts export.
+//
+// Accepted shapes:
+//  1. Legacy: {"type":"sub2api-data","accounts":[...]}
+//  2. Current: {"exported_at":"...","accounts":[{platform,credentials,...}, ...]}
+//     (type field omitted; each account is a sub2api platform record, NOT a
+//     CPA auth file — writing it raw would produce a useless credential)
+//
+// Plain CPA auth files ({"type":"codex",...} / {"type":"claude",...}) must
+// NOT match, even if they happen to contain an "accounts" key.
 func isSub2apiExport(data []byte) bool {
 	var probe struct {
-		Type string `json:"type"`
+		Type       string          `json:"type"`
+		ExportedAt string          `json:"exported_at"`
+		Accounts   json.RawMessage `json:"accounts"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(probe.Type), sub2apiExportType)
+	if strings.EqualFold(strings.TrimSpace(probe.Type), sub2apiExportType) {
+		return true
+	}
+	// Reject known CPA auth file types so a normal codex/claude upload is
+	// never re-interpreted as a sub2api export.
+	switch strings.ToLower(strings.TrimSpace(probe.Type)) {
+	case "codex", "claude", "gemini", "antigravity", "qwen", "iflow", "vertex", "openai-compatibility", "xai":
+		return false
+	}
+	if len(probe.Accounts) == 0 || probe.Accounts[0] != '[' {
+		return false
+	}
+	// Require at least one account-shaped object with platform+credentials
+	// (or the exported_at marker that current sub2api always sets).
+	if strings.TrimSpace(probe.ExportedAt) != "" {
+		return true
+	}
+	var accounts []sub2apiAccount
+	if err := json.Unmarshal(probe.Accounts, &accounts); err != nil || len(accounts) == 0 {
+		return false
+	}
+	for _, acc := range accounts {
+		if strings.TrimSpace(acc.Platform) != "" && acc.Credentials != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // convertSub2apiExport parses a sub2api export and converts each supported
@@ -55,12 +101,15 @@ func isSub2apiExport(data []byte) bool {
 // mapped (both the agentIdentity/K12 flow and standard OAuth); other platforms
 // are returned as skips with a reason.
 func convertSub2apiExport(data []byte) (files []sub2apiConvertedFile, skips []sub2apiSkip, err error) {
+	if !isSub2apiExport(data) {
+		return nil, nil, fmt.Errorf("not a sub2api export")
+	}
 	var export sub2apiExport
 	if errUnmarshal := json.Unmarshal(data, &export); errUnmarshal != nil {
 		return nil, nil, fmt.Errorf("invalid sub2api export JSON: %w", errUnmarshal)
 	}
-	if !strings.EqualFold(strings.TrimSpace(export.Type), sub2apiExportType) {
-		return nil, nil, fmt.Errorf("not a sub2api export (type=%q)", export.Type)
+	if len(export.Accounts) == 0 {
+		return nil, nil, fmt.Errorf("sub2api export contained no accounts")
 	}
 	seen := make(map[string]int)
 	for i, acc := range export.Accounts {
@@ -98,6 +147,17 @@ func sub2apiAccountToCodex(acc sub2apiAccount) (string, []byte, error) {
 		}
 		return ""
 	}
+	// Current sub2api OAuth exports put email under credentials.email and/or
+	// extra.email; fall back to either before using the account name.
+	extraStr := func(k string) string {
+		if acc.Extra == nil {
+			return ""
+		}
+		if v, ok := acc.Extra[k].(string); ok {
+			return strings.TrimSpace(v)
+		}
+		return ""
+	}
 	first := func(vals ...string) string {
 		for _, v := range vals {
 			if v != "" {
@@ -106,8 +166,30 @@ func sub2apiAccountToCodex(acc sub2apiAccount) (string, []byte, error) {
 		}
 		return ""
 	}
+	// sub2api may emit token expiry as either an RFC3339 string ("expired" /
+	// "expires_at") or a unix-seconds number ("expires_at": 1786007956).
+	// CPA auth files use the string field "expired".
+	expiryString := func() string {
+		if exp := str("expired"); exp != "" {
+			return exp
+		}
+		if exp := str("expires_at"); exp != "" {
+			return exp
+		}
+		switch v := c["expires_at"].(type) {
+		case float64:
+			if v > 0 {
+				return time.Unix(int64(v), 0).UTC().Format(time.RFC3339)
+			}
+		case json.Number:
+			if n, err := v.Int64(); err == nil && n > 0 {
+				return time.Unix(n, 0).UTC().Format(time.RFC3339)
+			}
+		}
+		return ""
+	}
 
-	email := first(str("email"), strings.TrimSpace(acc.Name), "codex")
+	email := first(str("email"), extraStr("email"), strings.TrimSpace(acc.Name), "codex")
 	out := map[string]any{"type": "codex", "email": email}
 	planType := first(str("plan_type"), "")
 
@@ -144,11 +226,20 @@ func sub2apiAccountToCodex(acc sub2apiAccount) (string, []byte, error) {
 		out["access_token"] = accessToken
 		out["refresh_token"] = refreshToken
 		out["account_id"] = first(str("account_id"), str("chatgpt_account_id"))
+		if accountID := first(str("chatgpt_account_id"), str("account_id")); accountID != "" {
+			out["chatgpt_account_id"] = accountID
+		}
+		if userID := str("chatgpt_user_id"); userID != "" {
+			out["chatgpt_user_id"] = userID
+		}
 		out["id_token"] = str("id_token")
+		if planType != "" {
+			out["plan_type"] = planType
+		}
 		if lr := str("last_refresh"); lr != "" {
 			out["last_refresh"] = lr
 		}
-		if exp := str("expired"); exp != "" {
+		if exp := expiryString(); exp != "" {
 			out["expired"] = exp
 		}
 	}

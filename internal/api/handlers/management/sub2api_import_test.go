@@ -10,11 +10,25 @@ func TestIsSub2apiExport(t *testing.T) {
 	if !isSub2apiExport([]byte(`{"type":"sub2api-data","accounts":[]}`)) {
 		t.Error("sub2api-data not detected")
 	}
+	// Current sub2api OAuth export omits type and uses exported_at + accounts[].
+	if !isSub2apiExport([]byte(`{"exported_at":"2026-07-27T09:21:09+00:00","proxies":[],"accounts":[{"name":"a","platform":"openai","type":"oauth","credentials":{"access_token":"x","refresh_token":"y"}}]}`)) {
+		t.Error("current sub2api export (no type field) not detected")
+	}
+	// accounts[] with platform+credentials is enough even without exported_at.
+	if !isSub2apiExport([]byte(`{"accounts":[{"name":"a","platform":"openai","credentials":{"access_token":"x"}}]}`)) {
+		t.Error("accounts-shaped export not detected")
+	}
 	if isSub2apiExport([]byte(`{"type":"codex","access_token":"x"}`)) {
 		t.Error("plain codex file wrongly detected as sub2api export")
 	}
+	if isSub2apiExport([]byte(`{"type":"claude","access_token":"x","accounts":[]}`)) {
+		t.Error("plain claude file with empty accounts wrongly detected")
+	}
 	if isSub2apiExport([]byte(`not json`)) {
 		t.Error("non-JSON detected as sub2api export")
+	}
+	if isSub2apiExport([]byte(`{"foo":1}`)) {
+		t.Error("unrelated JSON detected as sub2api export")
 	}
 }
 
@@ -66,5 +80,76 @@ func TestConvertSub2apiExport_AgentIdentityAndSkips(t *testing.T) {
 	}
 	if !strings.Contains(string(files2[0].Data), `"access_token": "at"`) {
 		t.Errorf("oauth file missing access_token: %s", files2[0].Data)
+	}
+}
+
+// TestConvertSub2apiExport_CurrentOAuthShape covers the 2026-07 sub2api export
+// format that omits type:"sub2api-data", uses exported_at, and stores token
+// expiry as a unix-seconds expires_at number.
+func TestConvertSub2apiExport_CurrentOAuthShape(t *testing.T) {
+	export := `{
+      "exported_at": "2026-07-27T09:21:09+00:00",
+      "proxies": [],
+      "accounts": [
+        {
+          "name": "bournealvin27093+a2",
+          "notes": "Sub2API OAuth export only; account was not imported automatically",
+          "platform": "openai",
+          "type": "oauth",
+          "credentials": {
+            "access_token": "at-value",
+            "refresh_token": "rt-value",
+            "id_token": "id-value",
+            "expires_at": 1786007956,
+            "chatgpt_account_id": "4f0058c4-92b7-40df-8d5b-76bf57e976f8",
+            "chatgpt_user_id": "user-Ze5rrMwxNNrxFN5hDbZEo6Xf",
+            "organization_id": "org-KlkHefYprbywgMvkbQEkfTcB",
+            "plan_type": "team",
+            "email": "bournealvin27093+a2@gmail.com"
+          },
+          "extra": {
+            "email": "bournealvin27093+a2@gmail.com",
+            "auth_provider": "openai",
+            "import_source": "oauth_export_only"
+          }
+        }
+      ]
+    }`
+	if !isSub2apiExport([]byte(export)) {
+		t.Fatal("current export shape not detected as sub2api")
+	}
+	files, skips, err := convertSub2apiExport([]byte(export))
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	if len(skips) != 0 {
+		t.Fatalf("skips = %#v, want none", skips)
+	}
+	if len(files) != 1 {
+		t.Fatalf("files = %d, want 1", len(files))
+	}
+	if files[0].Name != "codex-bournealvin27093_a2@gmail.com-team.json" {
+		// '+' in email is sanitized to '_'
+		t.Errorf("name = %q, want codex-bournealvin27093_a2@gmail.com-team.json", files[0].Name)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(files[0].Data, &out); err != nil {
+		t.Fatalf("converted file not JSON: %v", err)
+	}
+	for k, want := range map[string]string{
+		"type":               "codex",
+		"email":              "bournealvin27093+a2@gmail.com",
+		"access_token":       "at-value",
+		"refresh_token":      "rt-value",
+		"id_token":           "id-value",
+		"account_id":         "4f0058c4-92b7-40df-8d5b-76bf57e976f8",
+		"chatgpt_account_id": "4f0058c4-92b7-40df-8d5b-76bf57e976f8",
+		"chatgpt_user_id":    "user-Ze5rrMwxNNrxFN5hDbZEo6Xf",
+		"plan_type":          "team",
+		"expired":            "2026-08-06T09:19:16Z", // 1786007956 UTC
+	} {
+		if got, _ := out[k].(string); got != want {
+			t.Errorf("converted[%q] = %q, want %q", k, got, want)
+		}
 	}
 }
