@@ -779,6 +779,11 @@
     background: rgba(127,212,212,0.12);
     border: 1px solid rgba(127,212,212,0.32);
   }
+  .provider-pill.claude {
+    color: #f0b09b;
+    background: rgba(217,119,87,0.12);
+    border: 1px solid rgba(217,119,87,0.35);
+  }
   /* Clickable Grok Build/API endpoint toggle on a grok quota row. Green =
      Build (cli-chat-proxy, larger allowance); amber = official API. */
   .grok-build-toggle {
@@ -1210,14 +1215,15 @@
      The accompanying .quota-bar-wrap loses its min-width so the bar
      never forces its column wider than the colgroup says. */
   #quotaSection table { table-layout: fixed; width: 100%; }
-  #quotaSection col.qc-account   { width: 16%; }
-  #quotaSection col.qc-status    { width: 8%; }
-  #quotaSection col.qc-bar       { width: 11%; }
-  #quotaSection col.qc-resets    { width: 10%; }
+  #quotaSection col.qc-account   { width: 15%; }
+  #quotaSection col.qc-status    { width: 7%; }
+  #quotaSection col.qc-bar       { width: 10%; }
+  #quotaSection col.qc-trend     { width: 8%; }
+  #quotaSection col.qc-resets    { width: 9%; }
   #quotaSection col.qc-fetched   { width: 7%; }
-  #quotaSection col.qc-bindings  { width: 9%; }
-  #quotaSection col.qc-cooldown  { width: 12%; }
-  #quotaSection col.qc-actions   { width: 16%; }
+  #quotaSection col.qc-bindings  { width: 8%; }
+  #quotaSection col.qc-cooldown  { width: 11%; }
+  #quotaSection col.qc-actions   { width: 15%; }
   /* Bindings cell — a compact "N active" button that opens a popup with the
      full session list (uuids + workspace paths) rather than cramming them
      into the narrow cell. */
@@ -1426,8 +1432,8 @@
 
   <details class="history" id="quotaSection">
     <summary>
-      Account quota — Codex &amp; Grok (<span id="quotaCount">0</span>)
-      <button type="button" id="quotaRefreshAllBtn" class="quota-refresh-all" title="Refresh every codex account's wham/usage snapshot now">Refresh all</button>
+      Account quota — Codex, Grok &amp; Claude (<span id="quotaCount">0</span>)
+      <button type="button" id="quotaRefreshAllBtn" class="quota-refresh-all" title="Re-fetch the latest quota snapshots for every account now (codex wham/usage · grok billing; claude has no quota API)">Refresh all</button>
       <button type="button" id="deleteDeadBtn" class="quota-refresh-all quota-delete-dead" title="Delete every account flagged deactivated (terminal 4XX from quota refresh). A confirmation lists all of them first." hidden>🗑 Delete deactivated</button>
       <button type="button" id="registerAgentBtn" class="quota-refresh-all" title="Import an account from a one-time access_token via Agent Identity — no refresh_token / SMS code needed">+ Import via token</button>
       <label class="auto-release-429-toggle" title="When on, an upstream 429 or 402 (deactivated workspace / billing) auto-releases that account's session bindings and converts the error into a 500 so the client retries onto a fresh account — transparent failover with no client-side fork">
@@ -1450,6 +1456,7 @@
           <col class="qc-status">
           <col class="qc-bar">
           <col class="qc-bar">
+          <col class="qc-trend">
           <col class="qc-resets">
           <col class="qc-fetched">
           <col class="qc-bindings">
@@ -1460,8 +1467,8 @@
           <tr>
             <th>Account</th>
             <th>Status</th>
-            <th title="Shorter-horizon limit — codex: 5h · grok: weekly">5h window</th>
-            <th title="Longer-horizon limit — codex: 7d · grok: monthly">Weekly window</th>
+            <th title="Shorter-horizon limit — codex/claude: 5h · grok: weekly">5h window</th>
+            <th title="Longer-horizon limit — codex/claude: 7d · grok: monthly">Weekly window</th>
             <th title="Usage curve over the retained history (click for the full chart, peaks and resets)">Trend</th>
             <th>Resets</th>
             <th>Last fetched</th>
@@ -2646,7 +2653,7 @@
       noteServerNow(data.now);
       const files = (data.files || []).filter(a => {
         const p = (a.type || a.provider || '').toLowerCase();
-        return p === 'codex' || p === 'xai';
+        return p === 'codex' || p === 'xai' || p === 'claude';
       });
       $('quotaCount').textContent = String(files.length);
       lastQuotaFiles = files;
@@ -2731,10 +2738,13 @@
     let nextReset7 = null, nextReset7Label = '';
     for (const a of files) {
       if (a.disabled) continue;
-      // The fleet aggregate models Codex's 5h/7d rolling windows; grok's
-      // monthly credit pool has different semantics, so xai rows are
-      // excluded to avoid poisoning the projection.
-      if ((a.provider || a.type || '').toLowerCase() !== 'codex') continue;
+      // The fleet aggregate models the 5h/7d rolling windows shared by
+      // Codex and Claude; grok's monthly credit pool has different
+      // semantics, so xai rows are excluded to avoid poisoning the
+      // projection. (Claude rows only contribute once a quota snapshot
+      // exists — the null-check below skips them otherwise.)
+      const aggProvider = (a.provider || a.type || '').toLowerCase();
+      if (aggProvider !== 'codex' && aggProvider !== 'claude') continue;
       const q = a.quota || {};
       // wham/usage didn't deliver a snapshot yet — skip this account
       // entirely so we don't poison the aggregate with zeros that just
@@ -2836,21 +2846,26 @@
     // are distinguishable at a glance. Prefer the real filename; if it is
     // somehow missing, synthesize codex-<email>-<acct8>.json from the first
     // segment of the account id.
+    const rowProvider = (a.provider || a.type || '').toLowerCase();
+    const isXai = rowProvider === 'xai';
+    const isClaude = rowProvider === 'claude';
     const fileName = (function () {
       const nm = String(a.name || a.id || '').trim();
       if (nm) return nm;
+      if (isClaude) return 'claude-' + (a.email || 'unknown') + '.json';
       const acct = (a.id_token && a.id_token.chatgpt_account_id) || a.account_id || (a.account && a.account.id) || '';
       const seg = String(acct).split('-')[0] || 'unknown';
       return 'codex-' + (a.email || 'unknown') + '-' + seg + '.json';
     })();
     const sub = '<div class="muted qc-filename" title="' + escapeAttr(fileName) + '">' + escapeHtml(fileName) + '</div>';
     const q = a.quota || null;
-    const isXai = (a.provider || a.type || '').toLowerCase() === 'xai';
-    // Provider chip so grok rows are unmistakable in a mixed pool. Codex is
-    // the implicit default and stays unlabelled to avoid clutter.
+    // Provider chip so grok/claude rows are unmistakable in a mixed pool.
+    // Codex is the implicit default and stays unlabelled to avoid clutter.
     const providerPill = isXai
       ? '<span class="provider-pill xai" title="xAI / Grok account">grok</span>'
-      : '';
+      : (isClaude
+        ? '<span class="provider-pill claude" title="Anthropic / Claude account">claude</span>'
+        : '');
     // Clickable Grok endpoint toggle (grok rows only). a.xai_using_api is true
     // for the official API path, false for Grok Build. The label shows the mode
     // the account is CURRENTLY on; clicking switches it.
@@ -2896,18 +2911,19 @@
     else statusPill = '<span class="status-pill active">active</span>';
 
     // The two columns are ordered by horizon: primary = shorter window,
-    // secondary = longer. For codex that's 5h / 7d; for grok it's weekly /
-    // monthly. Which period each grok column represents (and when it refreshes)
-    // is shown by the Resets column ("weekly in …" / "monthly in …") plus the
-    // header tooltips, so no inline tag is needed. Hover titles name each pool.
+    // secondary = longer. For codex and claude that's 5h / 7d; for grok it's
+    // weekly / monthly. Which period each grok column represents (and when it
+    // refreshes) is shown by the Resets column ("weekly in …" / "monthly in …")
+    // plus the header tooltips. Hover titles name each pool. Claude rows have
+    // no quota poller yet, so they normally render the no-snapshot em-dash.
     const primaryCell = q
       ? (isXai ? '<span title="SuperGrok weekly cap (the binding limit)">' + quotaBarCell(q.used_percent_primary) + '</span>'
                : quotaBarCell(q.used_percent_primary))
-      : '<span class="muted">—</span>';
+      : '<span class="muted"' + (isClaude ? ' title="No quota API for Claude accounts — Anthropic tracks the 5h session window server-side"' : '') + '>' + (isClaude ? 'n/a' : '—') + '</span>';
     const secondaryCell = q
       ? (isXai ? '<span title="Monthly credit pool">' + quotaBarCell(q.used_percent_secondary) + '</span>'
                : quotaBarCell(q.used_percent_secondary))
-      : '<span class="muted">—</span>';
+      : '<span class="muted"' + (isClaude ? ' title="No quota API for Claude accounts — Anthropic tracks the weekly cap server-side"' : '') + '>' + (isClaude ? 'n/a' : '—') + '</span>';
 
     let resetsCell = '<span class="muted">—</span>';
     if (q && (validTime(q.reset_at_primary) || validTime(q.reset_at_secondary))) {
@@ -2938,12 +2954,19 @@
         ' ' + deleteBtn;
     } else {
       // Codex referral invites (✉) only make sense for codex accounts; show a
-      // disabled placeholder for grok so the action column stays aligned.
-      const inviteBtn = isXai
+      // disabled placeholder for grok/claude so the action column stays aligned.
+      const inviteBtn = (isXai || isClaude)
         ? '<button type="button" class="codex-invite-btn" disabled title="Codex only">✉</button>'
         : '<button type="button" class="codex-invite-btn" data-codex-invite="' + escapeAttr(a.id) + '" title="Send Codex referral invites from this account">✉</button>';
+      // The backend quota refresher only speaks codex wham/usage and grok
+      // billing; there is no Claude usage poller yet, so the per-row
+      // refresh stays disabled on claude rows instead of throwing a
+      // guaranteed server-side error on click.
+      const refreshBtn = isClaude
+        ? '<button type="button" class="quota-refresh-btn" disabled title="No quota API for Claude accounts yet — usage windows are tracked by Anthropic server-side only">↻</button>'
+        : '<button type="button" class="quota-refresh-btn" data-quota-refresh="' + escapeAttr(a.id) + '" title="' + (isXai ? 'Refresh grok billing for this account' : 'Refresh wham/usage for this account') + '">↻</button>';
       actions =
-        '<button type="button" class="quota-refresh-btn" data-quota-refresh="' + escapeAttr(a.id) + '" title="' + (isXai ? 'Refresh grok billing for this account' : 'Refresh wham/usage for this account') + '">↻</button>' +
+        refreshBtn +
         ' ' +
         '<button type="button" class="cooldown-force-btn" data-cooldown-force="' + escapeAttr(a.id) + '" title="Force this account into cooldown (use when quota data is returning wrong values)">⏸</button>' +
         ' ' +
