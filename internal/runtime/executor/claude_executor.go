@@ -107,8 +107,41 @@ var oauthToolRenameMap = map[string]string{
 // response to `bash`, causing Amp to reject the tool_use as unknown).
 
 // oauthToolsToRemove lists tool names that must be stripped from OAuth requests
-// even after remapping. Currently empty — all tools are mapped instead of removed.
+// even after remapping. Currently empty — non-official tools are dropped by
+// oauthOfficialToolName instead of an explicit denylist.
 var oauthToolsToRemove = map[string]bool{}
+
+// oauthOfficialToolNames is the set of Claude Code TitleCase tool names that are
+// safe to forward on OAuth traffic. Anything outside this set (and outside the
+// lowercase rename map) is treated as a third-party fingerprint and dropped.
+var oauthOfficialToolNames = func() map[string]struct{} {
+	out := make(map[string]struct{}, len(oauthToolRenameMap))
+	for _, official := range oauthToolRenameMap {
+		out[official] = struct{}{}
+	}
+	return out
+}()
+
+// oauthOfficialToolName returns the Claude Code tool name to forward upstream.
+// Lowercase OpenCode-style names are renamed; already-official TitleCase names
+// pass through; anything else is rejected so Anthropic cannot fingerprint the
+// request as a third-party app (e.g. GitHub Copilot's read_file/run_in_terminal).
+func oauthOfficialToolName(name string) (string, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", false
+	}
+	if oauthToolsToRemove[name] {
+		return "", false
+	}
+	if renamed, ok := oauthToolRenameMap[name]; ok {
+		return renamed, true
+	}
+	if _, ok := oauthOfficialToolNames[name]; ok {
+		return name, true
+	}
+	return "", false
+}
 
 // Anthropic-compatible upstreams may reject or even crash when Claude models
 // omit max_tokens. Prefer registered model metadata before using a fallback.
@@ -204,6 +237,8 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
 	body = normalizeClaudeTemperatureForThinking(body)
+	// Claude 5 family models reject temperature/top_p; drop them to avoid a 400.
+	body = stripUnsupportedClaudeSamplingParams(body)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
 	if countCacheControls(body) == 0 {
@@ -386,6 +421,8 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
 	body = normalizeClaudeTemperatureForThinking(body)
+	// Claude 5 family models reject temperature/top_p; drop them to avoid a 400.
+	body = stripUnsupportedClaudeSamplingParams(body)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
 	if countCacheControls(body) == 0 {
@@ -828,6 +865,40 @@ func normalizeClaudeTemperatureForThinking(body []byte) []byte {
 	return body
 }
 
+// claudeModelDeprecatesSampling reports whether the target Claude model rejects the
+// temperature/top_p sampling parameters outright. The Claude 5 family responds with
+// "temperature is deprecated for this model" for any temperature and
+// "top_p: only 0.95 is allowed for this model" for a differing top_p, so both
+// params must be dropped rather than forwarded. Real Claude Code never sends either.
+func claudeModelDeprecatesSampling(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	// Match the Claude 5 generation across tiers, including dated variants
+	// (e.g. claude-opus-5-20260115) and provider-prefixed ids.
+	for _, tier := range []string{"opus-5", "sonnet-5", "haiku-5", "fable-5"} {
+		if strings.Contains(m, tier) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripUnsupportedClaudeSamplingParams removes temperature/top_p for Claude models
+// that reject them (see claudeModelDeprecatesSampling). Without this, an upstream
+// client that forwards temperature/top_p (e.g. an OpenAI-compatible client) triggers
+// a hard 400 from Anthropic on the Claude 5 family.
+func stripUnsupportedClaudeSamplingParams(body []byte) []byte {
+	if !claudeModelDeprecatesSampling(gjson.GetBytes(body, "model").String()) {
+		return body
+	}
+	if gjson.GetBytes(body, "temperature").Exists() {
+		body, _ = sjson.DeleteBytes(body, "temperature")
+	}
+	if gjson.GetBytes(body, "top_p").Exists() {
+		body, _ = sjson.DeleteBytes(body, "top_p")
+	}
+	return body
+}
+
 type compositeReadCloser struct {
 	io.Reader
 	closers []func() error
@@ -1172,16 +1243,21 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 			}
 
 			name := tool.Get("name").String()
-			if oauthToolsToRemove[name] {
+			officialName, ok := oauthOfficialToolName(name)
+			if !ok {
+				// Drop non-Claude-Code tools. Copilot/BYOK clients send dozens of
+				// custom names (read_file, run_in_terminal, …); forwarding them on
+				// an OAuth token makes Anthropic classify the traffic as a
+				// third-party app and return the extra-usage 400.
 				return true
 			}
 
 			toolJSON := tool.Raw
-			if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
-				updatedTool, err := sjson.Set(toolJSON, "name", newName)
+			if officialName != name {
+				updatedTool, err := sjson.Set(toolJSON, "name", officialName)
 				if err == nil {
 					toolJSON = updatedTool
-					recordRename(name, newName)
+					recordRename(name, officialName)
 				}
 			}
 
@@ -1196,17 +1272,17 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 		body, _ = sjson.SetRawBytes(body, "tools", []byte(toolsJSON.String()))
 	}
 
-	// 2. Rename tool_choice if it references a known tool
+	// 2. Rename or drop tool_choice if it references a tool
 	toolChoiceType := gjson.GetBytes(body, "tool_choice.type").String()
 	if toolChoiceType == "tool" {
 		tcName := gjson.GetBytes(body, "tool_choice.name").String()
-		if oauthToolsToRemove[tcName] {
+		if officialName, ok := oauthOfficialToolName(tcName); !ok {
 			// The chosen tool was removed from the tools array, so drop tool_choice to
 			// keep the payload internally consistent and fall back to normal auto tool use.
 			body, _ = sjson.DeleteBytes(body, "tool_choice")
-		} else if newName, ok := oauthToolRenameMap[tcName]; ok && newName != tcName {
-			body, _ = sjson.SetBytes(body, "tool_choice.name", newName)
-			recordRename(tcName, newName)
+		} else if officialName != tcName {
+			body, _ = sjson.SetBytes(body, "tool_choice.name", officialName)
+			recordRename(tcName, officialName)
 		}
 	}
 
@@ -1223,17 +1299,20 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 				switch partType {
 				case "tool_use":
 					name := part.Get("name").String()
-					if newName, ok := oauthToolRenameMap[name]; ok && newName != name {
+					if officialName, ok := oauthOfficialToolName(name); ok && officialName != name {
 						path := fmt.Sprintf("messages.%d.content.%d.name", msgIndex.Int(), contentIndex.Int())
-						body, _ = sjson.SetBytes(body, path, newName)
-						recordRename(name, newName)
+						body, _ = sjson.SetBytes(body, path, officialName)
+						recordRename(name, officialName)
 					}
+					// Non-official historical tool_use names are left in place so the
+					// conversation structure stays valid; only the tools[] catalog is
+					// strictly filtered because that is what Anthropic fingerprints.
 				case "tool_reference":
 					toolName := part.Get("tool_name").String()
-					if newName, ok := oauthToolRenameMap[toolName]; ok && newName != toolName {
+					if officialName, ok := oauthOfficialToolName(toolName); ok && officialName != toolName {
 						path := fmt.Sprintf("messages.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int())
-						body, _ = sjson.SetBytes(body, path, newName)
-						recordRename(toolName, newName)
+						body, _ = sjson.SetBytes(body, path, officialName)
+						recordRename(toolName, officialName)
 					}
 				case "tool_result":
 					// Handle nested tool_reference blocks inside tool_result.content[]
@@ -1244,10 +1323,10 @@ func remapOAuthToolNames(body []byte) ([]byte, map[string]string) {
 						nestedContent.ForEach(func(nestedIndex, nestedPart gjson.Result) bool {
 							if nestedPart.Get("type").String() == "tool_reference" {
 								nestedToolName := nestedPart.Get("tool_name").String()
-								if newName, ok := oauthToolRenameMap[nestedToolName]; ok && newName != nestedToolName {
+								if officialName, ok := oauthOfficialToolName(nestedToolName); ok && officialName != nestedToolName {
 									nestedPath := fmt.Sprintf("messages.%d.content.%d.content.%d.tool_name", msgIndex.Int(), contentIndex.Int(), nestedIndex.Int())
-									body, _ = sjson.SetBytes(body, nestedPath, newName)
-									recordRename(nestedToolName, newName)
+									body, _ = sjson.SetBytes(body, nestedPath, officialName)
+									recordRename(nestedToolName, officialName)
 								}
 							}
 							return true

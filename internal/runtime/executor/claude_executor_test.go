@@ -2150,6 +2150,73 @@ func TestNormalizeClaudeTemperatureForThinking_AfterForcedToolChoiceKeepsOrigina
 	}
 }
 
+func TestStripUnsupportedClaudeSamplingParams_Claude5DropsTemperatureAndTopP(t *testing.T) {
+	for _, model := range []string{"claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-haiku-5", "claude-opus-5-20260115"} {
+		payload := []byte(`{"model":"` + model + `","temperature":0.7,"top_p":0.5,"max_tokens":1024}`)
+		out := stripUnsupportedClaudeSamplingParams(payload)
+		if gjson.GetBytes(out, "temperature").Exists() {
+			t.Fatalf("%s: temperature should be dropped", model)
+		}
+		if gjson.GetBytes(out, "top_p").Exists() {
+			t.Fatalf("%s: top_p should be dropped", model)
+		}
+		if got := gjson.GetBytes(out, "max_tokens").Int(); got != 1024 {
+			t.Fatalf("%s: max_tokens = %d, want 1024 (unrelated fields must be preserved)", model, got)
+		}
+	}
+}
+
+func TestStripUnsupportedClaudeSamplingParams_OlderModelsKeepTemperature(t *testing.T) {
+	for _, model := range []string{"claude-3-5-sonnet-20241022", "claude-opus-4-1", "claude-haiku-4-5-20251001"} {
+		payload := []byte(`{"model":"` + model + `","temperature":0.7,"top_p":0.5}`)
+		out := stripUnsupportedClaudeSamplingParams(payload)
+		if got := gjson.GetBytes(out, "temperature").Float(); got != 0.7 {
+			t.Fatalf("%s: temperature = %v, want 0.7 (should be left alone)", model, got)
+		}
+		if got := gjson.GetBytes(out, "top_p").Float(); got != 0.5 {
+			t.Fatalf("%s: top_p = %v, want 0.5 (should be left alone)", model, got)
+		}
+	}
+}
+
+func TestRemapOAuthToolNames_DropsNonOfficialCopilotTools(t *testing.T) {
+	// GitHub Copilot BYOK sends dozens of custom tool names. On OAuth these
+	// fingerprint the request as a third-party app and Anthropic returns:
+	// "Third-party apps now draw from your extra usage...".
+	body := []byte(`{"tools":[` +
+		`{"name":"read_file","description":"Read a file","input_schema":{"type":"object"}},` +
+		`{"name":"run_in_terminal","description":"Run a command","input_schema":{"type":"object"}},` +
+		`{"name":"Bash","description":"Official","input_schema":{"type":"object"}},` +
+		`{"name":"glob","description":"OpenCode-style","input_schema":{"type":"object"}},` +
+		`{"type":"web_search_20250305","name":"web_search"}` +
+		`],` +
+		`"tool_choice":{"type":"tool","name":"read_file"}}`)
+
+	out, reverseMap := remapOAuthToolNames(body)
+
+	tools := gjson.GetBytes(out, "tools")
+	if !tools.IsArray() {
+		t.Fatalf("tools missing after remap")
+	}
+	var names []string
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		names = append(names, tool.Get("name").String())
+		return true
+	})
+	if len(names) != 3 {
+		t.Fatalf("tools = %v, want 3 kept (Bash, Glob, web_search)", names)
+	}
+	if names[0] != "Bash" || names[1] != "Glob" || names[2] != "web_search" {
+		t.Fatalf("tools = %v, want [Bash Glob web_search]", names)
+	}
+	if reverseMap["Glob"] != "glob" {
+		t.Fatalf("reverseMap = %v, want Glob->glob", reverseMap)
+	}
+	if gjson.GetBytes(out, "tool_choice").Exists() {
+		t.Fatalf("tool_choice for dropped read_file should be removed, got %s", gjson.GetBytes(out, "tool_choice").Raw)
+	}
+}
+
 func TestRemapOAuthToolNames_TitleCase_NoReverseNeeded(t *testing.T) {
 	body := []byte(`{"tools":[{"name":"Bash","description":"Run shell commands","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
