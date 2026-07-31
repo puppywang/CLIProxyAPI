@@ -24,6 +24,7 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -619,6 +620,45 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 // These are the only states that genuinely cannot be served by
 // retrying upstream — every other failure mode resolves itself
 // through the natural request/response cycle.
+// modelUnsupportedForAuthID reports whether this auth has LEARNED it cannot
+// serve the model (durable registry model_not_supported marker set from an
+// upstream entitlement rejection). Deliberately narrow: it must never consider
+// the generic suspension marker, which is also set for transient 429/401 and
+// would tear down bindings that strict affinity exists to preserve.
+// filterModelSupported removes auths that have LEARNED they cannot serve the
+// model. Returns the input untouched when nothing is marked (the common case)
+// or when filtering would empty the pool — an empty candidate list produces a
+// confusing "no auth" error, and leaving the pool alone lets the normal error
+// path report the real upstream rejection instead.
+func filterModelSupported(auths []*Auth, model string) []*Auth {
+	if len(auths) == 0 {
+		return auths
+	}
+	kept := make([]*Auth, 0, len(auths))
+	for _, a := range auths {
+		if a != nil && modelUnsupportedForAuthID(a.ID, model) {
+			continue
+		}
+		kept = append(kept, a)
+	}
+	if len(kept) == 0 || len(kept) == len(auths) {
+		return auths
+	}
+	return kept
+}
+
+func modelUnsupportedForAuthID(authID, model string) bool {
+	reg := registry.GetGlobalRegistry()
+	if reg == nil {
+		return false
+	}
+	key := canonicalModelKey(model)
+	if key == "" {
+		return false
+	}
+	return reg.IsClientModelUnsupported(authID, key)
+}
+
 func findCacheHitAuthForStrictBypass(auths []*Auth, id, model string) *Auth {
 	if id == "" {
 		return nil
@@ -826,6 +866,12 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	// to thread_id (one conversation = one auth, allowing /new to redistribute).
 	// Remove this log once that question is settled.
 	defer logCodexTurnSample(entry, opts.Headers, provider, model, selectedAuth, retErr)
+	// Drop accounts that upstream has rejected as unentitled for this model
+	// (durable model_not_supported marker). Doing it here as well as in the
+	// downstream selector keeps each layer independently correct: this
+	// selector's fallback is not necessarily quota-aware, and honouring a
+	// binding to an account that cannot serve the model would 400 every turn.
+	auths = filterModelSupported(auths, model)
 	primaryID, fallbackID, mirrorID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
@@ -881,6 +927,19 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	// network blip. Administratively disabled auths (Disabled flag, status
 	// StatusDisabled, or per-model StatusDisabled) still trigger the
 	// strict-refuse path.
+	// A binding must not outlive the bound account's ability to serve the
+	// requested model. Session affinity is about keeping ONE conversation on
+	// ONE credential through transient trouble; an account that upstream has
+	// rejected as unentitled for this model (durable model_not_supported
+	// marker) is not transient — every turn would 400, and strict mode would
+	// refuse to move, so the conversation would be permanently stuck. Drop the
+	// binding for this model and let normal selection pick an entitled account
+	// (which also rebinds). Reason-scoped to the entitlement marker: transient
+	// quota/401 trouble still goes through the strict-bypass path below.
+	if hit && cachedAuthID != "" && modelUnsupportedForAuthID(cachedAuthID, model) {
+		entry.Infof("session-affinity: bound auth cannot serve %s, re-selecting | session=%s bound_auth=%s provider=%s", model, truncateSessionID(primaryID), cachedAuthID, provider)
+		hit = false
+	}
 	if hit && s.strict {
 		bound := findCacheHitAuthForStrictBypass(auths, cachedAuthID, model)
 		if bound == nil {

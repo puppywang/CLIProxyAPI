@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -2045,5 +2046,47 @@ func TestExtractSessionID_ContentHashIsModelScoped(t *testing.T) {
 	}
 	if got := ExtractSessionID(nil, body("grok-4.5(high)"), nil); got != native {
 		t.Fatalf("suffixed model must match its base model key: %q != %q", got, native)
+	}
+}
+
+// TestSessionAffinity_BoundAuthCannotServeModelRebinds verifies a binding is not
+// honoured for a model the bound account is not entitled to. Strict affinity
+// returns the bound credential without re-validating model support, so a
+// conversation bound to an account that upstream rejects for the requested
+// model used to 400 on every turn forever (observed: a codex thread pinned to
+// an account without the gpt-5.6-sol entitlement). The binding must give way
+// and the request must land on an entitled account.
+func TestSessionAffinity_BoundAuthCannotServeModelRebinds(t *testing.T) {
+	const model = "gpt-test-boundunsupported"
+	const sessionID = "bound-unsupported-uuid"
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+		Strict:   true,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "bound-nosol", Provider: "codex"}, {ID: "other-capable", Provider: "codex"}}
+	opts := cliproxyexecutor.Options{OriginalRequest: strictBypassPayload(sessionID)}
+
+	// Bind the session first, while both accounts still look capable.
+	bound, err := selector.Pick(context.Background(), "codex", model, opts, auths)
+	if err != nil {
+		t.Fatalf("initial Pick error = %v", err)
+	}
+
+	// Now mark the BOUND account as unentitled for this model, as an upstream
+	// model_not_supported rejection would.
+	reg := registry.GetGlobalRegistry()
+	reg.MarkClientModelUnsupported(bound.ID, model)
+	t.Cleanup(func() { reg.ResumeClientModel(bound.ID, model) })
+
+	got, errPick := selector.Pick(context.Background(), "codex", model, opts, auths)
+	if errPick != nil {
+		t.Fatalf("Pick error = %v (strict affinity must re-select, not refuse, when the bound auth cannot serve the model)", errPick)
+	}
+	if got == nil || got.ID == bound.ID {
+		t.Fatalf("picked %v, want an account other than the bound %q (the binding must not survive for an unsupported model)", got, bound.ID)
 	}
 }
