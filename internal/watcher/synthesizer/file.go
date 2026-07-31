@@ -191,6 +191,18 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 				}
 			}
 		}
+		// Agent-identity credentials authenticate with an ed25519 assertion and
+		// carry no id_token, so the claim above yields nothing. They persist the
+		// plan on the record at registration time — use it. Without this the
+		// plan stays unknown and the model catalog falls back to the Pro set,
+		// which advertises entitlements the account does not have (a free
+		// account was offered gpt-5.6-sol and every such request burned a
+		// round-trip on an upstream "model is not supported" rejection).
+		if strings.TrimSpace(a.Attributes["plan_type"]) == "" {
+			if pt, ok := metadata["plan_type"].(string); ok && strings.TrimSpace(pt) != "" {
+				a.Attributes["plan_type"] = strings.TrimSpace(pt)
+			}
+		}
 	}
 	if provider == "gemini-cli" {
 		if virtuals := SynthesizeGeminiVirtualAuths(a, metadata, now); len(virtuals) > 0 {

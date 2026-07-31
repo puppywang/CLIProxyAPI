@@ -955,3 +955,41 @@ func TestFileSynthesizer_Synthesize_MultiProjectGeminiWithNote(t *testing.T) {
 		}
 	}
 }
+
+// TestFileSynthesizer_CodexAgentIdentityPlanType verifies the plan is taken
+// from the stored plan_type when the record has no id_token. Agent-identity
+// codex credentials authenticate with an ed25519 assertion and carry no JWT,
+// so reading the plan only from the id_token left them unclassified — and an
+// unknown plan falls back to the Pro model catalog, advertising entitlements
+// (gpt-5.6-sol) a free account does not have.
+func TestFileSynthesizer_CodexAgentIdentityPlanType(t *testing.T) {
+	tempDir := t.TempDir()
+	authData := map[string]any{
+		"type":       "codex",
+		"email":      "free-user@example.com",
+		"auth_mode":  "agentIdentity",
+		"plan_type":  "free",
+		"account_id": "acct-1",
+	}
+	data, _ := json.Marshal(authData)
+	if err := os.WriteFile(filepath.Join(tempDir, "codex-free-user@example.com-free.json"), data, 0644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	if got := auths[0].Attributes["plan_type"]; got != "free" {
+		t.Fatalf("plan_type = %q, want %q (stored plan must be used when there is no id_token)", got, "free")
+	}
+}
