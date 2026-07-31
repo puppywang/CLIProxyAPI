@@ -172,6 +172,23 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 		}
 	}
+	// Read the operator's ignore-quota-limit override from the auth file. When
+	// set, the quota selector keeps this account schedulable even though its
+	// wham/usage snapshot says the window is exhausted — for accounts that
+	// still serve requests after upstream reports limit_reached. This is the
+	// inverse of forcing a cooldown.
+	if rawIgnore, ok := metadata["ignore_quota_limit"]; ok {
+		switch v := rawIgnore.(type) {
+		case bool:
+			if v {
+				a.Attributes["ignore_quota_limit"] = "true"
+			}
+		case string:
+			if parsed, errParse := strconv.ParseBool(strings.TrimSpace(v)); errParse == nil && parsed {
+				a.Attributes["ignore_quota_limit"] = "true"
+			}
+		}
+	}
 	// Read note from auth file.
 	if rawNote, ok := metadata["note"]; ok {
 		if note, isStr := rawNote.(string); isStr {

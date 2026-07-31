@@ -708,3 +708,42 @@ func TestLeastRemainingQuotaSelector_ExcludesModelUnsupportedAuth(t *testing.T) 
 		t.Fatalf("expected an error when no account supports %s, got a pick", model)
 	}
 }
+
+// TestLeastRemainingQuotaSelector_IgnoreQuotaLimitOverride verifies the operator
+// override keeps an account schedulable when its snapshot says the window is
+// exhausted (upstream sometimes reports limit_reached for an account that still
+// serves requests), while still ranking it behind an account with real headroom.
+func TestLeastRemainingQuotaSelector_IgnoreQuotaLimitOverride(t *testing.T) {
+	t.Parallel()
+
+	forced := &Auth{ID: "auth-forced", Provider: "codex", Attributes: map[string]string{"ignore_quota_limit": "true"}}
+	plain := &Auth{ID: "auth-plain", Provider: "codex"}
+	selector := NewLeastRemainingQuotaSelector(LeastRemainingQuotaConfig{
+		Inner:   &RoundRobinSelector{cursors: map[string]int{}},
+		Fetcher: newFakeQuotaFetcher(nil),
+		TTL:     time.Minute,
+		Async:   true,
+	})
+	selector.PushSnapshot("auth-forced", QuotaSnapshot{UsedPercentPrimary: 100, LimitReached: true})
+	selector.PushSnapshot("auth-plain", QuotaSnapshot{UsedPercentPrimary: 100, LimitReached: true})
+
+	// Both exhausted, but only the forced one may be selected.
+	got, err := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, []*Auth{forced, plain})
+	if err != nil {
+		t.Fatalf("Pick error = %v", err)
+	}
+	if got == nil || got.ID != "auth-forced" {
+		t.Fatalf("picked %v, want auth-forced (override must keep an exhausted account schedulable)", got)
+	}
+
+	// A healthy account still wins: the override does not promote the forced
+	// account, it only stops it from being excluded.
+	selector.PushSnapshot("auth-plain", QuotaSnapshot{UsedPercentPrimary: 5})
+	got2, err2 := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, []*Auth{forced, plain})
+	if err2 != nil {
+		t.Fatalf("Pick error = %v", err2)
+	}
+	if got2 == nil || got2.ID != "auth-plain" {
+		t.Fatalf("picked %v, want auth-plain (a healthy account must outrank a forced-exhausted one)", got2)
+	}
+}

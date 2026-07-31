@@ -690,6 +690,7 @@
   tr.quota-row-dead:hover > td { background: rgba(255,92,92,0.12); }
   .quota-refresh-btn,
   .cooldown-force-btn,
+  .force-usable-btn,
   .codex-invite-btn {
     background: transparent;
     color: rgba(255,255,255,0.6);
@@ -707,12 +708,22 @@
     font-size: 13px;
     line-height: 1;
   }
+  /* Force-schedulable (▶) toggle: the inverse of ⏸. When active, the quota
+     selector ignores this account's limit_reached / 100%-used snapshot and
+     keeps it in rotation. Highlighted while engaged so an override can never
+     be left on unnoticed. */
+  .force-usable-btn.is-on {
+    color: #7ee787;
+    border-color: rgba(126,231,135,0.55);
+    background: rgba(126,231,135,0.16);
+  }
   .cooldown-force-btn {
     /* Visual cue: this is a destructive operator action, not just a
        refresh. Reuse the same colour family as the cooldown-clear
        button so the two manual cooldown controls feel related. */
     color: #f5c98a;
   }
+  .force-usable-btn:hover:not(:disabled),
   .cooldown-force-btn:hover:not(:disabled) {
     background: rgba(245,201,138,0.08);
     border-color: rgba(245,201,138,0.35);
@@ -727,6 +738,7 @@
     border-color: rgba(127,212,212,0.35);
   }
   .quota-refresh-btn:disabled,
+  .force-usable-btn:disabled,
   .cooldown-force-btn:disabled,
   .codex-invite-btn:disabled {
     opacity: 0.35;
@@ -1158,17 +1170,36 @@
     white-space: nowrap;
     max-width: 100%;
   }
-  .cooldown-model-row {
+  /* Cooldown cell: one status pill + optional "until / count" + clear.
+     Must stay single-line and fully readable inside the fixed col width —
+     earlier flex+overflow clipped "unavail"/"quota" into "UNAVAL"/"QUO". */
+  .cooldown-cell {
     display: flex;
     align-items: center;
     gap: 6px;
-    flex-wrap: wrap;
-    padding: 2px 0;
-    font-size: 12px;
-  }
-  .cooldown-model-row code {
-    color: rgba(255,255,255,0.85);
+    width: 100%;
+    min-width: 0;
     font-size: 11px;
+    line-height: 1.3;
+  }
+  .cooldown-summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
+  }
+  .cooldown-summary .status-pill {
+    flex: 0 0 auto;
+  }
+  .cooldown-meta {
+    color: rgba(255,255,255,0.55);
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .cooldown-clear-btn {
     background: transparent;
@@ -1176,12 +1207,13 @@
     border: 1px solid rgba(255,138,138,0.35);
     border-radius: 4px;
     /* Same global-button-override story as .quota-refresh-btn. */
-    padding: 0 10px;
+    padding: 0 8px;
     box-sizing: border-box;
-    height: 24px;
+    height: 22px;
+    flex: 0 0 auto;
     cursor: pointer;
-    font-size: 11px;
-    line-height: 22px;
+    font-size: 10px;
+    line-height: 20px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
@@ -1192,16 +1224,6 @@
   .cooldown-clear-btn:disabled {
     opacity: 0.35;
     cursor: not-allowed;
-  }
-  /* Cooldown cell inside the quota panel — compact inline rendering of
-     auth-level + per-model + registry-suspended markers. Inherits the
-     .cooldown-model-row / .kind-badge styles already defined above. */
-  .cooldown-cell {
-    font-size: 11px;
-    line-height: 1.5;
-  }
-  .cooldown-cell .cooldown-model-row {
-    padding: 1px 0;
   }
   /* Fixed-layout table with <colgroup> widths summing to exactly 100%.
      Using <col> elements is more reliable than nth-child rules because
@@ -1215,15 +1237,15 @@
      The accompanying .quota-bar-wrap loses its min-width so the bar
      never forces its column wider than the colgroup says. */
   #quotaSection table { table-layout: fixed; width: 100%; }
-  #quotaSection col.qc-account   { width: 15%; }
+  #quotaSection col.qc-account   { width: 14%; }
   #quotaSection col.qc-status    { width: 7%; }
   #quotaSection col.qc-bar       { width: 10%; }
   #quotaSection col.qc-trend     { width: 8%; }
   #quotaSection col.qc-resets    { width: 9%; }
   #quotaSection col.qc-fetched   { width: 7%; }
-  #quotaSection col.qc-bindings  { width: 8%; }
-  #quotaSection col.qc-cooldown  { width: 11%; }
-  #quotaSection col.qc-actions   { width: 15%; }
+  #quotaSection col.qc-bindings  { width: 7%; }
+  #quotaSection col.qc-cooldown  { width: 14%; }
+  #quotaSection col.qc-actions   { width: 14%; }
   /* Bindings cell — a compact "N active" button that opens a popup with the
      full session list (uuids + workspace paths) rather than cramming them
      into the narrow cell. */
@@ -3046,6 +3068,7 @@
     // very state the operator is trying to spot.
     if (deadReason) statusPill = '<span class="status-pill dead" title="' + escapeAttr(deadTitle) + '">deactivated</span>';
     else if (a.disabled) statusPill = '<span class="status-pill disabled">disabled</span>';
+    else if (q && q.limit_reached && a.ignore_quota_limit) statusPill = '<span class="status-pill limit" title="Upstream reports the window exhausted, but the ignore-quota-limit override keeps this account in rotation">limit_reached (forced)</span>';
     else if (q && q.limit_reached) statusPill = '<span class="status-pill limit">limit_reached</span>';
     else if (a.unavailable) statusPill = '<span class="status-pill unavail">unavailable</span>';
     else statusPill = '<span class="status-pill active">active</span>';
@@ -3083,12 +3106,22 @@
     // Delete is always available (even for a disabled account) — it removes
     // the credential file from disk. Guarded by a confirm in the handler.
     const deleteBtn = '<button type="button" class="delete-account-btn" data-delete-account="' + escapeAttr(a.id) + '" title="Delete this account (removes the auth file from disk — irreversible)">🗑</button>';
+    // Force-usable toggle: ignore an over-reported quota limit and keep this
+    // account schedulable. Only meaningful for providers with a quota snapshot.
+    const forceUsableOn = !!a.ignore_quota_limit;
+    const forceUsableBtn = '<button type="button" class="force-usable-btn' + (forceUsableOn ? ' is-on' : '') +
+      '" data-force-usable="' + escapeAttr(a.id) + '" data-force-usable-on="' + (forceUsableOn ? '1' : '0') +
+      '" title="' + (forceUsableOn
+        ? 'Ignoring the quota limit for this account — click to stop forcing it into rotation'
+        : 'Keep scheduling this account even when its quota snapshot says the window is exhausted (use when it still serves requests despite limit_reached)') +
+      '">▶</button>';
     let actions;
     if (a.disabled) {
       actions =
         '<button type="button" class="quota-refresh-btn" disabled title="auth disabled">↻</button>' +
         '<button type="button" class="cooldown-force-btn" disabled title="auth disabled">⏸</button>' +
         '<button type="button" class="codex-invite-btn" disabled title="auth disabled">✉</button>' +
+        ' <button type="button" class="force-usable-btn" disabled title="auth disabled">▶</button>' +
         ' ' + prioBtn +
         ' ' + releaseBtn +
         ' ' + deleteBtn;
@@ -3111,6 +3144,7 @@
         '<button type="button" class="cooldown-force-btn" data-cooldown-force="' + escapeAttr(a.id) + '" title="Force this account into cooldown (use when quota data is returning wrong values)">⏸</button>' +
         ' ' +
         inviteBtn +
+        ' ' + forceUsableBtn +
         ' ' + prioBtn +
         ' ' + releaseBtn +
         ' ' + deleteBtn;
@@ -3131,63 +3165,131 @@
     return tr;
   }
 
-  // renderQuotaCooldownCell builds the Cooldown cell from the `cooldown`
-  // field attached by /v0/management/auth-files (which reuses the same
-  // buildCooldownAccount shape /v0/management/auth-cooldowns returns).
-  // Shows auth-level quota/retry markers, per-model cooldowns, and
-  // registry-suspended models — the same information the retired
-  // standalone cooldowns panel used to show, now inline so the operator
-  // sees it next to the quota bar and bindings count. A Clear button is
-  // rendered when any marker is present; it calls the same
-  // /auth-cooldowns/:id/clear endpoint the old panel used.
+  // renderQuotaCooldownCell builds a single-line Cooldown summary from the
+  // `cooldown` field on /v0/management/auth-files.
+  //
+  // Layout (must fit the fixed cooldown column without clipping pills):
+  //   [quota|unavailable|cooldown]  5d · 3m   [Clear]
+  // One primary status pill (same visual language as the Status column),
+  // optional muted meta, full per-model detail in the tooltip.
   function renderQuotaCooldownCell(a) {
     const cd = a.cooldown;
     if (!cd) return '<span class="muted">—</span>';
     const auth = cd.auth || {};
-    const models = cd.models || [];
-    const regSuspended = cd.registry_suspended_models || [];
-    const parts = [];
-    // Auth-level markers
-    if (auth.unavailable) parts.push('<span class="kind-badge closed">unavail</span>');
+    const models = Array.isArray(cd.models) ? cd.models : [];
+    const regSuspended = Array.isArray(cd.registry_suspended_models)
+      ? cd.registry_suspended_models : [];
+
+    const tipLines = [];
+    let untilIso = '';
+    let untilLabel = '';
+    let hasQuota = !!auth.quota_exceeded;
+    let hasUnavail = !!auth.unavailable;
+    let modelHits = 0;
+
+    const considerUntil = (iso) => {
+      if (!validTime(iso)) return;
+      const t = new Date(iso).getTime();
+      if (!isFinite(t)) return;
+      // Furthest recovery = when the account is fully free again.
+      if (!untilIso || t > new Date(untilIso).getTime()) {
+        untilIso = iso;
+        untilLabel = fmtResetWhen(iso);
+      }
+    };
+
+    if (auth.unavailable) tipLines.push('auth: unavailable');
     if (auth.quota_exceeded) {
-      const recover = validTime(auth.quota_recover_at) ? ' until ' + fmtResetWhen(auth.quota_recover_at) : '';
-      parts.push('<div><span class="kind-badge closed">quota</span>' + (auth.quota_reason ? ' <span class="muted">' + escapeHtml(auth.quota_reason) + '</span>' : '') + recover + '</div>');
+      let line = 'auth quota';
+      if (auth.quota_reason) line += ' · ' + String(auth.quota_reason);
+      if (validTime(auth.quota_recover_at)) {
+        line += ' · until ' + fmtResetWhen(auth.quota_recover_at);
+        considerUntil(auth.quota_recover_at);
+      }
+      tipLines.push(line);
     }
     if (validTime(auth.next_retry_after) && !auth.quota_exceeded) {
-      parts.push('<div><span class="muted">retry ' + fmtResetWhen(auth.next_retry_after) + '</span></div>');
+      tipLines.push('auth retry ' + fmtResetWhen(auth.next_retry_after));
+      considerUntil(auth.next_retry_after);
+      hasUnavail = true;
     }
-    if (auth.quota_backoff_level) parts.push('<div class="muted">backoff lvl ' + auth.quota_backoff_level + '</div>');
-    // Per-model markers
+    if (auth.quota_backoff_level) {
+      tipLines.push('auth backoff lvl ' + auth.quota_backoff_level);
+    }
+
     for (const m of models) {
-      const bits = ['<code>' + escapeHtml(m.model) + '</code>'];
+      const name = m.model || '?';
+      let line = name;
+      let hit = false;
       if (m.quota_exceeded) {
-        const recover = validTime(m.quota_recover_at) ? ' until ' + fmtResetWhen(m.quota_recover_at) : '';
-        bits.push('<span class="kind-badge closed">quota</span>' + recover);
+        hasQuota = true;
+        hit = true;
+        line += ' · quota';
+        if (validTime(m.quota_recover_at)) {
+          line += ' until ' + fmtResetWhen(m.quota_recover_at);
+          considerUntil(m.quota_recover_at);
+        }
       } else if (validTime(m.next_retry_after)) {
-        bits.push('<span class="muted">retry ' + fmtResetWhen(m.next_retry_after) + '</span>');
+        hasUnavail = true;
+        hit = true;
+        line += ' · retry ' + fmtResetWhen(m.next_retry_after);
+        considerUntil(m.next_retry_after);
       } else if (m.unavailable) {
-        bits.push('<span class="kind-badge closed">unavail</span>');
+        hasUnavail = true;
+        hit = true;
+        line += ' · unavail';
       }
-      // Surface WHY the model is down (upstream status_message), so an operator
-      // doesn't have to hit the management API to learn e.g. it was a
-      // context_too_large / "model not supported" 4xx rather than a quota cap.
       const rawReason = m.status_message ? String(m.status_message) : '';
       const reason = extractErrMsg(rawReason);
-      const reasonLine = reason
-        ? '<div class="muted cooldown-reason" title="' + escapeAttr(rawReason) + '">' + escapeHtml(reason.length > 90 ? reason.slice(0, 90) + '…' : reason) + '</div>'
-        : '';
-      parts.push('<div class="cooldown-model-row">' + bits.join(' ') + reasonLine + '</div>');
+      if (reason) {
+        line += ' · ' + reason;
+        hit = true;
+      }
+      if (hit) {
+        modelHits++;
+        tipLines.push(line);
+      }
     }
-    // Registry-suspended models
     if (regSuspended.length) {
-      parts.push('<div class="muted">suspended: ' + regSuspended.map(m => '<code>' + escapeHtml(m) + '</code>').join(' ') + '</div>');
+      tipLines.push('suspended: ' + regSuspended.join(', '));
     }
-    if (parts.length === 0) return '<span class="muted">—</span>';
-    // Clear button — only when there is something to clear.
+
+    const susCount = regSuspended.length;
+    if (!hasQuota && !hasUnavail && modelHits === 0 && susCount === 0 && tipLines.length === 0) {
+      return '<span class="muted">—</span>';
+    }
+
+    // One primary pill — priority matches operator urgency.
+    let pillClass = 'status-pill unavail';
+    let pillText = 'cooldown';
+    if (hasQuota) {
+      pillClass = 'status-pill limit';
+      pillText = 'quota';
+    } else if (hasUnavail) {
+      pillClass = 'status-pill unavail';
+      pillText = 'unavail';
+    } else if (susCount > 0) {
+      pillClass = 'status-pill disabled';
+      pillText = 'suspended';
+    }
+
+    const metaBits = [];
+    if (untilLabel) metaBits.push(untilLabel);          // "5d" / "2h 10m"
+    if (modelHits > 0) metaBits.push(modelHits + 'm');  // models in cooldown
+    if (susCount > 0) metaBits.push(susCount + 's');    // registry-suspended
+    const metaHtml = metaBits.length
+      ? '<span class="cooldown-meta">' + escapeHtml(metaBits.join(' · ')) + '</span>'
+      : '';
+
+    const tip = tipLines.length ? tipLines.join('\n') : pillText;
+    const summary = '<span class="cooldown-summary" title="' + escapeAttr(tip) + '">' +
+      '<span class="' + pillClass + '">' + escapeHtml(pillText) + '</span>' +
+      metaHtml +
+      '</span>';
     const clearBtn = a.disabled
       ? ''
-      : ' <button type="button" class="cooldown-clear-btn" data-cooldown-clear="' + escapeAttr(a.id) + '" title="Clear all cooldown markers for this account">Clear</button>';
-    return '<div class="cooldown-cell">' + parts.join('') + '</div>' + clearBtn;
+      : '<button type="button" class="cooldown-clear-btn" data-cooldown-clear="' + escapeAttr(a.id) + '" title="Clear all cooldown markers for this account">Clear</button>';
+    return '<div class="cooldown-cell">' + summary + clearBtn + '</div>';
   }
 
   // Build the per-account Bindings cell: a compact "N active" (+ "M closed")
@@ -3459,6 +3561,30 @@
   // DELETE /v0/management/auth-files?name=<file>. Irreversible — the auth
   // file is gone and the account drops out of the pool immediately. Guarded
   // by a confirm that names the account so a misclick can't nuke a credential.
+  // toggleForceUsable flips the per-account ignore-quota-limit override via the
+  // generic auth-file field patch (the same endpoint the priority setter uses),
+  // so it persists across restarts; the selector reads it back through the
+  // synthesizer.
+  async function toggleForceUsable(authID, btnEl) {
+    if (!authID) return;
+    const turningOn = btnEl && btnEl.getAttribute('data-force-usable-on') !== '1';
+    if (turningOn && !window.confirm(
+      '强制调度 ' + authID + ' ？即使上游报告额度已用尽（limit_reached / 100%）也继续把请求派给它。适用于上游误报、实际还能用的账号；它仍会排在真正有余量的账号之后。'
+    )) return;
+    if (btnEl) btnEl.disabled = true;
+    try {
+      await apiFetch('/v0/management/auth-files/fields', {
+        method: 'PATCH',
+        body: JSON.stringify({ name: authID, ignore_quota_limit: turningOn }),
+      });
+      setStatus((turningOn ? 'forcing ' : 'stopped forcing ') + authID + ' into rotation');
+      await loadAccountQuota();
+    } catch (err) {
+      setStatus('force-usable toggle failed: ' + (err && err.message ? err.message : err), true);
+      if (btnEl && btnEl.isConnected) btnEl.disabled = false;
+    }
+  }
+
   async function deleteAccountOne(authID, btnEl) {
     if (!authID) return;
     if (!window.confirm(
@@ -4275,6 +4401,12 @@
     if (bindingsBtn) {
       ev.preventDefault();
       openBindingsModal(bindingsBtn.getAttribute('data-bindings-popup'));
+      return;
+    }
+    const forceUsable = ev.target.closest('button[data-force-usable]');
+    if (forceUsable) {
+      ev.preventDefault();
+      toggleForceUsable(forceUsable.getAttribute('data-force-usable'), forceUsable);
       return;
     }
     const deleteBtn = ev.target.closest('button[data-delete-account]');

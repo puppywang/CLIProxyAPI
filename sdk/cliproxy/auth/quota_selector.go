@@ -503,6 +503,41 @@ func (s *LeastRemainingQuotaSelector) selectFromPool(ctx context.Context, provid
 	return picked, nil
 }
 
+// QuotaLimitIgnored reports whether an operator forced this auth to stay
+// schedulable regardless of its quota snapshot. Upstream sometimes reports
+// limit_reached (or 100% used) for an account that still serves requests, and
+// the snapshot then locks it out of selection until the window resets. The
+// override is the inverse of ForceCooldown: instead of taking a healthy account
+// out of rotation, it keeps a supposedly-exhausted one in.
+//
+// Overridden accounts are not treated as fresh: effectiveQuotaSnapshot clamps
+// them into the stressed tier, so a genuinely healthy account is still
+// preferred and the override only matters once nothing better is available.
+func QuotaLimitIgnored(a *Auth) bool {
+	if a == nil || a.Attributes == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(a.Attributes["ignore_quota_limit"]), "true")
+}
+
+// effectiveQuotaSnapshot applies the operator's ignore-quota-limit override to a
+// snapshot before it drives selection: limit_reached is cleared and the used
+// percentages are clamped just below the exclusion threshold, which keeps the
+// account selectable while ranking it behind accounts with real headroom.
+func effectiveQuotaSnapshot(a *Auth, snap QuotaSnapshot) QuotaSnapshot {
+	if !QuotaLimitIgnored(a) {
+		return snap
+	}
+	snap.LimitReached = false
+	if snap.UsedPercentPrimary >= UnhealthyUsedPercent {
+		snap.UsedPercentPrimary = UnhealthyUsedPercent - 1
+	}
+	if snap.UsedPercentSecondary >= UnhealthyUsedPercent {
+		snap.UsedPercentSecondary = UnhealthyUsedPercent - 1
+	}
+	return snap
+}
+
 // splitByModelSupport partitions the candidate auths by whether a codex account
 // has LEARNED it cannot serve `model` (durable registry model_not_supported
 // marker). Non-codex auths and unmarked codex auths go to capable; marked codex
@@ -571,6 +606,7 @@ func (s *LeastRemainingQuotaSelector) partitionByQuota(auths []*Auth, model stri
 			continue
 		}
 		snap, fresh := s.cache.get(a.ID, now)
+		snap = effectiveQuotaSnapshot(a, snap)
 		if !fresh {
 			if s.async {
 				// Async: no fresh data ≠ unhealthy. The refresher will
@@ -686,6 +722,7 @@ func (s *LeastRemainingQuotaSelector) isExcludedNow(a *Auth, model string, now t
 	if !fresh {
 		return false
 	}
+	snap = effectiveQuotaSnapshot(a, snap)
 	if snap.LimitReached {
 		return true
 	}
@@ -823,6 +860,7 @@ func (s *LeastRemainingQuotaSelector) pickLowest(auths []*Auth, now time.Time) (
 			continue
 		}
 		snap, fresh := s.cache.get(auth.ID, now)
+		snap = effectiveQuotaSnapshot(auth, snap)
 		if !fresh {
 			if !s.async {
 				continue

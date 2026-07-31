@@ -535,6 +535,25 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
 	}
+	// Expose the operator's ignore-quota-limit override so the UI can show and
+	// toggle it. Set when the account keeps serving requests after upstream
+	// reports limit_reached; the quota selector then keeps it schedulable.
+	if strings.EqualFold(strings.TrimSpace(authAttribute(auth, "ignore_quota_limit")), "true") {
+		entry["ignore_quota_limit"] = true
+	} else if auth.Metadata != nil {
+		if raw, ok := auth.Metadata["ignore_quota_limit"]; ok {
+			switch v := raw.(type) {
+			case bool:
+				if v {
+					entry["ignore_quota_limit"] = true
+				}
+			case string:
+				if parsed, errParse := strconv.ParseBool(strings.TrimSpace(v)); errParse == nil && parsed {
+					entry["ignore_quota_limit"] = true
+				}
+			}
+		}
+	}
 	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
 	if p := strings.TrimSpace(authAttribute(auth, "priority")); p != "" {
