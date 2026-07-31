@@ -773,76 +773,36 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	return httpClient.Do(httpReq)
 }
 
-// codexDowngradedCtxKey marks that a model_not_supported downgrade has already
-// fired for this request, capping the retry at one hop regardless of config.
-type codexDowngradedCtxKey struct{}
-
-func codexDowngradeApplied(ctx context.Context) bool {
-	applied, _ := ctx.Value(codexDowngradedCtxKey{}).(bool)
-	return applied
-}
-
-func markCodexDowngradeApplied(ctx context.Context) context.Context {
-	return context.WithValue(ctx, codexDowngradedCtxKey{}, true)
-}
-
-// codexDowngradeModel handles an upstream model_not_supported response. When a
-// downgrade is configured for the request's base model, it (1) marks the
-// account as unentitled for that model via the registry — a durable marker the
-// selector consults so future requests for the model route to accounts that
-// support it, and which ClearCooldown does not wipe — and (2) returns the
-// downgraded req.Model to retry with on the SAME account. Returns "" when no
-// downgrade applies (wrong error, no mapping, or already downgraded once).
-func (e *CodexExecutor) codexDowngradeModel(ctx context.Context, auth *cliproxyauth.Auth, reqModel string, status int, body []byte) string {
-	if codexDowngradeApplied(ctx) {
-		return ""
-	}
+// codexNoteModelUnsupported handles an upstream model_not_supported response by
+// recording that this account cannot serve the request's base model. The marker
+// is durable and self-healing (TTL-based): the quota selector consults it and
+// EXCLUDES the account from future requests for that model, so the request is
+// failed over to an account that is actually entitled to it.
+//
+// Deliberately no downgrade. Silently serving gpt-5.6-sol from a weaker tier
+// produced noticeably different output than the caller asked for, so the
+// request must land on a genuinely capable account or fail loudly.
+//
+// MarkClientModelUnsupported rather than SuspendClientModel: the latter is
+// wiped by the conductor's ResumeClientModel on the next success, and it is
+// also set for transient reasons (429/401), which must never exclude an
+// account from candidacy. Returns true when the error was a model-support
+// error, so the caller can log it as such.
+func (e *CodexExecutor) codexNoteModelUnsupported(ctx context.Context, auth *cliproxyauth.Auth, reqModel string, status int, body []byte) bool {
 	if !helps.IsCodexModelNotSupportedError(status, body) {
-		return ""
-	}
-	downgraded := helps.ResolveCodexModelDowngrade(e.cfg, reqModel)
-	if downgraded == "" {
-		return ""
+		return false
 	}
 	base := helps.CodexModelBase(reqModel)
 	authID := ""
 	if auth != nil {
 		authID = auth.ID
 	}
-	if authID != "" && base != "" {
-		// Durable, self-healing flag (not SuspendClientModel): this request will
-		// be transparently downgraded and thus look like a success for `base` to
-		// the conductor — whose ResumeClientModel would immediately wipe a
-		// SuspendClientModel marker. MarkClientModelUnsupported survives that.
-		registry.GetGlobalRegistry().MarkClientModelUnsupported(authID, base)
+	if authID == "" || base == "" {
+		return false
 	}
-	helps.LogWithRequestID(ctx).Infof("codex: model %s not supported for auth %s; downgrading to %s", base, authID, helps.CodexModelBase(downgraded))
-	return downgraded
-}
-
-// codexProactiveDowngrade returns a downgraded req.Model when this auth is
-// ALREADY known — via the durable learned-unsupported marker a prior
-// codexDowngradeModel set — not to support reqModel's base tier (e.g.
-// gpt-5.6-sol on a ChatGPT account that lacks the sol entitlement). Downgrading
-// up front skips the doomed upstream probe that would otherwise 400 on every
-// request and burn a full round-trip (plus, during failover, an entire
-// credential slot's worth of latency) before the reactive downgrade kicks in.
-// Returns "" when the auth is not known-unsupported, the ctx is already flagged,
-// or no distinct downgrade target is configured.
-func (e *CodexExecutor) codexProactiveDowngrade(ctx context.Context, auth *cliproxyauth.Auth, reqModel string) string {
-	if codexDowngradeApplied(ctx) || auth == nil {
-		return ""
-	}
-	base := helps.CodexModelBase(reqModel)
-	if base == "" || !registry.GetGlobalRegistry().IsClientModelUnsupported(auth.ID, base) {
-		return ""
-	}
-	downgraded := helps.ResolveCodexModelDowngrade(e.cfg, reqModel)
-	if downgraded == "" || helps.CodexModelBase(downgraded) == base {
-		return ""
-	}
-	helps.LogWithRequestID(ctx).Infof("codex: auth %s known-unsupported for %s; pre-downgrading to %s", auth.ID, base, helps.CodexModelBase(downgraded))
-	return downgraded
+	registry.GetGlobalRegistry().MarkClientModelUnsupported(authID, base)
+	helps.LogWithRequestID(ctx).Infof("codex: model %s not supported for auth %s; excluding it for this model and failing over", base, authID)
+	return true
 }
 
 // codexTaskRecoveredCtxKey caps agent-identity task re-registration at one hop
@@ -895,10 +855,6 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImage(ctx, auth, req, opts)
-	}
-	if dm := e.codexProactiveDowngrade(ctx, auth, req.Model); dm != "" {
-		ctx = markCodexDowngradeApplied(ctx)
-		req.Model = dm
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -986,11 +942,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		clearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, b)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		if dm := e.codexDowngradeModel(ctx, auth, req.Model, httpResp.StatusCode, b); dm != "" {
-			retryReq := req
-			retryReq.Model = dm
-			return e.Execute(markCodexDowngradeApplied(ctx), auth, retryReq, opts)
-		}
+		e.codexNoteModelUnsupported(ctx, auth, req.Model, httpResp.StatusCode, b)
 		if e.codexRecoverAgentTask(ctx, auth, httpResp.StatusCode, b) {
 			return e.Execute(markCodexTaskRecovered(ctx), auth, req, opts)
 		}
@@ -1080,10 +1032,6 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 }
 
 func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	if dm := e.codexProactiveDowngrade(ctx, auth, req.Model); dm != "" {
-		ctx = markCodexDowngradeApplied(ctx)
-		req.Model = dm
-	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := codexCreds(auth)
@@ -1164,11 +1112,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		b = applyCodexIdentityConfuseResponsePayload(b, identityState)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		if dm := e.codexDowngradeModel(ctx, auth, req.Model, httpResp.StatusCode, b); dm != "" {
-			retryReq := req
-			retryReq.Model = dm
-			return e.executeCompact(markCodexDowngradeApplied(ctx), auth, retryReq, opts)
-		}
+		e.codexNoteModelUnsupported(ctx, auth, req.Model, httpResp.StatusCode, b)
 		if e.codexRecoverAgentTask(ctx, auth, httpResp.StatusCode, b) {
 			return e.executeCompact(markCodexTaskRecovered(ctx), auth, req, opts)
 		}
@@ -1197,10 +1141,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 	if isCodexOpenAIImageRequest(opts) {
 		return e.executeOpenAIImageStream(ctx, auth, req, opts)
-	}
-	if dm := e.codexProactiveDowngrade(ctx, auth, req.Model); dm != "" {
-		ctx = markCodexDowngradeApplied(ctx)
-		req.Model = dm
 	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
@@ -1290,11 +1230,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		clearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, data)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		if dm := e.codexDowngradeModel(ctx, auth, req.Model, httpResp.StatusCode, data); dm != "" {
-			retryReq := req
-			retryReq.Model = dm
-			return e.ExecuteStream(markCodexDowngradeApplied(ctx), auth, retryReq, opts)
-		}
+		e.codexNoteModelUnsupported(ctx, auth, req.Model, httpResp.StatusCode, data)
 		if e.codexRecoverAgentTask(ctx, auth, httpResp.StatusCode, data) {
 			return e.ExecuteStream(markCodexTaskRecovered(ctx), auth, req, opts)
 		}

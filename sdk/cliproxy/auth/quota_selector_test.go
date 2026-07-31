@@ -621,7 +621,7 @@ func TestCodexAuthPriority_ReadsBothSources(t *testing.T) {
 // (which the executor downgrades) when no capable account is usable — instead
 // of stranding the request. This is the safe replacement for the reverted hard
 // candidacy gate (b8fbab1e), and it must NOT strand.
-func TestLeastRemainingQuotaSelector_SoftModelSupportIsolation(t *testing.T) {
+func TestLeastRemainingQuotaSelector_HardModelSupportIsolation(t *testing.T) {
 	// Not parallel: mutates the process-global model registry.
 	const model = "gpt-test-softiso"
 	reg := registry.GetGlobalRegistry()
@@ -639,8 +639,8 @@ func TestLeastRemainingQuotaSelector_SoftModelSupportIsolation(t *testing.T) {
 		TTL:     time.Minute,
 		Async:   true,
 	})
-	// The no-sol account is FRESHER (1%) than the sol account (30%). Soft
-	// isolation must still prefer the sol-capable account for a sol request.
+	// The no-sol account is FRESHER (1%) than the sol account (30%). Model
+	// support still wins: a sol request must go to the sol-capable account.
 	selector.PushSnapshot("softiso-sol", QuotaSnapshot{UsedPercentPrimary: 30, UsedPercentSecondary: 10})
 	selector.PushSnapshot("softiso-nosol", QuotaSnapshot{UsedPercentPrimary: 1, UsedPercentSecondary: 1})
 
@@ -654,14 +654,57 @@ func TestLeastRemainingQuotaSelector_SoftModelSupportIsolation(t *testing.T) {
 		}
 	}
 
-	// Exhaust the sol-capable account -> must fall back to the no-sol account
-	// (the executor will downgrade it), NOT strand the request.
+	// Exhausting the sol-capable account must NOT spill the request onto the
+	// no-sol account: it cannot serve this model, and answering from a
+	// different model is worse than failing. Either the exhausted-but-capable
+	// account is reused, or the pick fails — never softiso-nosol.
 	selector.PushSnapshot("softiso-sol", QuotaSnapshot{UsedPercentPrimary: 0, LimitReached: true})
 	got, err := selector.Pick(context.Background(), "codex", model, cliproxyexecutor.Options{}, auths)
-	if err != nil {
-		t.Fatalf("fallback pick error: %v", err)
+	if err == nil && got != nil && got.ID == "softiso-nosol" {
+		t.Fatalf("pick = softiso-nosol, but it cannot serve %s and must never be selected for it", model)
 	}
-	if got == nil || got.ID != "softiso-nosol" {
-		t.Fatalf("fallback pick = %v, want softiso-nosol (no usable sol-capable account -> downgrade fallback)", got)
+}
+
+// TestLeastRemainingQuotaSelector_ExcludesModelUnsupportedAuth verifies that an
+// account which has LEARNED it cannot serve a model (durable
+// model_not_supported marker, e.g. gpt-5.6-sol on an account without the
+// entitlement) is excluded from selection for that model — never merely
+// deprioritised. Serving the request from a different model would silently
+// change the answer, so it must land on an entitled account.
+func TestLeastRemainingQuotaSelector_ExcludesModelUnsupportedAuth(t *testing.T) {
+	const model = "gpt-5.6-sol"
+	reg := registry.GetGlobalRegistry()
+	reg.MarkClientModelUnsupported("auth-nosol", model)
+	t.Cleanup(func() { reg.ResumeClientModel("auth-nosol", model) })
+
+	auths := []*Auth{
+		{ID: "auth-nosol", Provider: "codex"},
+		{ID: "auth-sol", Provider: "codex"},
+	}
+	fetcher := newFakeQuotaFetcher(map[string]QuotaSnapshot{
+		// The unsupported account looks far more attractive on quota alone,
+		// so a pick landing on it would prove the exclusion is not applied.
+		"auth-nosol": {UsedPercentPrimary: 1},
+		"auth-sol":   {UsedPercentPrimary: 80},
+	})
+	selector := NewLeastRemainingQuotaSelector(LeastRemainingQuotaConfig{
+		Inner:   &RoundRobinSelector{cursors: map[string]int{}},
+		Fetcher: fetcher,
+		TTL:     time.Minute,
+	})
+
+	got, err := selector.Pick(context.Background(), "codex", model, cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick error = %v", err)
+	}
+	if got.ID != "auth-sol" {
+		t.Fatalf("picked %q, want auth-sol (auth-nosol cannot serve %s and must be excluded)", got.ID, model)
+	}
+
+	// With no entitled account left, the selector must say so rather than
+	// silently serving the request from an account that cannot honour it.
+	_, errNone := selector.Pick(context.Background(), "codex", model, cliproxyexecutor.Options{}, auths[:1])
+	if errNone == nil {
+		t.Fatalf("expected an error when no account supports %s, got a pick", model)
 	}
 }

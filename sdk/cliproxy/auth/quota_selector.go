@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"math/rand/v2"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -414,35 +415,30 @@ func (s *LeastRemainingQuotaSelector) Pick(ctx context.Context, provider, model 
 	// by hand. Non-codex auths always pass through (priority is a
 	// codex-quota concept). When no priority is set anywhere every codex
 	// auth shares level 0 and this is a no-op.
-	// Soft model-support isolation (unbound path only — a bound session is
-	// served by the affinity layer before it reaches here). For a model some
-	// accounts have LEARNED they cannot serve (durable registry
+	// Hard model-support isolation (unbound path only — a bound session is
+	// served by the affinity layer before it reaches here). Accounts that have
+	// LEARNED they cannot serve this model (durable registry
 	// model_not_supported marker, e.g. gpt-5.6-sol on a ChatGPT account that
-	// lacks it), prefer accounts that CAN serve it. The learned-unsupported
-	// ones stay selectable as a fallback (the executor downgrades them, e.g.
-	// sol->terra) but only when no supporting account is usable. Reason-scoped
-	// to model_not_supported — NEVER the generic suspension marker — so a
-	// transient 429/401 account is not split out here, and priority
-	// fall-through within each phase is intact.
+	// lacks the entitlement) are EXCLUDED from selection, not merely
+	// deprioritised: serving such a request from a different, weaker model is
+	// worse than failing it, so the request must land on an account that
+	// genuinely supports the requested model. When none does, surface that
+	// plainly instead of silently substituting a model the caller did not ask
+	// for. Reason-scoped to model_not_supported — NEVER the generic suspension
+	// marker — so a transient 429/401 account is not excluded here and
+	// priority fall-through stays intact.
 	capable, unsupported := s.splitByModelSupport(auths, model)
-	if len(capable) > 0 && len(unsupported) > 0 {
-		picked, errCap := s.selectFromPool(ctx, provider, model, opts, capable, now, entry, false)
-		if errCap != nil {
-			return nil, errCap
+	if len(unsupported) > 0 {
+		if len(capable) == 0 {
+			entry.Warnf("quota-selector: no account supports model %s (all %d candidates marked model_not_supported) | provider=%s", model, len(unsupported), provider)
+			return nil, &Error{
+				Code:       "model_not_supported",
+				Message:    `{"error":{"type":"invalid_request_error","message":"No available credential supports the requested model. Pick a model your accounts are entitled to, or add an account that supports it."}}`,
+				HTTPStatus: http.StatusBadRequest,
+			}
 		}
-		if picked != nil {
-			return picked, nil
-		}
-		entry.Infof("quota-selector: no usable %s-capable account (pool=%d); falling back to downgrade-eligible pool (%d) | provider=%s", model, len(capable), len(unsupported), provider)
-		picked, errUns := s.selectFromPool(ctx, provider, model, opts, unsupported, now, entry, false)
-		if errUns != nil {
-			return nil, errUns
-		}
-		if picked != nil {
-			return picked, nil
-		}
-		// Neither pool has a usable tier — fall through to the last-ditch
-		// selection over the full candidate list (original behaviour).
+		entry.Debugf("quota-selector: excluding %d account(s) that cannot serve %s | provider=%s", len(unsupported), model, provider)
+		return s.selectFromPool(ctx, provider, model, opts, capable, now, entry, true)
 	}
 	return s.selectFromPool(ctx, provider, model, opts, auths, now, entry, true)
 }
@@ -510,10 +506,12 @@ func (s *LeastRemainingQuotaSelector) selectFromPool(ctx context.Context, provid
 // splitByModelSupport partitions the candidate auths by whether a codex account
 // has LEARNED it cannot serve `model` (durable registry model_not_supported
 // marker). Non-codex auths and unmarked codex auths go to capable; marked codex
-// auths go to unsupported. Reason-scoped: only the model_not_supported marker
-// moves an account to unsupported — a transient quota/401 suspension does NOT
-// (that is handled by the ModelState-driven partition, which recovers on
-// cooldown), so this never breaks priority fall-through.
+// auths go to unsupported and are excluded from selection for this model.
+// Reason-scoped: only the model_not_supported marker moves an account to
+// unsupported — a transient quota/401 suspension does NOT (that is handled by
+// the ModelState-driven partition, which recovers on cooldown), so this never
+// breaks priority fall-through. The marker carries a TTL, so an account
+// recovers automatically if the entitlement is later granted.
 func (s *LeastRemainingQuotaSelector) splitByModelSupport(auths []*Auth, model string) (capable, unsupported []*Auth) {
 	reg := registry.GetGlobalRegistry()
 	modelKey := canonicalModelKey(model)
