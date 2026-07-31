@@ -1043,9 +1043,10 @@ func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.Fil
 }
 
 func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
-	// A sub2api accounts export expands into one CPA auth file per account, so
-	// uploading such an export (or POSTing it to the import endpoint) is handled
-	// transparently here rather than writing the raw export as a bogus auth.
+	// A sub2api or grok2api accounts export expands into one CPA auth file per
+	// account, so uploading such an export (or POSTing it to the import endpoint)
+	// is handled transparently here rather than writing the raw export as a bogus
+	// auth.
 	if isSub2apiExport(data) {
 		files, _, convErr := convertSub2apiExport(data)
 		if convErr != nil {
@@ -1053,6 +1054,21 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		}
 		if len(files) == 0 {
 			return fmt.Errorf("sub2api export contained no importable accounts")
+		}
+		for _, f := range files {
+			if err := h.writeSingleAuthFile(ctx, f.Name, f.Data); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if isGrok2apiExport(data) {
+		files, _, convErr := convertGrok2apiExport(data)
+		if convErr != nil {
+			return convErr
+		}
+		if len(files) == 0 {
+			return fmt.Errorf("grok2api export contained no importable accounts")
 		}
 		for _, f := range files {
 			if err := h.writeSingleAuthFile(ctx, f.Name, f.Data); err != nil {
