@@ -256,6 +256,62 @@ func (c *SessionCache) Invalidate(sessionID string) {
 // InvalidateAuth removes all sessions bound to a specific auth ID.
 // Used when an auth becomes unavailable.
 func (c *SessionCache) InvalidateAuth(authID string) {
+
+// InvalidateAuthCount removes every cache row bound to authID and returns the
+// count of removed rows. A single logical conversation usually has two entries
+// (the codex-thread key and its codex-window mirror), so the count can exceed
+// the number of distinct conversations.
+func (c *SessionCache) InvalidateAuthCount(authID string) int {
+	if authID == "" {
+		return 0
+	}
+	removed := 0
+	c.mu.Lock()
+	for sid, entry := range c.entries {
+		if entry.authID == authID {
+			delete(c.entries, sid)
+			removed++
+		}
+	}
+	c.mu.Unlock()
+	return removed
+}
+
+// splitCacheKeyID returns the trailing conversation id of a session cache
+// key. Keys have the shape "<provider>::<kind>:<id>". ok=false for malformed.
+func splitCacheKeyID(key string) (id string, ok bool) {
+	if idx := strings.Index(key, "::"); idx >= 0 {
+		key = key[idx+2:]
+	}
+	colon := strings.Index(key, ":")
+	if colon <= 0 {
+		return "", false
+	}
+	id = key[colon+1:]
+	return id, id != ""
+}
+
+// InvalidateWindowForAuth removes every cache row for the given conversation
+// uuid that is currently bound to authID. The authID filter makes the call
+// safe against stale UI data. Returns the number of rows removed.
+func (c *SessionCache) InvalidateWindowForAuth(authID, uuid string) int {
+	if authID == "" || uuid == "" {
+		return 0
+	}
+	removed := 0
+	c.mu.Lock()
+	for key, entry := range c.entries {
+		if entry.authID != authID {
+			continue
+		}
+		if id, ok := splitCacheKeyID(key); ok && id == uuid {
+			delete(c.entries, key)
+			removed++
+		}
+	}
+	c.mu.Unlock()
+	return removed
+}
 	if authID == "" {
 		return
 	}

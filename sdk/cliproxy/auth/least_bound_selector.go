@@ -122,7 +122,7 @@ func bindingSnapshotFromContext(ctx context.Context) map[string]int {
 // The first element after sort is returned.
 func (s *LeastBoundSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
-	available, err := getAvailableAuths(ctx, auths, provider, model, time.Now())
+	available, err := getAvailableAuths(auths, provider, model, time.Now())
 	if err != nil {
 		return nil, err
 	}

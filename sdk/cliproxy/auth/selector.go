@@ -668,6 +668,26 @@ func (s *SessionAffinitySelector) Stop() {
 // InvalidateAuth removes all session bindings for a specific auth.
 // Called when an auth becomes rate-limited or unavailable.
 func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
+
+// InvalidateAuthBindings removes every session-affinity binding for authID.
+// Used by the management cooldown panel's "release" action. Returns 0 when no
+// cache is configured.
+func (s *SessionAffinitySelector) InvalidateAuthBindings(authID string) int {
+	if s == nil || s.cache == nil {
+		return 0
+	}
+	return s.cache.InvalidateAuthCount(authID)
+}
+
+// InvalidateWindowBinding removes the cache rows for ONE conversation (uuid)
+// but only while it is still bound to authID. Returns the number of rows
+// removed; 0 when the uuid isn't bound to that auth or no cache is configured.
+func (s *SessionAffinitySelector) InvalidateWindowBinding(authID, uuid string) int {
+	if s == nil || s.cache == nil {
+		return 0
+	}
+	return s.cache.InvalidateWindowForAuth(authID, uuid)
+}
 	if s.cache != nil {
 		s.cache.InvalidateAuth(authID)
 	}

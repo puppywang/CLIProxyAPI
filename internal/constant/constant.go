@@ -7,6 +7,9 @@ const (
 	// Gemini represents the Google Gemini provider identifier.
 	Gemini = "gemini"
 
+	// GeminiCLI represents the Google Gemini CLI provider identifier.
+	GeminiCLI = "gemini-cli"
+
 	// GeminiInteractions represents the native Google Interactions API provider identifier.
 	GeminiInteractions = "gemini-interactions"
 

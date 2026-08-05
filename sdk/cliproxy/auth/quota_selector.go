@@ -382,7 +382,7 @@ func (s *LeastRemainingQuotaSelector) Pick(ctx context.Context, provider, model 
 	}
 	entry := selectorLogEntry(ctx)
 
-	available, err := getAvailableAuths(ctx, auths, provider, model, time.Now())
+	available, err := getAvailableAuths(auths, provider, model, time.Now())
 	if err != nil {
 		return nil, err
 	}

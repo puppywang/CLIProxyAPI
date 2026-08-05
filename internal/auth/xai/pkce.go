@@ -7,6 +7,12 @@ import (
 	"fmt"
 )
 
+// PKCECodes holds the PKCE verifier/challenge pair for the xAI OAuth flow.
+type PKCECodes struct {
+	CodeVerifier  string
+	CodeChallenge string
+}
+
 // GeneratePKCECodes creates a verifier/challenge pair for the OAuth flow.
 func GeneratePKCECodes() (*PKCECodes, error) {
 	bytes := make([]byte, 96)
