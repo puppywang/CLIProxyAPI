@@ -1,6 +1,8 @@
 # Binaries
 cli-proxy-api
 *.exe
+build/
+__pycache__/
 
 # Configuration
 config.yaml

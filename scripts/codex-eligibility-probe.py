@@ -1,36 +1,33 @@
 #!/usr/bin/env python3
-"""Codex referral eligibility probe — single GET via curl_cffi.
+"""Codex referral probe — Cloudflare-bypass helper via curl_cffi.
 
-CPA's main Go HTTP path uses Go's stdlib TLS, whose JA3 fingerprint is
-nothing like any real browser. Cloudflare protects the
-/backend-api/referrals/invite/eligibility path with UA-Client-Hints
-enforcement (cf-mitigated: challenge), so Go's request gets a 403 + HTML
-page instead of the JSON eligibility blob. curl_cffi with the chrome116
-impersonation profile passes the challenge — newer profiles (chrome120+)
-get blocked because real Chrome 120+ ships Sec-CH-UA-Bitness/Arch/
-Full-Version-List headers that those impersonation profiles don't fully
-replicate, so CF spots the mismatch. chrome116 predates that enforcement
-era and slips through.
+CPA's main Go HTTP path uses Go's stdlib TLS. Cloudflare protects the
+/backend-api/referrals/invite/* family with UA-Client-Hints enforcement
+(cf-mitigated: challenge), so Go gets 403 HTML instead of JSON.
+curl_cffi with impersonate=chrome116 passes the challenge.
 
-This script is intentionally tiny — one read-only GET, JSON in, JSON
-out — so the Go process can shell out without inheriting any state.
+This script is intentionally small — JSON in on stdin, JSON out on
+stdout — so the Go process can shell out without inheriting state.
 
 Input (stdin, JSON):
     {
-      "access_token": "...",     # required
-      "account_id":   "...",     # optional, sent as ChatGPT-Account-Id
-      "proxy_url":    "socks5://host:port/",  # optional
-      "referral_key": "codex_referral_persistent_invite",  # optional
-      "base_url":     "https://chatgpt.com"   # optional
+      "action":       "eligibility" | "tracking" | "invite",  # default eligibility
+      "access_token": "...",                                  # required
+      "account_id":   "...",                                  # optional
+      "proxy_url":    "socks5://host:port/",                  # optional
+      "base_url":     "https://chatgpt.com",                  # optional
+      "program_id":   "codex_referral_consumer",              # optional
+      "entrypoint":   "persistent",                           # optional
+      "emails":       ["a@b.com"],                            # invite only
+      "period":       "past_90_days",                         # tracking only
+      "limit":        100                                     # tracking only
     }
 
 Output (stdout, JSON):
-    On success: {"ok": true, "status": 200, "data": {...eligibility...}}
-    On failure: {"ok": false, "status": <int|null>, "error": "<short>"}
+    success: {"ok": true, "status": 200, "data": {...}}
+    failure: {"ok": false, "status": <int|null>, "error": "<short>"}
 
-Exit codes:
-    0  always (the failure mode is in the JSON body, not the exit code,
-       so callers can rely on the body without checking $?)
+Exit code is always 0 — callers read the body, not $?.
 """
 
 from __future__ import annotations
@@ -49,32 +46,25 @@ except ImportError as exc:
     sys.exit(0)
 
 
+DEFAULT_PROGRAM_ID = "codex_referral_consumer"
+DEFAULT_ENTRYPOINT = "persistent"
+DEFAULT_BASE_URL = "https://chatgpt.com"
+
+
 def emit(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False))
 
 
-def main() -> int:
-    try:
-        req = json.load(sys.stdin)
-    except Exception as exc:
-        emit({"ok": False, "status": None, "error": "stdin: " + str(exc)})
-        return 0
-
+def build_session(req: dict):
     token = (req.get("access_token") or "").strip()
     if not token:
-        emit({"ok": False, "status": None, "error": "missing access_token"})
-        return 0
+        raise ValueError("missing access_token")
 
     account_id = (req.get("account_id") or "").strip()
     proxy_url = (req.get("proxy_url") or "").strip()
-    referral_key = (req.get("referral_key") or "codex_referral_persistent_invite").strip()
-    base_url = (req.get("base_url") or "https://chatgpt.com").strip().rstrip("/")
+    base_url = (req.get("base_url") or DEFAULT_BASE_URL).strip().rstrip("/")
 
     headers = {
-        # Codex Desktop -specific bits the userscript also sends. These
-        # do NOT bypass CF on their own — the TLS fingerprint via
-        # impersonate=chrome116 is what passes the challenge. We include
-        # them anyway because they match what a real Desktop client sends.
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
         "OAI-Language": "zh-CN",
@@ -90,31 +80,38 @@ def main() -> int:
 
     proxies = None
     if proxy_url:
-        # socks5h:// resolves DNS at the proxy, matching how CPA's Go
-        # http.ProxyURL handles socks5:// URLs. Keeps egress IP and DNS
-        # behaviour consistent with the account's normal traffic.
+        # socks5h:// resolves DNS at the proxy, matching CPA's Go socks5
+        # behaviour so egress IP and DNS stay consistent with the account.
         norm = proxy_url.replace("socks5://", "socks5h://").rstrip("/")
         proxies = {"http": norm, "https": norm}
 
-    try:
-        resp = requests.get(
-            base_url + "/backend-api/referrals/invite/eligibility",
-            params={"referral_key": referral_key},
-            headers=headers,
-            impersonate="chrome116",
-            proxies=proxies,
-            timeout=20,
-        )
-    except Exception as exc:
-        emit({
-            "ok": False,
-            "status": None,
-            "error": "request: " + type(exc).__name__ + ": " + str(exc),
-        })
-        return 0
+    return base_url, headers, proxies
 
+
+def do_request(method: str, url: str, headers: dict, proxies, *, params=None, json_body=None):
+    kwargs = {
+        "headers": headers,
+        "impersonate": "chrome116",
+        "proxies": proxies,
+        "timeout": 25,
+    }
+    if params is not None:
+        kwargs["params"] = params
+    if json_body is not None:
+        kwargs["json"] = json_body
+        headers = dict(headers)
+        headers["Content-Type"] = "application/json"
+        kwargs["headers"] = headers
+
+    if method == "GET":
+        return requests.get(url, **kwargs)
+    if method == "POST":
+        return requests.post(url, **kwargs)
+    raise ValueError("unsupported method " + method)
+
+
+def handle_response(resp) -> int:
     body = resp.text or ""
-
     if 200 <= resp.status_code < 300:
         try:
             data = resp.json()
@@ -135,6 +132,83 @@ def main() -> int:
         "error": "upstream " + str(resp.status_code) + ": " + snippet,
     })
     return 0
+
+
+def main() -> int:
+    try:
+        req = json.load(sys.stdin)
+    except Exception as exc:
+        emit({"ok": False, "status": None, "error": "stdin: " + str(exc)})
+        return 0
+
+    action = (req.get("action") or "eligibility").strip().lower()
+    program_id = (req.get("program_id") or DEFAULT_PROGRAM_ID).strip()
+    entrypoint = (req.get("entrypoint") or DEFAULT_ENTRYPOINT).strip()
+
+    try:
+        base_url, headers, proxies = build_session(req)
+    except Exception as exc:
+        emit({"ok": False, "status": None, "error": str(exc)})
+        return 0
+
+    try:
+        if action in ("eligibility", "elig", ""):
+            resp = do_request(
+                "GET",
+                base_url + "/backend-api/referrals/invite/eligibility",
+                headers,
+                proxies,
+                params={"program_id": program_id, "entrypoint": entrypoint},
+            )
+            return handle_response(resp)
+
+        if action in ("tracking", "history", "referrals"):
+            period = (req.get("period") or "past_90_days").strip()
+            limit = req.get("limit") or 100
+            try:
+                limit = int(limit)
+            except Exception:
+                limit = 100
+            resp = do_request(
+                "GET",
+                base_url + "/backend-api/referrals/invite/tracking",
+                headers,
+                proxies,
+                params={
+                    "program_id": program_id,
+                    "period": period,
+                    "limit": limit,
+                },
+            )
+            return handle_response(resp)
+
+        if action in ("invite", "send"):
+            emails = req.get("emails") or []
+            if not isinstance(emails, list) or not emails:
+                emit({"ok": False, "status": None, "error": "invite requires emails[]"})
+                return 0
+            resp = do_request(
+                "POST",
+                base_url + "/backend-api/referrals/invite",
+                headers,
+                proxies,
+                json_body={
+                    "program_id": program_id,
+                    "entrypoint": entrypoint,
+                    "emails": emails,
+                },
+            )
+            return handle_response(resp)
+
+        emit({"ok": False, "status": None, "error": "unknown action " + action})
+        return 0
+    except Exception as exc:
+        emit({
+            "ok": False,
+            "status": None,
+            "error": "request: " + type(exc).__name__ + ": " + str(exc),
+        })
+        return 0
 
 
 if __name__ == "__main__":
