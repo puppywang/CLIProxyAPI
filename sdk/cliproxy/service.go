@@ -904,6 +904,13 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 			}
 			return err
 		}),
+		// Live plan_type from wham/usage. Agent-identity credentials freeze
+		// plan at registration; without this a free→plus upgrade keeps the
+		// free model catalog (no gpt-5.6-sol) until the operator re-imports
+		// the file. Idempotent: same plan is a no-op.
+		quota.WithPlanUpdater(func(ctx context.Context, auth *coreauth.Auth, planType string) error {
+			return s.applyCodexPlanTypeFromUpstream(ctx, auth, planType)
+		}),
 	)
 	refresher.Start(ctx)
 	s.quotaRefresher = refresher
@@ -951,6 +958,7 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 				ResetAtPrimary:       optTime(snap.ResetAtPrimary),
 				ResetAtSecondary:     optTime(snap.ResetAtSecondary),
 				FetchedAt:            optTime(snap.FetchedAt),
+				PlanType:             strings.TrimSpace(snap.PlanType),
 			}
 		}
 		snapshotFn := func(authID string) (managementHandlers.QuotaSnapshotData, bool) {
@@ -1036,6 +1044,64 @@ func (s *Service) stopQuotaRefresher() {
 	}
 	s.quotaRefresher.Stop()
 	s.quotaRefresher = nil
+}
+
+// applyCodexPlanTypeFromUpstream rewrites a codex auth's stored plan_type from
+// a live wham/usage response and re-registers the model catalog when the plan
+// actually changes. Idempotent: same plan is a no-op. Used by the quota
+// refresher (periodic + manual refresh) so agent-identity free→plus upgrades
+// take effect without re-importing the credential file.
+func (s *Service) applyCodexPlanTypeFromUpstream(ctx context.Context, auth *coreauth.Auth, planType string) error {
+	if s == nil || s.coreManager == nil || auth == nil {
+		return nil
+	}
+	planType = strings.TrimSpace(planType)
+	if planType == "" {
+		return nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return nil
+	}
+	current := ""
+	if auth.Attributes != nil {
+		current = strings.TrimSpace(auth.Attributes["plan_type"])
+	}
+	if current == "" && auth.Metadata != nil {
+		if v, ok := auth.Metadata["plan_type"].(string); ok {
+			current = strings.TrimSpace(v)
+		}
+	}
+	if strings.EqualFold(current, planType) {
+		return nil
+	}
+
+	// Work on a fresh clone from the manager so we don't race concurrent
+	// updates against a stale refresher snapshot.
+	live, ok := s.coreManager.GetByID(auth.ID)
+	if !ok || live == nil {
+		return fmt.Errorf("auth %q not found", auth.ID)
+	}
+	updated := live.Clone()
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]any)
+	}
+	if updated.Attributes == nil {
+		updated.Attributes = make(map[string]string)
+	}
+	updated.Metadata["plan_type"] = planType
+	updated.Attributes["plan_type"] = planType
+	updated.UpdatedAt = time.Now()
+
+	if _, err := s.coreManager.Update(ctx, updated); err != nil {
+		return err
+	}
+	// Re-register the codex model catalog for the new plan (free omits
+	// gpt-5.6-sol; plus/team/pro include it). RegisterClient also clears
+	// learned model_not_supported flags for models now in the catalog.
+	s.registerModelsForAuth(ctx, updated)
+	s.coreManager.RefreshSchedulerEntry(updated.ID)
+	log.Infof("quota-refresher: plan_type updated from wham | auth=%s %s -> %s", updated.ID, current, planType)
+	return nil
 }
 
 func (s *Service) applyRetryConfig(cfg *config.Config) {

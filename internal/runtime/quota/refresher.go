@@ -62,6 +62,7 @@ type Refresher struct {
 	pusher         SnapshotPusher
 	staleCleaner   StaleCooldownClearer
 	limitReachedFn LimitReachedSetter
+	planUpdater    PlanUpdater
 	interval       time.Duration
 	concurrency    int
 
@@ -126,6 +127,15 @@ type StaleCooldownClearer func(ctx context.Context, authID string) error
 // desired behaviour.
 type LimitReachedSetter func(ctx context.Context, authID string, snap coreauth.QuotaSnapshot) error
 
+// PlanUpdater is the optional hook the refresher invokes after a
+// successful wham/usage fetch that includes a non-empty plan_type.
+// The cliproxy Service wires this to rewrite the auth's stored
+// plan_type (Metadata + Attributes) and re-register the codex model
+// catalog so a free→plus upgrade is reflected without re-importing
+// the credential file. Implementations must be idempotent: same plan
+// is a no-op.
+type PlanUpdater func(ctx context.Context, auth *coreauth.Auth, planType string) error
+
 // RefresherOption tunes a Refresher at construction. Use the WithX helpers
 // rather than poking the struct directly.
 type RefresherOption func(*Refresher)
@@ -148,6 +158,16 @@ func WithStaleCooldownClearer(fn StaleCooldownClearer) RefresherOption {
 func WithLimitReachedSetter(fn LimitReachedSetter) RefresherOption {
 	return func(r *Refresher) {
 		r.limitReachedFn = fn
+	}
+}
+
+// WithPlanUpdater registers the hook that rewrites an auth's stored
+// plan_type from the live wham/usage response. Pass nil or omit to
+// leave plan_type frozen at registration time (legacy behaviour for
+// agent-identity credentials).
+func WithPlanUpdater(fn PlanUpdater) RefresherOption {
+	return func(r *Refresher) {
+		r.planUpdater = fn
 	}
 }
 
@@ -306,6 +326,7 @@ func (r *Refresher) RefreshNow(ctx context.Context, authID string) (coreauth.Quo
 	// cadence forward. The next scheduled tick handles long-term
 	// scheduling.
 	r.recordSuccessKeepingSchedule(authID)
+	r.maybeUpdatePlan(ctx, target, snap)
 	return snap, true, nil
 }
 
@@ -516,6 +537,23 @@ func (r *Refresher) refresh(ctx context.Context, a *coreauth.Auth, scheduleNext 
 		if errSet := r.limitReachedFn(ctx, a.ID, snap); errSet != nil {
 			log.WithError(errSet).Warnf("quota-refresher: limit-reached setter failed | auth=%s", a.ID)
 		}
+	}
+	r.maybeUpdatePlan(ctx, a, snap)
+}
+
+// maybeUpdatePlan rewrites the auth's stored plan_type from the live
+// wham/usage response when a PlanUpdater is configured. No-op when the
+// snapshot omits plan_type or the hook is nil.
+func (r *Refresher) maybeUpdatePlan(ctx context.Context, a *coreauth.Auth, snap coreauth.QuotaSnapshot) {
+	if r == nil || r.planUpdater == nil || a == nil {
+		return
+	}
+	plan := strings.TrimSpace(snap.PlanType)
+	if plan == "" {
+		return
+	}
+	if err := r.planUpdater(ctx, a, plan); err != nil {
+		log.WithError(err).Warnf("quota-refresher: plan_type update failed | auth=%s plan=%s", a.ID, plan)
 	}
 }
 

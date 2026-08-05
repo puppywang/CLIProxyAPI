@@ -88,6 +88,12 @@ type QuotaSnapshotData struct {
 	ResetAtPrimary       *time.Time `json:"reset_at_primary,omitempty"`
 	ResetAtSecondary     *time.Time `json:"reset_at_secondary,omitempty"`
 	FetchedAt            *time.Time `json:"fetched_at,omitempty"`
+	// PlanType is the live ChatGPT subscription tier from wham/usage
+	// (free/plus/team/pro/…). Empty when the snapshot predates plan
+	// capture or the response omitted it. The refresher also writes this
+	// back onto the auth so agent-identity upgrades take effect without
+	// re-importing the credential file.
+	PlanType string `json:"plan_type,omitempty"`
 	// DeadReason / DeadSince surface a terminal "account unusable" signal
 	// observed by the quota fetcher (e.g. wham/usage 402 deactivated_workspace).
 	// Set only for permanently-dead credentials the operator should clean up;

@@ -40,3 +40,51 @@ func TestClientModelUnsupported_DurableAcrossResume(t *testing.T) {
 		t.Error("different model must report unsupported=false")
 	}
 }
+
+// TestClientModelUnsupported_ClearedOnReRegister is the free→plus plan-upgrade
+// path: an account that previously learned it cannot serve sol must become
+// selectable again as soon as RegisterClient re-advertises sol in its catalog
+// (the synthesizer re-registers after plan_type flips). Waiting out the 12h
+// TTL is not acceptable for an operator-driven upgrade.
+func TestClientModelUnsupported_ClearedOnReRegister(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("c-upgrade", "codex", []*ModelInfo{{ID: "m-terra"}})
+	r.MarkClientModelUnsupported("c-upgrade", "m-sol")
+	if !r.IsClientModelUnsupported("c-upgrade", "m-sol") {
+		t.Fatal("precondition: account should be marked unsupported for sol")
+	}
+
+	// Re-register with sol now in the catalog (plan upgraded to plus).
+	r.RegisterClient("c-upgrade", "codex", []*ModelInfo{
+		{ID: "m-terra"},
+		{ID: "m-sol"},
+	})
+	if r.IsClientModelUnsupported("c-upgrade", "m-sol") {
+		t.Fatal("re-registering sol in the catalog must clear the learned unsupported flag")
+	}
+	if !r.ClientSupportsModel("c-upgrade", "m-sol") {
+		t.Fatal("re-registered client must support sol")
+	}
+}
+
+// TestClearClientModelUnsupported verifies the explicit admin/operator clear
+// path used when plan_type is patched without a full re-registration cycle.
+func TestClearClientModelUnsupported(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("c1", "codex", []*ModelInfo{{ID: "m-sol"}, {ID: "m-terra"}})
+	r.MarkClientModelUnsupported("c1", "m-sol")
+	r.MarkClientModelUnsupported("c1", "m-terra")
+
+	r.ClearClientModelUnsupported("c1", "m-sol")
+	if r.IsClientModelUnsupported("c1", "m-sol") {
+		t.Error("ClearClientModelUnsupported must drop the sol flag")
+	}
+	if !r.IsClientModelUnsupported("c1", "m-terra") {
+		t.Error("ClearClientModelUnsupported must not touch other models")
+	}
+
+	r.ClearAllClientModelUnsupported("c1")
+	if r.IsClientModelUnsupported("c1", "m-terra") {
+		t.Error("ClearAllClientModelUnsupported must drop every flag for the client")
+	}
+}

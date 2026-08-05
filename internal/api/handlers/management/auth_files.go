@@ -535,6 +535,26 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
 	}
+	// Surface the effective ChatGPT plan tier so the quota panel can show
+	// free/plus/team/pro and the operator can tell whether sol is expected.
+	// Prefer Attributes (synthesizer / plan-refresh path), then Metadata
+	// (agent-identity registration), then the id_token claim for OAuth.
+	if plan := strings.TrimSpace(authAttribute(auth, "plan_type")); plan != "" {
+		entry["plan_type"] = plan
+	} else if auth.Metadata != nil {
+		if raw, ok := auth.Metadata["plan_type"].(string); ok {
+			if plan := strings.TrimSpace(raw); plan != "" {
+				entry["plan_type"] = plan
+			}
+		}
+	}
+	if _, hasPlan := entry["plan_type"]; !hasPlan {
+		if claims := extractCodexIDTokenClaims(auth); claims != nil {
+			if v, ok := claims["plan_type"].(string); ok && strings.TrimSpace(v) != "" {
+				entry["plan_type"] = strings.TrimSpace(v)
+			}
+		}
+	}
 	// Expose the operator's ignore-quota-limit override so the UI can show and
 	// toggle it. Set when the account keeps serving requests after upstream
 	// reports limit_reached; the quota selector then keeps it schedulable.
@@ -1507,7 +1527,55 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return
 	}
 
+	// plan_type changes the codex model catalog (free has no gpt-5.6-sol).
+	// Manager.Update alone only refreshes runtime auth state — it does not
+	// re-run registerModelsForAuth. Re-register here so a free→plus patch
+	// makes sol selectable immediately, without waiting for a file rename
+	// or process restart. RegisterClient also clears learned
+	// model_not_supported flags for models now in the catalog.
+	if _, ok := touchedRoots["plan_type"]; ok {
+		reRegisterCodexModelsForPlan(targetAuth)
+		if h.authManager != nil {
+			h.authManager.RefreshSchedulerEntry(targetAuth.ID)
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// reRegisterCodexModelsForPlan mirrors service.registerModelsForAuth's codex
+// plan switch so a management plan_type patch updates the global model
+// registry without going through the full Service path. Non-codex auths are
+// a no-op. Keep the switch arms aligned with sdk/cliproxy/service.go.
+func reRegisterCodexModelsForPlan(auth *coreauth.Auth) {
+	if auth == nil || auth.ID == "" {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return
+	}
+	plan := ""
+	if auth.Attributes != nil {
+		plan = strings.TrimSpace(auth.Attributes["plan_type"])
+	}
+	var models []*registry.ModelInfo
+	switch strings.ToLower(plan) {
+	case "pro":
+		models = registry.GetCodexProModels()
+	case "plus":
+		models = registry.GetCodexPlusModels()
+	case "team", "business", "go":
+		models = registry.GetCodexTeamModels()
+	case "free":
+		models = registry.GetCodexFreeModels()
+	default:
+		models = registry.GetCodexProModels()
+	}
+	if len(models) == 0 {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+		return
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, "codex", models)
 }
 
 func decodeAuthFileFieldValue(raw json.RawMessage) (any, error) {
@@ -1646,6 +1714,38 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	if _, ok := touchedRoots["disabled"]; ok {
 		syncAuthFileDisabledState(auth)
 	}
+	// plan_type drives the codex model catalog (free omits gpt-5.6-sol;
+	// plus/team/pro include it). Without this, PATCH only rewrote the
+	// on-disk metadata and left Attributes["plan_type"] stale, so the
+	// selector kept treating an upgraded account as free until a full
+	// file re-synthesis (rename/restart) rebuilt Attributes.
+	if _, ok := touchedRoots["plan_type"]; ok {
+		syncAuthFilePlanTypeAttribute(auth)
+	}
+}
+
+// syncAuthFilePlanTypeAttribute copies Metadata["plan_type"] into
+// Attributes["plan_type"] so registerModelsForAuth / isFreeCodexAuth see
+// the operator's upgrade immediately. Empty values clear the attribute
+// (catalog then falls through to the Pro default).
+func syncAuthFilePlanTypeAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	raw, ok := auth.Metadata["plan_type"].(string)
+	if !ok {
+		delete(auth.Attributes, "plan_type")
+		return
+	}
+	plan := strings.TrimSpace(raw)
+	if plan == "" {
+		delete(auth.Attributes, "plan_type")
+		return
+	}
+	auth.Attributes["plan_type"] = plan
 }
 
 func syncAuthFileHeaderAttributes(auth *coreauth.Auth) {

@@ -299,6 +299,11 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 		} else {
 			delete(r.clientProviders, clientID)
 		}
+		// A fresh registration (or a rename free→plus that creates a new
+		// client ID) means the catalog is authoritative again — drop any
+		// stale learned model_not_supported flags for these models so a
+		// prior free-plan 400 cannot keep excluding the upgraded account.
+		r.clearLearnedUnsupportedForModelsLocked(clientID, uniqueModelIDs)
 		r.invalidateAvailableModelsCacheLocked()
 		r.triggerModelsRegistered(provider, clientID, models)
 		log.Debugf("Registered client %s from provider %s with %d models", clientID, clientProvider, len(rawModelIDs))
@@ -445,6 +450,12 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 	} else {
 		delete(r.clientProviders, clientID)
 	}
+
+	// Models now present in the catalog are entitled again. Clear any
+	// learned model_not_supported flags for them so a free→plus plan
+	// upgrade (or any re-registration that adds e.g. gpt-5.6-sol) takes
+	// effect immediately instead of waiting out the 12h TTL.
+	r.clearLearnedUnsupportedForModelsLocked(clientID, uniqueModelIDs)
 
 	r.invalidateAvailableModelsCacheLocked()
 	r.triggerModelsRegistered(provider, clientID, models)
@@ -781,7 +792,9 @@ const learnedUnsupportedTTL = 12 * time.Hour
 // executor transparently downgrades (and which therefore looks like a success
 // for the original model to the conductor, triggering ResumeClientModel) does
 // not wipe it. It self-heals after the TTL so an account that later gains
-// entitlement is retried.
+// entitlement is retried. It IS cleared when the client is re-registered with
+// that model in its catalog (see clearLearnedUnsupportedForModelsLocked) so a
+// plan upgrade free→plus that adds gpt-5.6-sol does not stay blocked for 12h.
 func (r *ModelRegistry) MarkClientModelUnsupported(clientID, modelID string) {
 	clientID = strings.TrimSpace(clientID)
 	modelID = strings.TrimSpace(modelID)
@@ -801,11 +814,72 @@ func (r *ModelRegistry) MarkClientModelUnsupported(clientID, modelID string) {
 	byClient[clientID] = time.Now().Add(learnedUnsupportedTTL)
 }
 
+// ClearClientModelUnsupported drops the learned model_not_supported flag for
+// one client/model pair. Used when an operator upgrades an account's plan (or
+// re-registers models) and the previous 400 must not keep excluding the
+// account for the rest of the 12h TTL.
+func (r *ModelRegistry) ClearClientModelUnsupported(clientID, modelID string) {
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
+	if clientID == "" || modelID == "" {
+		return
+	}
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	r.clearLearnedUnsupportedForModelsLocked(clientID, []string{modelID})
+}
+
+// ClearAllClientModelUnsupported drops every learned model_not_supported flag
+// for clientID across all models. Useful on plan upgrades where the whole
+// entitlement set may have changed.
+func (r *ModelRegistry) ClearAllClientModelUnsupported(clientID string) {
+	clientID = strings.TrimSpace(clientID)
+	if clientID == "" || r == nil {
+		return
+	}
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	if r.learnedUnsupported == nil {
+		return
+	}
+	for modelID, byClient := range r.learnedUnsupported {
+		if byClient == nil {
+			continue
+		}
+		delete(byClient, clientID)
+		if len(byClient) == 0 {
+			delete(r.learnedUnsupported, modelID)
+		}
+	}
+}
+
+// clearLearnedUnsupportedForModelsLocked drops learned flags for clientID on
+// the given model IDs. Caller must hold r.mutex.
+func (r *ModelRegistry) clearLearnedUnsupportedForModelsLocked(clientID string, modelIDs []string) {
+	if r == nil || r.learnedUnsupported == nil || clientID == "" || len(modelIDs) == 0 {
+		return
+	}
+	for _, modelID := range modelIDs {
+		modelID = strings.TrimSpace(modelID)
+		if modelID == "" {
+			continue
+		}
+		byClient := r.learnedUnsupported[modelID]
+		if byClient == nil {
+			continue
+		}
+		delete(byClient, clientID)
+		if len(byClient) == 0 {
+			delete(r.learnedUnsupported, modelID)
+		}
+	}
+}
+
 // IsClientModelUnsupported reports whether clientID has a non-expired
 // model_not_supported flag for modelID (see MarkClientModelUnsupported).
-// Selection uses this to softly DEPRIORITIZE such accounts for that model
-// (prefer accounts that can serve it) WITHOUT hard-excluding them, so they
-// remain a downgrade-eligible fallback and priority fall-through is unaffected.
+// Selection uses this to EXCLUDE such accounts for that model so a request
+// lands on an account that is actually entitled to it (see quota_selector
+// splitByModelSupport). Cleared on re-registration of the model or TTL expiry.
 func (r *ModelRegistry) IsClientModelUnsupported(clientID, modelID string) bool {
 	clientID = strings.TrimSpace(clientID)
 	modelID = strings.TrimSpace(modelID)

@@ -166,6 +166,10 @@ func parseWhamUsage(body []byte) (coreauth.QuotaSnapshot, bool, error) {
 		UsedPercentSecondary: int(gjson.GetBytes(body, "rate_limit.secondary_window.used_percent").Int()),
 		LimitReached:         gjson.GetBytes(body, "rate_limit.limit_reached").Bool(),
 		FetchedAt:            time.Now(),
+		// Top-level plan_type is the live ChatGPT subscription tier
+		// (free/plus/team/pro/…). Agent-identity credentials freeze plan
+		// at registration; the refresher uses this field to re-sync.
+		PlanType: strings.TrimSpace(gjson.GetBytes(body, "plan_type").String()),
 	}
 	if v := gjson.GetBytes(body, "rate_limit.primary_window.reset_at").Int(); v > 0 {
 		snap.ResetAtPrimary = time.Unix(v, 0)

@@ -37,6 +37,12 @@ type QuotaSnapshot struct {
 	// FetchedAt is when the snapshot was captured. The cache evicts when the
 	// age exceeds its configured TTL.
 	FetchedAt time.Time
+	// PlanType is the ChatGPT subscription tier reported by wham/usage
+	// (e.g. "free", "plus", "team", "pro"). Empty when the response omits
+	// it. Used to refresh agent-identity accounts whose on-disk plan_type
+	// was frozen at registration and would otherwise keep advertising the
+	// wrong model catalog after an upgrade.
+	PlanType string
 }
 
 // QuotaFetcher retrieves a current QuotaSnapshot for a single auth. Returns
