@@ -41,6 +41,7 @@ func TestAuthenticateManagementKey_LocalhostIPBan_BlocksCorrectKeyDuringBan(t *t
 }
 
 func TestMiddlewareSetsSupportPluginHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg:            &config.Config{},

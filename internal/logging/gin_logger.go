@@ -18,10 +18,15 @@ import (
 
 // aiAPIPrefixes defines path prefixes for AI API requests that should have request ID tracking.
 var aiAPIPrefixes = []string{
-	"/v1",
-	"/v1beta",
-	"/openai/v1",
-	"/backend-api/codex",
+	"/v1/chat/completions",
+	"/v1/completions",
+	"/v1/images",
+	"/v1/videos",
+	"/v1/messages",
+	"/v1/responses",
+	"/v1beta/models/",
+	"/api/provider/",
+	"/backend-api/codex/",
 }
 
 const (
@@ -102,7 +107,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 // isAIAPIPath checks if the given path is an AI API endpoint that should have request ID tracking.
 func isAIAPIPath(path string) bool {
 	for _, prefix := range aiAPIPrefixes {
-		if path == prefix || strings.HasPrefix(path, prefix+"/") {
+		if strings.HasPrefix(path, prefix) {
 			return true
 		}
 	}

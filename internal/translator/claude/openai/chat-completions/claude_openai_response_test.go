@@ -7,18 +7,6 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func assertCachedCreationTokens(t *testing.T, payload []byte, want int64) {
-	t.Helper()
-
-	got := gjson.GetBytes(payload, "usage.prompt_tokens_details.cached_creation_tokens")
-	if !got.Exists() {
-		t.Fatalf("expected cached_creation_tokens to exist, payload=%s", string(payload))
-	}
-	if got.Int() != want {
-		t.Fatalf("expected cached_creation_tokens %d, got %d", want, got.Int())
-	}
-}
-
 func TestConvertClaudeResponseToOpenAI_StreamUsageIncludesCachedTokens(t *testing.T) {
 	ctx := context.Background()
 	var param any
@@ -47,7 +35,6 @@ func TestConvertClaudeResponseToOpenAI_StreamUsageIncludesCachedTokens(t *testin
 	if gotCachedTokens := gjson.GetBytes(out[0], "usage.prompt_tokens_details.cached_tokens").Int(); gotCachedTokens != 22000 {
 		t.Fatalf("expected cached_tokens %d, got %d", 22000, gotCachedTokens)
 	}
-	assertCachedCreationTokens(t, out[0], 31)
 }
 
 func TestConvertClaudeResponseToOpenAI_StreamUsageMergesMessageStartUsage(t *testing.T) {
@@ -86,7 +73,6 @@ func TestConvertClaudeResponseToOpenAI_StreamUsageMergesMessageStartUsage(t *tes
 	if gotCachedTokens := gjson.GetBytes(out[0], "usage.prompt_tokens_details.cached_tokens").Int(); gotCachedTokens != 22000 {
 		t.Fatalf("expected cached_tokens %d, got %d", 22000, gotCachedTokens)
 	}
-	assertCachedCreationTokens(t, out[0], 31)
 }
 
 func TestConvertClaudeResponseToOpenAINonStream_UsageIncludesCachedTokens(t *testing.T) {
@@ -107,7 +93,6 @@ func TestConvertClaudeResponseToOpenAINonStream_UsageIncludesCachedTokens(t *tes
 	if gotCachedTokens := gjson.GetBytes(out, "usage.prompt_tokens_details.cached_tokens").Int(); gotCachedTokens != 22000 {
 		t.Fatalf("expected cached_tokens %d, got %d", 22000, gotCachedTokens)
 	}
-	assertCachedCreationTokens(t, out, 31)
 }
 
 func TestConvertClaudeResponseToOpenAINonStream_UsageMergesMessageStartUsage(t *testing.T) {
@@ -128,5 +113,4 @@ func TestConvertClaudeResponseToOpenAINonStream_UsageMergesMessageStartUsage(t *
 	if gotCachedTokens := gjson.GetBytes(out, "usage.prompt_tokens_details.cached_tokens").Int(); gotCachedTokens != 22000 {
 		t.Fatalf("expected cached_tokens %d, got %d", 22000, gotCachedTokens)
 	}
-	assertCachedCreationTokens(t, out, 31)
 }

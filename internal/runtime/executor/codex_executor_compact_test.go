@@ -14,18 +14,18 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func TestCodexExecutorCompactAddsDefaultInstructionsWithoutInjectingImageTool(t *testing.T) {
+func TestCodexExecutorCompactAddsDefaultInstructions(t *testing.T) {
 	cases := []struct {
 		name    string
 		payload string
 	}{
 		{
 			name:    "missing instructions",
-			payload: `{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":"history"},{"type":"compaction_trigger"}]}`,
+			payload: `{"model":"gpt-5.4","input":"hello"}`,
 		},
 		{
 			name:    "null instructions",
-			payload: `{"model":"gpt-5.4","instructions":null,"input":[{"type":"message","role":"user","content":"history"},{"type":"compaction_trigger"}]}`,
+			payload: `{"model":"gpt-5.4","instructions":null,"input":"hello"}`,
 		},
 	}
 
@@ -62,15 +62,14 @@ func TestCodexExecutorCompactAddsDefaultInstructionsWithoutInjectingImageTool(t 
 			if gotPath != "/responses/compact" {
 				t.Fatalf("path = %q, want %q", gotPath, "/responses/compact")
 			}
-			if instructions := gjson.GetBytes(gotBody, "instructions"); instructions.Type != gjson.String || instructions.String() != "" {
-				t.Fatalf("instructions = %s, want empty string; body=%s", instructions.Raw, gotBody)
+			if !gjson.GetBytes(gotBody, "instructions").Exists() {
+				t.Fatalf("expected instructions in compact request body, got %s", string(gotBody))
 			}
-			if gjson.GetBytes(gotBody, "tools").Exists() {
-				t.Fatalf("compact request injected image_generation tool: %s", gotBody)
+			if gjson.GetBytes(gotBody, "instructions").Type != gjson.String {
+				t.Fatalf("instructions type = %v, want string", gjson.GetBytes(gotBody, "instructions").Type)
 			}
-			input := gjson.GetBytes(gotBody, "input").Array()
-			if len(input) != 2 || input[1].Get("type").String() != "compaction_trigger" {
-				t.Fatalf("compact input order changed: %s", gotBody)
+			if gjson.GetBytes(gotBody, "instructions").String() != "" {
+				t.Fatalf("instructions = %q, want empty string", gjson.GetBytes(gotBody, "instructions").String())
 			}
 			if string(resp.Payload) != `{"id":"resp_1","object":"response.compaction","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}` {
 				t.Fatalf("payload = %s", string(resp.Payload))

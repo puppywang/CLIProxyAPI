@@ -18,11 +18,6 @@ import (
 // OpenAIImageModelType marks models that are callable through OpenAI-compatible image endpoints.
 const OpenAIImageModelType = "openai-image"
 
-const (
-	DefaultClaudeMaxInputTokens  = 200000
-	DefaultClaudeMaxOutputTokens = 64000
-)
-
 // ModelInfo represents information about an available model
 type ModelInfo struct {
 	// ID is the unique identifier for the model
@@ -51,9 +46,6 @@ type ModelInfo struct {
 	SupportedGenerationMethods []string `json:"supportedGenerationMethods,omitempty"`
 	// ContextLength is the context window size
 	ContextLength int `json:"context_length,omitempty"`
-	// MaxContextLength is an explicit per-model context window override from configuration.
-	// It is carried internally for Codex client model catalog generation.
-	MaxContextLength int `json:"-"`
 	// MaxCompletionTokens is the maximum completion tokens
 	MaxCompletionTokens int `json:"max_completion_tokens,omitempty"`
 	// SupportedParameters lists supported parameters
@@ -70,20 +62,10 @@ type ModelInfo struct {
 	// This is optional and currently used for Gemini thinking budget normalization.
 	Thinking *ThinkingSupport `json:"thinking,omitempty"`
 
-	// Config holds model-specific runtime overrides loaded from models.json.
-	Config *ModelConfig `json:"config,omitempty"`
-
 	// UserDefined indicates this model was defined through config file's models[]
 	// array (e.g., openai-compatibility.*.models[], *-api-key.models[]).
 	// UserDefined models have thinking configuration passed through without validation.
 	UserDefined bool `json:"-"`
-}
-
-// ModelConfig holds optional runtime overrides for a model definition.
-type ModelConfig struct {
-	// OverrideHeader forces upstream request headers when non-empty.
-	// Keys are header names (e.g. "user-agent"); values replace any existing header.
-	OverrideHeader map[string]string `json:"override_header,omitempty"`
 }
 
 type availableModelsCacheEntry struct {
@@ -149,15 +131,12 @@ type ModelRegistry struct {
 	availableModelsCache map[string]availableModelsCacheEntry
 	// hook is an optional callback sink for model registration changes
 	hook ModelRegistryHook
-}
-	// hook is an optional callback sink for model registration changes
-	hook ModelRegistryHook
 	// learnedUnsupported records, per model ID, the clients that have LEARNED
 	// they cannot serve that model (upstream model_not_supported), each with an
-	// expiry. DELIBERATELY separate from SuspendedClients: a downgraded request
-	// looks like a success for the original model to the conductor, so its
-	// ResumeClientModel would wipe a SuspendedClients marker but must not wipe
-	// this durable, self-healing flag. Guarded by mutex; lazily allocated.
+	// expiry. This is DELIBERATELY separate from SuspendedClients: a downgraded
+	// request looks like a success for the original model to the conductor, so
+	// its ResumeClientModel would wipe a SuspendedClients marker — but must not
+	// wipe this durable, self-healing flag. Guarded by mutex; lazily allocated.
 	learnedUnsupported map[string]map[string]time.Time
 }
 
@@ -208,27 +187,6 @@ func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 		return cloneModelInfo(info)
 	}
 	return cloneModelInfo(LookupStaticModelInfo(modelID))
-}
-
-// ModelOverrideHeaders returns models.json config.override_header for the model, if any.
-// The returned map is a defensive copy and may be empty but never nil when overrides exist.
-func ModelOverrideHeaders(modelID string, provider ...string) map[string]string {
-	info := LookupModelInfo(modelID, provider...)
-	if info == nil || info.Config == nil || len(info.Config.OverrideHeader) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(info.Config.OverrideHeader))
-	for key, value := range info.Config.OverrideHeader {
-		key = strings.TrimSpace(key)
-		if key == "" {
-			continue
-		}
-		out[key] = value
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
 
 // SetHook sets an optional hook for observing model registration changes.
@@ -341,6 +299,11 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 		} else {
 			delete(r.clientProviders, clientID)
 		}
+		// A fresh registration (or a rename free→plus that creates a new
+		// client ID) means the catalog is authoritative again — drop any
+		// stale learned model_not_supported flags for these models so a
+		// prior free-plan 400 cannot keep excluding the upgraded account.
+		r.clearLearnedUnsupportedForModelsLocked(clientID, uniqueModelIDs)
 		r.invalidateAvailableModelsCacheLocked()
 		r.triggerModelsRegistered(provider, clientID, models)
 		log.Debugf("Registered client %s from provider %s with %d models", clientID, clientProvider, len(rawModelIDs))
@@ -488,6 +451,12 @@ func (r *ModelRegistry) RegisterClient(clientID, clientProvider string, models [
 		delete(r.clientProviders, clientID)
 	}
 
+	// Models now present in the catalog are entitled again. Clear any
+	// learned model_not_supported flags for them so a free→plus plan
+	// upgrade (or any re-registration that adds e.g. gpt-5.6-sol) takes
+	// effect immediately instead of waiting out the 12h TTL.
+	r.clearLearnedUnsupportedForModelsLocked(clientID, uniqueModelIDs)
+
 	r.invalidateAvailableModelsCacheLocked()
 	r.triggerModelsRegistered(provider, clientID, models)
 	if len(added) == 0 && len(removed) == 0 && !providerChanged {
@@ -598,16 +567,6 @@ func cloneModelInfo(model *ModelInfo) *ModelInfo {
 			copyThinking.Levels = append([]string(nil), model.Thinking.Levels...)
 		}
 		copyModel.Thinking = &copyThinking
-	}
-	if model.Config != nil {
-		copyConfig := *model.Config
-		if len(model.Config.OverrideHeader) > 0 {
-			copyConfig.OverrideHeader = make(map[string]string, len(model.Config.OverrideHeader))
-			for key, value := range model.Config.OverrideHeader {
-				copyConfig.OverrideHeader[key] = value
-			}
-		}
-		copyModel.Config = &copyConfig
 	}
 	return &copyModel
 }
@@ -764,6 +723,30 @@ func (r *ModelRegistry) SuspendClientModel(clientID, modelID, reason string) {
 	}
 }
 
+// SuspendedModelsForClient returns the list of models the named client
+// is currently suspended on. Used by the management cooldown panel so
+// operators see which model_registry suspensions still apply — these
+// are tracked SEPARATELY from the per-ModelState fields on the Auth
+// (a clean ModelState can coexist with a stale registry suspension).
+// Returns nil when the client has no active suspensions.
+func (r *ModelRegistry) SuspendedModelsForClient(clientID string) []string {
+	if clientID == "" {
+		return nil
+	}
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	var out []string
+	for modelID, registration := range r.models {
+		if registration == nil || registration.SuspendedClients == nil {
+			continue
+		}
+		if _, ok := registration.SuspendedClients[clientID]; ok {
+			out = append(out, modelID)
+		}
+	}
+	return out
+}
+
 // ResumeClientModel clears a previous suspension so the client counts toward availability again.
 // Parameters:
 //   - clientID: The client to resume
@@ -787,6 +770,161 @@ func (r *ModelRegistry) ResumeClientModel(clientID, modelID string) {
 	registration.LastUpdated = time.Now()
 	r.invalidateAvailableModelsCacheLocked()
 	log.Debugf("Resumed client %s for model %s", clientID, modelID)
+}
+
+// ModelNotSupportedReason is the SuspendClientModel reason string recorded on
+// the model-support branch (upstream "model is not supported when using Codex
+// with a ChatGPT account"). Kept for the cooldown-panel display / diagnostics;
+// the durable soft-isolation flag lives in learnedUnsupported (see below), not
+// in SuspendedClients.
+const ModelNotSupportedReason = "model_not_supported"
+
+// learnedUnsupportedTTL bounds how long a learned model_not_supported flag
+// stays in effect before the account is retried for that model. Matches the
+// conductor's 12h model-support cooldown. Long enough to be a stable routing
+// preference; short enough that an account which later gains entitlement
+// recovers on its own.
+const learnedUnsupportedTTL = 12 * time.Hour
+
+// MarkClientModelUnsupported records that clientID has LEARNED it cannot serve
+// modelID (upstream model_not_supported), with a TTL. Unlike SuspendClientModel
+// this flag is NOT cleared by ResumeClientModel — so a request that the
+// executor transparently downgrades (and which therefore looks like a success
+// for the original model to the conductor, triggering ResumeClientModel) does
+// not wipe it. It self-heals after the TTL so an account that later gains
+// entitlement is retried. It IS cleared when the client is re-registered with
+// that model in its catalog (see clearLearnedUnsupportedForModelsLocked) so a
+// plan upgrade free→plus that adds gpt-5.6-sol does not stay blocked for 12h.
+func (r *ModelRegistry) MarkClientModelUnsupported(clientID, modelID string) {
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
+	if clientID == "" || modelID == "" {
+		return
+	}
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	if r.learnedUnsupported == nil {
+		r.learnedUnsupported = make(map[string]map[string]time.Time)
+	}
+	byClient := r.learnedUnsupported[modelID]
+	if byClient == nil {
+		byClient = make(map[string]time.Time)
+		r.learnedUnsupported[modelID] = byClient
+	}
+	byClient[clientID] = time.Now().Add(learnedUnsupportedTTL)
+}
+
+// ClearClientModelUnsupported drops the learned model_not_supported flag for
+// one client/model pair. Used when an operator upgrades an account's plan (or
+// re-registers models) and the previous 400 must not keep excluding the
+// account for the rest of the 12h TTL.
+func (r *ModelRegistry) ClearClientModelUnsupported(clientID, modelID string) {
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
+	if clientID == "" || modelID == "" {
+		return
+	}
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	r.clearLearnedUnsupportedForModelsLocked(clientID, []string{modelID})
+}
+
+// ClearAllClientModelUnsupported drops every learned model_not_supported flag
+// for clientID across all models. Useful on plan upgrades where the whole
+// entitlement set may have changed.
+func (r *ModelRegistry) ClearAllClientModelUnsupported(clientID string) {
+	clientID = strings.TrimSpace(clientID)
+	if clientID == "" || r == nil {
+		return
+	}
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	if r.learnedUnsupported == nil {
+		return
+	}
+	for modelID, byClient := range r.learnedUnsupported {
+		if byClient == nil {
+			continue
+		}
+		delete(byClient, clientID)
+		if len(byClient) == 0 {
+			delete(r.learnedUnsupported, modelID)
+		}
+	}
+}
+
+// clearLearnedUnsupportedForModelsLocked drops learned flags for clientID on
+// the given model IDs. Caller must hold r.mutex.
+func (r *ModelRegistry) clearLearnedUnsupportedForModelsLocked(clientID string, modelIDs []string) {
+	if r == nil || r.learnedUnsupported == nil || clientID == "" || len(modelIDs) == 0 {
+		return
+	}
+	for _, modelID := range modelIDs {
+		modelID = strings.TrimSpace(modelID)
+		if modelID == "" {
+			continue
+		}
+		byClient := r.learnedUnsupported[modelID]
+		if byClient == nil {
+			continue
+		}
+		delete(byClient, clientID)
+		if len(byClient) == 0 {
+			delete(r.learnedUnsupported, modelID)
+		}
+	}
+}
+
+// IsClientModelUnsupported reports whether clientID has a non-expired
+// model_not_supported flag for modelID (see MarkClientModelUnsupported).
+// Selection uses this to EXCLUDE such accounts for that model so a request
+// lands on an account that is actually entitled to it (see quota_selector
+// splitByModelSupport). Cleared on re-registration of the model or TTL expiry.
+func (r *ModelRegistry) IsClientModelUnsupported(clientID, modelID string) bool {
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
+	if clientID == "" || modelID == "" {
+		return false
+	}
+	r.mutex.RLock()
+	expiry, ok := r.learnedUnsupported[modelID][clientID]
+	r.mutex.RUnlock()
+	if !ok {
+		return false
+	}
+	if time.Now().After(expiry) {
+		// Expired — drop it lazily under the write lock (re-checking so we do
+		// not race a concurrent re-mark).
+		r.mutex.Lock()
+		if byClient := r.learnedUnsupported[modelID]; byClient != nil {
+			if exp, still := byClient[clientID]; still && time.Now().After(exp) {
+				delete(byClient, clientID)
+			}
+		}
+		r.mutex.Unlock()
+		return false
+	}
+	return true
+}
+
+// IsClientModelSuspended reports whether the client currently carries a
+// SuspendClientModel marker for modelID (any reason). NOTE: not used to gate
+// selection candidacy — see IsClientModelUnsupported for why. Retained for
+// diagnostics / potential callers.
+func (r *ModelRegistry) IsClientModelSuspended(clientID, modelID string) bool {
+	clientID = strings.TrimSpace(clientID)
+	modelID = strings.TrimSpace(modelID)
+	if clientID == "" || modelID == "" {
+		return false
+	}
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	registration, exists := r.models[modelID]
+	if !exists || registration == nil || registration.SuspendedClients == nil {
+		return false
+	}
+	_, suspended := registration.SuspendedClients[clientID]
+	return suspended
 }
 
 // ClientSupportsModel reports whether the client registered support for modelID.
@@ -848,84 +986,49 @@ func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any 
 	return models
 }
 
-func modelRegistrationAvailability(registration *ModelRegistration, now time.Time) (bool, time.Time) {
-	if registration == nil {
-		return false, time.Time{}
-	}
-
-	availableClients := registration.Count
-	expiredClients := 0
-	var expiresAt time.Time
-	for _, quotaTime := range registration.QuotaExceededClients {
-		if quotaTime == nil {
-			continue
-		}
-		recoveryAt := quotaTime.Add(modelQuotaExceededWindow)
-		if now.Before(recoveryAt) {
-			expiredClients++
-			if expiresAt.IsZero() || recoveryAt.Before(expiresAt) {
-				expiresAt = recoveryAt
-			}
-		}
-	}
-
-	cooldownSuspended := 0
-	otherSuspended := 0
-	if registration.SuspendedClients != nil {
-		for _, reason := range registration.SuspendedClients {
-			if strings.EqualFold(reason, "quota") {
-				cooldownSuspended++
-				continue
-			}
-			otherSuspended++
-		}
-	}
-
-	effectiveClients := availableClients - expiredClients - otherSuspended
-	if effectiveClients < 0 {
-		effectiveClients = 0
-	}
-
-	available := effectiveClients > 0 || (availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0)
-	return available, expiresAt
-}
-
-// GetAvailableModelInfos returns cloned metadata for all currently available models.
-func (r *ModelRegistry) GetAvailableModelInfos() []*ModelInfo {
-	now := time.Now()
-	r.mutex.RLock()
-	defer r.mutex.RUnlock()
-
-	result := make([]*ModelInfo, 0, len(r.models))
-	for _, registration := range r.models {
-		available, _ := modelRegistrationAvailability(registration, now)
-		if !available || registration == nil || registration.Info == nil {
-			continue
-		}
-		result = append(result, cloneModelInfo(registration.Info))
-	}
-	sort.Slice(result, func(i, j int) bool {
-		return strings.TrimSpace(result[i].ID) < strings.TrimSpace(result[j].ID)
-	})
-	return result
-}
-
 func (r *ModelRegistry) buildAvailableModelsLocked(handlerType string, now time.Time) ([]map[string]any, time.Time) {
 	models := make([]map[string]any, 0, len(r.models))
 	var expiresAt time.Time
 
 	for _, registration := range r.models {
-		available, registrationExpiresAt := modelRegistrationAvailability(registration, now)
-		if !registrationExpiresAt.IsZero() && (expiresAt.IsZero() || registrationExpiresAt.Before(expiresAt)) {
-			expiresAt = registrationExpiresAt
-		}
-		if !available || registration == nil {
-			continue
+		availableClients := registration.Count
+
+		expiredClients := 0
+		for _, quotaTime := range registration.QuotaExceededClients {
+			if quotaTime == nil {
+				continue
+			}
+			recoveryAt := quotaTime.Add(modelQuotaExceededWindow)
+			if now.Before(recoveryAt) {
+				expiredClients++
+				if expiresAt.IsZero() || recoveryAt.Before(expiresAt) {
+					expiresAt = recoveryAt
+				}
+			}
 		}
 
-		model := r.convertModelToMap(registration.Info, handlerType)
-		if model != nil {
-			models = append(models, model)
+		cooldownSuspended := 0
+		otherSuspended := 0
+		if registration.SuspendedClients != nil {
+			for _, reason := range registration.SuspendedClients {
+				if strings.EqualFold(reason, "quota") {
+					cooldownSuspended++
+					continue
+				}
+				otherSuspended++
+			}
+		}
+
+		effectiveClients := availableClients - expiredClients - otherSuspended
+		if effectiveClients < 0 {
+			effectiveClients = 0
+		}
+
+		if effectiveClients > 0 || (availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0) {
+			model := r.convertModelToMap(registration.Info, handlerType)
+			if model != nil {
+				models = append(models, model)
+			}
 		}
 	}
 
@@ -1235,9 +1338,6 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 		if model.ContextLength > 0 {
 			result["context_length"] = model.ContextLength
 		}
-		if model.MaxContextLength > 0 {
-			result["max_context_length"] = model.MaxContextLength
-		}
 		if model.MaxCompletionTokens > 0 {
 			result["max_completion_tokens"] = model.MaxCompletionTokens
 		}
@@ -1253,24 +1353,14 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 			"owned_by": model.OwnedBy,
 		}
 		if model.Created > 0 {
-			result["created_at"] = time.Unix(model.Created, 0).UTC().Format(time.RFC3339)
+			result["created_at"] = model.Created
 		}
-		result["type"] = "model"
+		if model.Type != "" {
+			result["type"] = "model"
+		}
 		if model.DisplayName != "" {
 			result["display_name"] = model.DisplayName
-		} else {
-			result["display_name"] = model.ID
 		}
-		maxInput := model.ContextLength
-		if maxInput <= 0 {
-			maxInput = DefaultClaudeMaxInputTokens
-		}
-		maxOutput := model.MaxCompletionTokens
-		if maxOutput <= 0 {
-			maxOutput = DefaultClaudeMaxOutputTokens
-		}
-		result["max_input_tokens"] = maxInput
-		result["max_tokens"] = maxOutput
 		return result
 
 	case "gemini":
@@ -1427,134 +1517,4 @@ func (r *ModelRegistry) GetModelsForClient(clientID string) []*ModelInfo {
 		}
 	}
 	return result
-}
-
-const ModelNotSupportedReason = "model_not_supported"
-
-// learnedUnsupportedTTL bounds how long a learned model_not_supported flag
-// stays in effect before the account is retried for that model. Matches the
-// conductor's 12h model-support cooldown. Long enough to be a stable routing
-// preference; short enough that an account which later gains entitlement
-// recovers on its own.
-const learnedUnsupportedTTL = 12 * time.Hour
-
-// MarkClientModelUnsupported records that clientID has LEARNED it cannot serve
-// modelID (upstream model_not_supported), with a TTL. Unlike SuspendClientModel
-// this flag is NOT cleared by ResumeClientModel — so a request that the
-// executor transparently downgrades (and which therefore looks like a success
-// for the original model to the conductor, triggering ResumeClientModel) does
-// not wipe it. It self-heals after the TTL so an account that later gains
-// entitlement is retried. It IS cleared when the client is re-registered with
-// that model in its catalog (see clearLearnedUnsupportedForModelsLocked) so a
-// plan upgrade free→plus that adds gpt-5.6-sol does not stay blocked for 12h.
-func (r *ModelRegistry) MarkClientModelUnsupported(clientID, modelID string) {
-	clientID = strings.TrimSpace(clientID)
-	modelID = strings.TrimSpace(modelID)
-	if clientID == "" || modelID == "" {
-		return
-	}
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-	if r.learnedUnsupported == nil {
-		r.learnedUnsupported = make(map[string]map[string]time.Time)
-	}
-	byClient := r.learnedUnsupported[modelID]
-	if byClient == nil {
-		byClient = make(map[string]time.Time)
-		r.learnedUnsupported[modelID] = byClient
-	}
-	byClient[clientID] = time.Now().Add(learnedUnsupportedTTL)
-}
-
-// ClearClientModelUnsupported drops the learned model_not_supported flag for
-// one client/model pair. Used when an operator upgrades an account's plan (or
-// re-registers models) and the previous 400 must not keep excluding the
-// account for the rest of the 12h TTL.
-func (r *ModelRegistry) ClearClientModelUnsupported(clientID, modelID string) {
-	clientID = strings.TrimSpace(clientID)
-	modelID = strings.TrimSpace(modelID)
-	if clientID == "" || modelID == "" {
-		return
-	}
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-	r.clearLearnedUnsupportedForModelsLocked(clientID, []string{modelID})
-}
-
-// ClearAllClientModelUnsupported drops every learned model_not_supported flag
-// for clientID across all models. Useful on plan upgrades where the whole
-// entitlement set may have changed.
-func (r *ModelRegistry) ClearAllClientModelUnsupported(clientID string) {
-	clientID = strings.TrimSpace(clientID)
-	if clientID == "" || r == nil {
-		return
-	}
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-	if r.learnedUnsupported == nil {
-		return
-	}
-	for modelID, byClient := range r.learnedUnsupported {
-		if byClient == nil {
-			continue
-		}
-		delete(byClient, clientID)
-		if len(byClient) == 0 {
-			delete(r.learnedUnsupported, modelID)
-		}
-	}
-}
-
-// clearLearnedUnsupportedForModelsLocked drops learned flags for clientID on
-// the given model IDs. Caller must hold r.mutex.
-func (r *ModelRegistry) clearLearnedUnsupportedForModelsLocked(clientID string, modelIDs []string) {
-	if r == nil || r.learnedUnsupported == nil || clientID == "" || len(modelIDs) == 0 {
-		return
-	}
-	for _, modelID := range modelIDs {
-		modelID = strings.TrimSpace(modelID)
-		if modelID == "" {
-			continue
-		}
-		byClient := r.learnedUnsupported[modelID]
-		if byClient == nil {
-			continue
-		}
-		delete(byClient, clientID)
-		if len(byClient) == 0 {
-			delete(r.learnedUnsupported, modelID)
-		}
-	}
-}
-
-// IsClientModelUnsupported reports whether clientID has a non-expired
-// model_not_supported flag for modelID (see MarkClientModelUnsupported).
-// Selection uses this to EXCLUDE such accounts for that model so a request
-// lands on an account that is actually entitled to it (see quota_selector
-// splitByModelSupport). Cleared on re-registration of the model or TTL expiry.
-func (r *ModelRegistry) IsClientModelUnsupported(clientID, modelID string) bool {
-	clientID = strings.TrimSpace(clientID)
-	modelID = strings.TrimSpace(modelID)
-	if clientID == "" || modelID == "" {
-		return false
-	}
-	r.mutex.RLock()
-	expiry, ok := r.learnedUnsupported[modelID][clientID]
-	r.mutex.RUnlock()
-	if !ok {
-		return false
-	}
-	if time.Now().After(expiry) {
-		// Expired — drop it lazily under the write lock (re-checking so we do
-		// not race a concurrent re-mark).
-		r.mutex.Lock()
-		if byClient := r.learnedUnsupported[modelID]; byClient != nil {
-			if exp, still := byClient[clientID]; still && time.Now().After(exp) {
-				delete(byClient, clientID)
-			}
-		}
-		r.mutex.Unlock()
-		return false
-	}
-	return true
 }

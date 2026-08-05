@@ -6,10 +6,10 @@
 package claude
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
@@ -19,7 +19,7 @@ import (
 const geminiClaudeThoughtSignature = "skip_thought_signature_validator"
 
 // ConvertClaudeRequestToGemini parses a Claude API request and returns a complete
-// Gemini request body (as JSON bytes) ready to be sent via SendRawMessageStream.
+// Gemini CLI request body (as JSON bytes) ready to be sent via SendRawMessageStream.
 // All JSON transformations are performed using gjson/sjson.
 //
 // Parameters:
@@ -28,16 +28,17 @@ const geminiClaudeThoughtSignature = "skip_thought_signature_validator"
 //   - stream: A boolean indicating if the request is for a streaming response.
 //
 // Returns:
-//   - []byte: The transformed request in Gemini format.
+//   - []byte: The transformed request in Gemini CLI format.
 func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool) []byte {
 	rawJSON := inputRawJSON
-	// Build output Gemini request JSON
+	// Build output Gemini CLI request JSON
 	out := []byte(`{"contents":[]}`)
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
 	// system instruction
 	if systemResult := gjson.GetBytes(rawJSON, "system"); systemResult.IsArray() {
-		systemParts := make([][]byte, 0, 2)
+		systemInstruction := []byte(`{"role":"user","parts":[]}`)
+		hasSystemParts := false
 		systemResult.ForEach(func(_, systemPromptResult gjson.Result) bool {
 			if systemPromptResult.Get("type").String() == "text" {
 				textResult := systemPromptResult.Get("text")
@@ -47,23 +48,21 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 					}
 					part := []byte(`{"text":""}`)
 					part, _ = sjson.SetBytes(part, "text", textResult.String())
-					systemParts = append(systemParts, part)
+					systemInstruction, _ = sjson.SetRawBytes(systemInstruction, "parts.-1", part)
+					hasSystemParts = true
 				}
 			}
 			return true
 		})
-		if len(systemParts) > 0 {
-			systemInstruction := []byte(`{"role":"user","parts":[]}`)
-			systemInstruction, _ = sjson.SetRawBytes(systemInstruction, "parts", translatorcommon.JoinRawArray(systemParts))
-			out, _ = sjson.SetRawBytes(out, "systemInstruction", systemInstruction)
+		if hasSystemParts {
+			out, _ = sjson.SetRawBytes(out, "system_instruction", systemInstruction)
 		}
 	} else if systemResult.Type == gjson.String && !util.IsClaudeCodeAttributionSystemText(systemResult.String()) {
-		out, _ = sjson.SetBytes(out, "systemInstruction.parts.-1.text", systemResult.String())
+		out, _ = sjson.SetBytes(out, "system_instruction.parts.-1.text", systemResult.String())
 	}
 
 	// contents
 	if messagesResult := gjson.GetBytes(rawJSON, "messages"); messagesResult.IsArray() {
-		contentItems := translatorcommon.NewRawArrayItems(messagesResult.Get("#").Int())
 		messagesResult.ForEach(func(_, messageResult gjson.Result) bool {
 			roleResult := messageResult.Get("role")
 			if roleResult.Type != gjson.String {
@@ -76,17 +75,10 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 				role = "user"
 			}
 
-			partItems := make([][]byte, 0, 4)
+			contentJSON := []byte(`{"role":"","parts":[]}`)
+			contentJSON, _ = sjson.SetBytes(contentJSON, "role", role)
+
 			contentsResult := messageResult.Get("content")
-			if roleResult.String() == "system" {
-				if reminderText, ok := translatorcommon.ClaudeMessageSystemReminderText(contentsResult); ok {
-					part := []byte(`{"text":""}`)
-					part, _ = sjson.SetBytes(part, "text", reminderText)
-					partItems = append(partItems, part)
-					contentItems = append(contentItems, geminiContentWithParts(role, partItems))
-				}
-				return true
-			}
 			if contentsResult.IsArray() {
 				contentsResult.ForEach(func(_, contentResult gjson.Result) bool {
 					switch contentResult.Get("type").String() {
@@ -97,7 +89,7 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						}
 						part := []byte(`{"text":""}`)
 						part, _ = sjson.SetBytes(part, "text", text)
-						partItems = append(partItems, part)
+						contentJSON, _ = sjson.SetRawBytes(contentJSON, "parts.-1", part)
 
 					case "tool_use":
 						functionName := contentResult.Get("name").String()
@@ -114,7 +106,7 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 							part, _ = sjson.SetBytes(part, "thoughtSignature", geminiClaudeThoughtSignature)
 							part, _ = sjson.SetBytes(part, "functionCall.name", functionName)
 							part, _ = sjson.SetRawBytes(part, "functionCall.args", []byte(functionArgs))
-							partItems = append(partItems, part)
+							contentJSON, _ = sjson.SetRawBytes(contentJSON, "parts.-1", part)
 						}
 
 					case "tool_result":
@@ -127,21 +119,11 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 							funcName = toolCallID
 						}
 						funcName = util.SanitizeFunctionName(funcName)
-						toolResult := util.ConvertClaudeToolResultContent(contentResult.Get("content"))
+						responseData := contentResult.Get("content").Raw
 						part := []byte(`{"functionResponse":{"name":"","response":{"result":""}}}`)
 						part, _ = sjson.SetBytes(part, "functionResponse.name", funcName)
-						if toolResult.ResultIsRaw {
-							part, _ = sjson.SetRawBytes(part, "functionResponse.response.result", []byte(toolResult.Result))
-						} else {
-							part, _ = sjson.SetBytes(part, "functionResponse.response.result", toolResult.Result)
-						}
-						partItems = append(partItems, part)
-						for _, img := range toolResult.Images {
-							imagePart := []byte(`{"inline_data":{"mime_type":"","data":""}}`)
-							imagePart, _ = sjson.SetBytes(imagePart, "inline_data.mime_type", img.MimeType)
-							imagePart, _ = sjson.SetBytes(imagePart, "inline_data.data", img.Data)
-							partItems = append(partItems, imagePart)
-						}
+						part, _ = sjson.SetBytes(part, "functionResponse.response.result", responseData)
+						contentJSON, _ = sjson.SetRawBytes(contentJSON, "parts.-1", part)
 
 					case "image":
 						source := contentResult.Get("source")
@@ -156,43 +138,48 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						part := []byte(`{"inline_data":{"mime_type":"","data":""}}`)
 						part, _ = sjson.SetBytes(part, "inline_data.mime_type", mimeType)
 						part, _ = sjson.SetBytes(part, "inline_data.data", data)
-						partItems = append(partItems, part)
+						contentJSON, _ = sjson.SetRawBytes(contentJSON, "parts.-1", part)
 					}
 					return true
 				})
-				contentItems = append(contentItems, geminiContentWithParts(role, partItems))
+				out, _ = sjson.SetRawBytes(out, "contents.-1", contentJSON)
 			} else if contentsResult.Type == gjson.String {
 				part := []byte(`{"text":""}`)
 				part, _ = sjson.SetBytes(part, "text", contentsResult.String())
-				partItems = append(partItems, part)
-				contentItems = append(contentItems, geminiContentWithParts(role, partItems))
+				contentJSON, _ = sjson.SetRawBytes(contentJSON, "parts.-1", part)
+				out, _ = sjson.SetRawBytes(out, "contents.-1", contentJSON)
 			}
 			return true
 		})
+	}
 
-		// Strip a trailing model turn with unanswered function calls.
-		if len(contentItems) > 0 {
-			last := gjson.ParseBytes(contentItems[len(contentItems)-1])
+	// strip trailing model turn with unanswered function calls —
+	// Gemini returns empty responses when the last turn is a model
+	// functionCall with no corresponding user functionResponse.
+	contents := gjson.GetBytes(out, "contents")
+	if contents.Exists() && contents.IsArray() {
+		arr := contents.Array()
+		if len(arr) > 0 {
+			last := arr[len(arr)-1]
 			if last.Get("role").String() == "model" {
-				hasFunctionCall := false
+				hasFC := false
 				last.Get("parts").ForEach(func(_, part gjson.Result) bool {
 					if part.Get("functionCall").Exists() {
-						hasFunctionCall = true
+						hasFC = true
 						return false
 					}
 					return true
 				})
-				if hasFunctionCall {
-					contentItems = contentItems[:len(contentItems)-1]
+				if hasFC {
+					out, _ = sjson.DeleteBytes(out, fmt.Sprintf("contents.%d", len(arr)-1))
 				}
 			}
 		}
-		out = translatorcommon.SetRawArrayItems(out, "contents", contentItems)
 	}
 
 	// tools
 	if toolsResult := gjson.GetBytes(rawJSON, "tools"); toolsResult.IsArray() {
-		var toolItems [][]byte
+		hasTools := false
 		toolsResult.ForEach(func(_, toolResult gjson.Result) bool {
 			inputSchemaResult := toolResult.Get("input_schema")
 			if inputSchemaResult.Exists() && inputSchemaResult.IsObject() {
@@ -207,27 +194,25 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 				if err != nil {
 					return true
 				}
-				for _, path := range []string{"strict", "input_examples", "type", "cache_control", "defer_loading", "eager_input_streaming"} {
-					if toolResult.Get(path).Exists() {
-						tool, _ = sjson.DeleteBytes(tool, path)
-					}
-				}
-				nameResult := toolResult.Get("name")
-				originalName := nameResult.String()
-				sanitizedName := util.SanitizeFunctionName(originalName)
-				if nameResult.Type != gjson.String || sanitizedName != originalName {
-					tool, _ = sjson.SetBytes(tool, "name", sanitizedName)
-				}
+				tool, _ = sjson.DeleteBytes(tool, "strict")
+				tool, _ = sjson.DeleteBytes(tool, "input_examples")
+				tool, _ = sjson.DeleteBytes(tool, "type")
+				tool, _ = sjson.DeleteBytes(tool, "cache_control")
+				tool, _ = sjson.DeleteBytes(tool, "defer_loading")
+				tool, _ = sjson.DeleteBytes(tool, "eager_input_streaming")
+				tool, _ = sjson.SetBytes(tool, "name", util.SanitizeFunctionName(gjson.GetBytes(tool, "name").String()))
 				if gjson.ValidBytes(tool) && gjson.ParseBytes(tool).IsObject() {
-					toolItems = append(toolItems, tool)
+					if !hasTools {
+						out, _ = sjson.SetRawBytes(out, "tools", []byte(`[{"functionDeclarations":[]}]`))
+						hasTools = true
+					}
+					out, _ = sjson.SetRawBytes(out, "tools.0.functionDeclarations.-1", tool)
 				}
 			}
 			return true
 		})
-		if len(toolItems) > 0 {
-			tools := []byte(`[{"functionDeclarations":[]}]`)
-			tools, _ = sjson.SetRawBytes(tools, "0.functionDeclarations", translatorcommon.JoinRawArray(toolItems))
-			out, _ = sjson.SetRawBytes(out, "tools", tools)
+		if !hasTools {
+			out, _ = sjson.DeleteBytes(out, "tools")
 		}
 	}
 
@@ -266,6 +251,7 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 			if b := t.Get("budget_tokens"); b.Exists() && b.Type == gjson.Number {
 				budget := int(b.Int())
 				out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.thinkingBudget", budget)
+				out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.includeThoughts", true)
 			}
 		case "adaptive", "auto":
 			// For adaptive thinking:
@@ -289,6 +275,7 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 					out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.thinkingLevel", "high")
 				}
 			}
+			out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.includeThoughts", true)
 		}
 	}
 	if v := gjson.GetBytes(rawJSON, "temperature"); v.Exists() && v.Type == gjson.Number {
@@ -305,13 +292,6 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 	result = common.AttachDefaultSafetySettings(result, "safetySettings")
 
 	return result
-}
-
-func geminiContentWithParts(role string, parts [][]byte) []byte {
-	content := []byte(`{"role":"","parts":[]}`)
-	content, _ = sjson.SetBytes(content, "role", role)
-	content, _ = sjson.SetRawBytes(content, "parts", translatorcommon.JoinRawArray(parts))
-	return content
 }
 
 func toolNameFromClaudeToolUseID(toolUseID string) string {

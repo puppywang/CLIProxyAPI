@@ -38,7 +38,7 @@ func (h *Host) schedulerRecord() *capabilityRecord {
 	if h == nil {
 		return nil
 	}
-	for _, record := range h.activeRecords() {
+	for _, record := range h.Snapshot().records {
 		if h.isPluginFused(record.id) || record.plugin.Capabilities.Scheduler == nil {
 			continue
 		}
@@ -50,7 +50,7 @@ func (h *Host) schedulerRecord() *capabilityRecord {
 
 func (h *Host) callScheduler(ctx context.Context, record capabilityRecord, req pluginapi.SchedulerPickRequest) (resp pluginapi.SchedulerPickResponse, handled bool, err error) {
 	scheduler := record.plugin.Capabilities.Scheduler
-	if h == nil || scheduler == nil || h.isPluginFused(record.id) || !h.recordCurrent(record) {
+	if h == nil || scheduler == nil || h.isPluginFused(record.id) {
 		return pluginapi.SchedulerPickResponse{}, false, nil
 	}
 	defer func() {

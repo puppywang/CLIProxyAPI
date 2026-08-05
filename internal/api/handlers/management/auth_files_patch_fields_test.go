@@ -12,12 +12,14 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	fileauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 func TestPatchAuthFileFields_MergeHeadersAndDeleteEmptyValues(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
 
 	store := &memoryAuthStore{}
 	manager := coreauth.NewManager(store, nil, nil)
@@ -112,6 +114,7 @@ func TestPatchAuthFileFields_MergeHeadersAndDeleteEmptyValues(t *testing.T) {
 
 func TestPatchAuthFileFields_HeadersEmptyMapIsNoop(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
 
 	store := &memoryAuthStore{}
 	manager := coreauth.NewManager(store, nil, nil)
@@ -166,6 +169,7 @@ func TestPatchAuthFileFields_HeadersEmptyMapIsNoop(t *testing.T) {
 
 func TestPatchAuthFileFields_WebsocketsFalseIsUpdate(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
 
 	store := &memoryAuthStore{}
 	manager := coreauth.NewManager(store, nil, nil)
@@ -212,8 +216,77 @@ func TestPatchAuthFileFields_WebsocketsFalseIsUpdate(t *testing.T) {
 	}
 }
 
+func TestPatchAuthFileFields_PlanTypeSyncsAttributeAndRegistersSol(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	fileName := "codex-bill@example.com-free.json"
+	filePath := filepath.Join(authDir, fileName)
+	store := fileauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path":      filePath,
+			"plan_type": "free",
+		},
+		Metadata: map[string]any{
+			"type":      "codex",
+			"plan_type": "free",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+	// Seed free catalog + a stale learned sol exclusion (what a free account
+	// would accumulate if it ever hit a sol 400 while plan was empty/pro).
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(fileName, "codex", registry.GetCodexFreeModels())
+	reg.MarkClientModelUnsupported(fileName, "gpt-5.6-sol")
+	if reg.ClientSupportsModel(fileName, "gpt-5.6-sol") {
+		t.Fatal("precondition: free catalog must not include gpt-5.6-sol")
+	}
+	if !reg.IsClientModelUnsupported(fileName, "gpt-5.6-sol") {
+		t.Fatal("precondition: learned unsupported flag must be set")
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	body := `{"name":"codex-bill@example.com-free.json","plan_type":"plus"}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID(fileName)
+	if !ok || updated == nil {
+		t.Fatal("auth missing after patch")
+	}
+	if got := updated.Attributes["plan_type"]; got != "plus" {
+		t.Fatalf("Attributes plan_type = %q, want plus", got)
+	}
+	if got, _ := updated.Metadata["plan_type"].(string); got != "plus" {
+		t.Fatalf("Metadata plan_type = %q, want plus", got)
+	}
+	if !reg.ClientSupportsModel(fileName, "gpt-5.6-sol") {
+		t.Fatal("after free→plus patch, client must support gpt-5.6-sol")
+	}
+	if reg.IsClientModelUnsupported(fileName, "gpt-5.6-sol") {
+		t.Fatal("re-registering plus catalog must clear learned sol exclusion")
+	}
+}
+
 func TestPatchAuthFileFields_ArbitraryFieldsPersistToFile(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
 
 	authDir := t.TempDir()
 	fileName := "generic.json"
@@ -274,98 +347,5 @@ func TestPatchAuthFileFields_ArbitraryFieldsPersistToFile(t *testing.T) {
 	}
 	if got := fgh["ijk"]; got != true {
 		t.Fatalf("fgh.ijk = %#v, want true", got)
-	}
-}
-
-func TestPatchAuthFileFields_WeightPersistsAndSyncsRuntime(t *testing.T) {
-	t.Setenv("MANAGEMENT_PASSWORD", "")
-
-	authDir := t.TempDir()
-	fileName := "weighted.json"
-	filePath := filepath.Join(authDir, fileName)
-	store := fileauth.NewFileTokenStore()
-	store.SetBaseDir(authDir)
-	manager := coreauth.NewManager(store, nil, nil)
-	record := &coreauth.Auth{
-		ID:         fileName,
-		FileName:   fileName,
-		Provider:   "codex",
-		Attributes: map[string]string{"path": filePath},
-		Metadata:   map[string]any{"type": "codex"},
-	}
-	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
-		t.Fatalf("Register() error = %v", errRegister)
-	}
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-
-	patch := func(weight string) *httptest.ResponseRecorder {
-		t.Helper()
-		rec := httptest.NewRecorder()
-		ctx, _ := gin.CreateTestContext(rec)
-		body := `{"name":"weighted.json","weight":` + weight + `}`
-		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
-		ctx.Request.Header.Set("Content-Type", "application/json")
-		h.PatchAuthFileFields(ctx)
-		return rec
-	}
-
-	if rec := patch("7"); rec.Code != http.StatusOK {
-		t.Fatalf("update status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	updated, ok := manager.GetByID(fileName)
-	if !ok || updated.Attributes[coreauth.AttributeWeight] != "7" {
-		t.Fatalf("runtime weight = %#v, want 7", updated)
-	}
-	raw, errRead := os.ReadFile(filePath)
-	if errRead != nil {
-		t.Fatalf("ReadFile() error = %v", errRead)
-	}
-	var persisted map[string]any
-	if errUnmarshal := json.Unmarshal(raw, &persisted); errUnmarshal != nil {
-		t.Fatalf("Unmarshal() error = %v", errUnmarshal)
-	}
-	if persisted["weight"] != float64(7) {
-		t.Fatalf("persisted weight = %#v, want 7", persisted["weight"])
-	}
-
-	if rec := patch("null"); rec.Code != http.StatusOK {
-		t.Fatalf("reset status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	updated, _ = manager.GetByID(fileName)
-	if _, exists := updated.Attributes[coreauth.AttributeWeight]; exists {
-		t.Fatal("runtime weight remains after reset")
-	}
-	raw, errRead = os.ReadFile(filePath)
-	if errRead != nil {
-		t.Fatalf("ReadFile() after reset error = %v", errRead)
-	}
-	persisted = nil
-	if errUnmarshal := json.Unmarshal(raw, &persisted); errUnmarshal != nil {
-		t.Fatalf("Unmarshal() after reset error = %v", errUnmarshal)
-	}
-	if _, exists := persisted["weight"]; exists {
-		t.Fatal("persisted weight remains after reset")
-	}
-}
-
-func TestPatchAuthFileFields_RejectsInvalidWeights(t *testing.T) {
-	store := &memoryAuthStore{}
-	manager := coreauth.NewManager(store, nil, nil)
-	record := &coreauth.Auth{ID: "auth.json", FileName: "auth.json", Provider: "codex", Metadata: map[string]any{"type": "codex"}}
-	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
-		t.Fatalf("Register() error = %v", errRegister)
-	}
-	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
-
-	for _, weight := range []string{"1.5", "1000001", "9223372036854775808", `"7"`} {
-		rec := httptest.NewRecorder()
-		ctx, _ := gin.CreateTestContext(rec)
-		body := `{"name":"auth.json","weight":` + weight + `}`
-		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
-		ctx.Request.Header.Set("Content-Type", "application/json")
-		h.PatchAuthFileFields(ctx)
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("weight %s status = %d, want 400; body=%s", weight, rec.Code, rec.Body.String())
-		}
 	}
 }

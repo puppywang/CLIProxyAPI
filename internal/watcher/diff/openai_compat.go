@@ -16,14 +16,14 @@ func DiffOpenAICompatibility(oldList, newList []config.OpenAICompatibility) []st
 	oldMap := make(map[string]config.OpenAICompatibility, len(oldList))
 	oldLabels := make(map[string]string, len(oldList))
 	for idx, entry := range oldList {
-		key, label := uniqueOpenAICompatKey(oldMap, entry, idx)
+		key, label := openAICompatKey(entry, idx)
 		oldMap[key] = entry
 		oldLabels[key] = label
 	}
 	newMap := make(map[string]config.OpenAICompatibility, len(newList))
 	newLabels := make(map[string]string, len(newList))
 	for idx, entry := range newList {
-		key, label := uniqueOpenAICompatKey(newMap, entry, idx)
+		key, label := openAICompatKey(entry, idx)
 		newMap[key] = entry
 		newLabels[key] = label
 	}
@@ -60,17 +60,6 @@ func DiffOpenAICompatibility(oldList, newList []config.OpenAICompatibility) []st
 	return changes
 }
 
-func uniqueOpenAICompatKey(existing map[string]config.OpenAICompatibility, entry config.OpenAICompatibility, index int) (string, string) {
-	key, label := openAICompatKey(entry, index)
-	baseKey := key
-	for duplicateIndex := 1; ; duplicateIndex++ {
-		if _, exists := existing[key]; !exists {
-			return key, label
-		}
-		key = fmt.Sprintf("duplicate:%s:%d", baseKey, duplicateIndex)
-	}
-}
-
 func describeOpenAICompatibilityUpdate(oldEntry, newEntry config.OpenAICompatibility) string {
 	oldKeyCount := countAPIKeys(oldEntry)
 	newKeyCount := countAPIKeys(newEntry)
@@ -79,9 +68,6 @@ func describeOpenAICompatibilityUpdate(oldEntry, newEntry config.OpenAICompatibi
 	details := make([]string, 0, 3)
 	if oldEntry.Disabled != newEntry.Disabled {
 		details = append(details, fmt.Sprintf("disabled %t -> %t", oldEntry.Disabled, newEntry.Disabled))
-	}
-	if oldEntry.SupportPromptCacheKey != newEntry.SupportPromptCacheKey {
-		details = append(details, fmt.Sprintf("support-prompt-cache-key %t -> %t", oldEntry.SupportPromptCacheKey, newEntry.SupportPromptCacheKey))
 	}
 	if oldKeyCount != newKeyCount {
 		details = append(details, fmt.Sprintf("api-keys %d -> %d", oldKeyCount, newKeyCount))
@@ -128,7 +114,7 @@ func openAICompatKey(entry config.OpenAICompatibility, index int) (string, strin
 	}
 	base := strings.TrimSpace(entry.BaseURL)
 	if base != "" {
-		return "base:" + base, formatURL(base)
+		return "base:" + base, base
 	}
 	for _, model := range entry.Models {
 		alias := strings.TrimSpace(model.Alias)
@@ -167,7 +153,7 @@ func openAICompatSignature(entry config.OpenAICompatibility) string {
 		if name == "" && alias == "" {
 			continue
 		}
-		models = append(models, strings.ToLower(name)+"|"+strings.ToLower(alias)+"|"+strings.TrimSpace(model.DisplayName)+"|"+fmt.Sprintf("image=%t", model.Image))
+		models = append(models, strings.ToLower(name)+"|"+strings.ToLower(alias)+"|"+fmt.Sprintf("image=%t", model.Image))
 	}
 	if len(models) > 0 {
 		sort.Strings(models)

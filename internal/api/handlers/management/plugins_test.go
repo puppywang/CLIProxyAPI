@@ -12,7 +12,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -21,71 +20,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func waitForAsyncReload(t *testing.T, reloads <-chan *config.Config) *config.Config {
-	t.Helper()
-	select {
-	case cfg := <-reloads:
-		return cfg
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for async config reload")
-		return nil
-	}
-}
-
-func waitForReloadDone(t *testing.T, done <-chan struct{}) {
-	t.Helper()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for config reload hook to finish")
-	}
-}
-
-func captureConfigReload(h *Handler) (<-chan *config.Config, <-chan struct{}) {
-	reloads := make(chan *config.Config, 1)
-	done := make(chan struct{})
-	h.SetConfigReloadHook(func(_ context.Context, cfg *config.Config) {
-		defer close(done)
-		reloads <- cfg
-	})
-	return reloads, done
-}
-
-func TestConfigReloadGenerationSkipsOlderSnapshot(t *testing.T) {
-	t.Parallel()
-
-	h := &Handler{
-		cfg: &config.Config{
-			Plugins: config.PluginsConfig{
-				Configs: map[string]config.PluginInstanceConfig{
-					"sample": pluginConfigFromYAML(t, "enabled: true\nmode: old\n"),
-				},
-			},
-		},
-	}
-	reloadedModes := make([]string, 0, 1)
-	h.SetConfigReloadHook(func(_ context.Context, cfg *config.Config) {
-		reloadedModes = append(reloadedModes, pluginRawScalarValue(t, cfg.Plugins.Configs["sample"], "mode"))
-	})
-
-	h.mu.Lock()
-	older := h.reloadSnapshotConfigLocked()
-	item := h.cfg.Plugins.Configs["sample"]
-	setPluginRawScalarValue(t, &item.Raw, "mode", "new")
-	h.cfg.Plugins.Configs["sample"] = item
-	newer := h.reloadSnapshotConfigLocked()
-	h.mu.Unlock()
-
-	h.reloadConfigAfterManagementSave(context.Background(), newer)
-	h.reloadConfigAfterManagementSave(context.Background(), older)
-
-	if len(reloadedModes) != 1 || reloadedModes[0] != "new" {
-		t.Fatalf("reloaded modes = %#v, want only new snapshot", reloadedModes)
-	}
-}
-
 func TestListPluginsIncludesScannedAndConfiguredPlugins(t *testing.T) {
 	t.Parallel()
+	gin.SetMode(gin.TestMode)
 
 	pluginsDir := writeManagementPluginFile(t, "scanned")
 	disabled := false
@@ -122,7 +59,6 @@ func TestListPluginsIncludesScannedAndConfiguredPlugins(t *testing.T) {
 			Enabled          bool   `json:"enabled"`
 			EffectiveEnabled bool   `json:"effective_enabled"`
 			SupportsOAuth    bool   `json:"supports_oauth"`
-			OAuthProvider    string `json:"oauth_provider"`
 			Logo             string `json:"logo"`
 			ConfigFields     []any  `json:"config_fields"`
 			Menus            []any  `json:"menus"`
@@ -155,16 +91,11 @@ func TestListPluginsIncludesScannedAndConfiguredPlugins(t *testing.T) {
 			EffectiveEnabled: item.EffectiveEnabled,
 			Path:             item.Path,
 		}
-		if item.Registered ||
-			item.SupportsOAuth ||
-			item.OAuthProvider != "" ||
-			item.Logo != "" ||
-			len(item.ConfigFields) != 0 ||
-			len(item.Menus) != 0 {
+		if item.Registered || item.SupportsOAuth || item.Logo != "" || len(item.ConfigFields) != 0 || len(item.Menus) != 0 {
 			t.Fatalf("unregistered plugin entry has runtime fields: %#v", item)
 		}
 	}
-	if got, ok := entries["scanned"]; !ok || got.Configured || got.Enabled || got.EffectiveEnabled || got.Path == "" {
+	if got, ok := entries["scanned"]; !ok || got.Configured || !got.Enabled || got.EffectiveEnabled || got.Path == "" {
 		t.Fatalf("scanned entry = %#v, exists=%v", got, ok)
 	}
 	if got, ok := entries["configured-only"]; !ok || !got.Configured || got.Enabled || got.EffectiveEnabled || got.Path != "" {
@@ -172,62 +103,9 @@ func TestListPluginsIncludesScannedAndConfiguredPlugins(t *testing.T) {
 	}
 }
 
-func TestListPluginsUsesConfiguredStoreVersionWhenFilesCoexist(t *testing.T) {
-	t.Parallel()
-
-	pluginsDir := t.TempDir()
-	archDir := filepath.Join(pluginsDir, runtime.GOOS, runtime.GOARCH)
-	if errMkdirAll := os.MkdirAll(archDir, 0o755); errMkdirAll != nil {
-		t.Fatalf("MkdirAll(%s) error = %v", archDir, errMkdirAll)
-	}
-	extension := managementPluginExtension(runtime.GOOS)
-	pinnedPath := filepath.Join(archDir, "sample-provider-v0.1.0"+extension)
-	newerPath := filepath.Join(archDir, "sample-provider-v0.2.0"+extension)
-	for _, path := range []string{pinnedPath, newerPath} {
-		if errWriteFile := os.WriteFile(path, []byte("x"), 0o644); errWriteFile != nil {
-			t.Fatalf("WriteFile(%s) error = %v", path, errWriteFile)
-		}
-	}
-	h := &Handler{
-		cfg: &config.Config{
-			Plugins: config.PluginsConfig{
-				Enabled: true,
-				Dir:     pluginsDir,
-				Configs: map[string]config.PluginInstanceConfig{
-					"sample-provider": pluginConfigFromYAML(t, "enabled: true\nstore:\n  version: 0.1.0\n"),
-				},
-			},
-		},
-		configFilePath: writeTestConfigFile(t),
-	}
-
-	rec := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/plugins", nil)
-
-	h.ListPlugins(c)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	var body pluginListResponse
-	if errDecode := json.Unmarshal(rec.Body.Bytes(), &body); errDecode != nil {
-		t.Fatalf("decode response: %v; body=%s", errDecode, rec.Body.String())
-	}
-	for _, entry := range body.Plugins {
-		if entry.ID != "sample-provider" {
-			continue
-		}
-		if entry.Path != pinnedPath || !entry.Configured || !entry.Enabled {
-			t.Fatalf("plugin entry = %#v, want pinned path %s", entry, pinnedPath)
-		}
-		return
-	}
-	t.Fatalf("sample-provider entry missing: %#v", body.Plugins)
-}
-
 func TestGetPluginConfigReturnsPreservedRawConfig(t *testing.T) {
 	t.Parallel()
+	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -284,6 +162,7 @@ options:
 
 func TestGetPluginConfigReturnsEmptyObjectForKnownUnconfiguredPlugin(t *testing.T) {
 	t.Parallel()
+	gin.SetMode(gin.TestMode)
 
 	pluginsDir := writeManagementPluginFile(t, "scanned")
 	h := &Handler{
@@ -316,6 +195,7 @@ func TestGetPluginConfigReturnsEmptyObjectForKnownUnconfiguredPlugin(t *testing.
 
 func TestGetPluginConfigReturnsNotFoundForUnknownPlugin(t *testing.T) {
 	t.Parallel()
+	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg:            &config.Config{},
@@ -336,6 +216,7 @@ func TestGetPluginConfigReturnsNotFoundForUnknownPlugin(t *testing.T) {
 
 func TestPatchPluginEnabledUpdatesOnlyPluginConfig(t *testing.T) {
 	t.Parallel()
+	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -348,7 +229,6 @@ func TestPatchPluginEnabledUpdatesOnlyPluginConfig(t *testing.T) {
 		},
 		configFilePath: writeTestConfigFile(t),
 	}
-	reloads, reloadDone := captureConfigReload(h)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -360,21 +240,6 @@ func TestPatchPluginEnabledUpdatesOnlyPluginConfig(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	cfgSnapshot := waitForAsyncReload(t, reloads)
-	waitForReloadDone(t, reloadDone)
-	if cfgSnapshot == h.cfg {
-		t.Fatalf("reload config = handler config %p, want independent snapshot", h.cfg)
-	}
-	if cfgSnapshot.Plugins.Enabled {
-		t.Fatal("snapshot global Plugins.Enabled changed to true")
-	}
-	snapshotItem := cfgSnapshot.Plugins.Configs["sample"]
-	if snapshotItem.Enabled == nil || !*snapshotItem.Enabled {
-		t.Fatalf("snapshot sample enabled = %#v, want true", snapshotItem.Enabled)
-	}
-	if raw := marshalPluginRaw(t, snapshotItem); !strings.Contains(raw, "mode: safe") {
-		t.Fatalf("snapshot raw config lost custom field:\n%s", raw)
 	}
 	if h.cfg.Plugins.Enabled {
 		t.Fatal("global Plugins.Enabled changed to true")
@@ -389,71 +254,9 @@ func TestPatchPluginEnabledUpdatesOnlyPluginConfig(t *testing.T) {
 	}
 }
 
-func TestPatchPluginEnabledReloadSnapshotRawImmutability(t *testing.T) {
-	t.Parallel()
-	h := &Handler{
-		cfg: &config.Config{
-			Plugins: config.PluginsConfig{
-				Configs: map[string]config.PluginInstanceConfig{
-					"sample": pluginConfigFromYAML(t, "enabled: false\nmode: first\n"),
-				},
-			},
-		},
-		configFilePath: writeTestConfigFile(t),
-	}
-	reloads := make(chan *config.Config, 1)
-	releaseReload := make(chan struct{})
-	reloadDone := make(chan struct{})
-	h.SetConfigReloadHook(func(_ context.Context, cfg *config.Config) {
-		defer close(reloadDone)
-		reloads <- cfg
-		<-releaseReload
-	})
-
-	rec := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(rec)
-	c.Params = gin.Params{{Key: "id", Value: "sample"}}
-	c.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/plugins/sample/enabled", strings.NewReader(`{"enabled":true}`))
-	c.Request.Header.Set("Content-Type", "application/json")
-
-	h.PatchPluginEnabled(c)
-
-	if rec.Code != http.StatusOK {
-		close(releaseReload)
-		waitForReloadDone(t, reloadDone)
-		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	cfgSnapshot := waitForAsyncReload(t, reloads)
-
-	h.mu.Lock()
-	item := h.cfg.Plugins.Configs["sample"]
-	setPluginRawScalarValue(t, &item.Raw, "mode", "second")
-	h.cfg.Plugins.Configs["sample"] = item
-	h.mu.Unlock()
-
-	if cfgSnapshot == h.cfg {
-		t.Fatalf("reload config = handler config %p, want independent snapshot", h.cfg)
-	}
-	snapshotItem := cfgSnapshot.Plugins.Configs["sample"]
-	if snapshotItem.Enabled == nil || !*snapshotItem.Enabled {
-		t.Fatalf("snapshot sample enabled = %#v, want true", snapshotItem.Enabled)
-	}
-	if got := pluginRawScalarValue(t, snapshotItem, "mode"); got != "first" {
-		t.Fatalf("snapshot raw mode = %q, want first", got)
-	}
-	h.mu.Lock()
-	handlerItem := h.cfg.Plugins.Configs["sample"]
-	h.mu.Unlock()
-	if got := pluginRawScalarValue(t, handlerItem, "mode"); got != "second" {
-		t.Fatalf("handler raw mode = %q, want second", got)
-	}
-
-	close(releaseReload)
-	waitForReloadDone(t, reloadDone)
-}
-
 func TestPutPluginConfigReplacesPluginConfig(t *testing.T) {
 	t.Parallel()
+	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -489,6 +292,7 @@ func TestPutPluginConfigReplacesPluginConfig(t *testing.T) {
 
 func TestPatchPluginConfigMergesAndDeletesFields(t *testing.T) {
 	t.Parallel()
+	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -522,84 +326,28 @@ func TestPatchPluginConfigMergesAndDeletesFields(t *testing.T) {
 	}
 }
 
-func TestDeletePluginRejectsUnresolvedPluginsDir(t *testing.T) {
-	workspace := t.TempDir()
-	t.Setenv("HOME", "")
-	t.Setenv("USERPROFILE", "")
-	t.Chdir(workspace)
-
-	literalPluginsDir := filepath.Join(workspace, "~", ".cli-proxy-api", "plugins")
-	targetDir := filepath.Join(literalPluginsDir, runtime.GOOS, runtime.GOARCH)
-	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
-		t.Fatalf("MkdirAll(%s) error = %v", targetDir, errMkdir)
-	}
-	target := filepath.Join(targetDir, "sample"+managementPluginExtension(runtime.GOOS))
-	if errWrite := os.WriteFile(target, []byte("library-data"), 0o644); errWrite != nil {
-		t.Fatalf("WriteFile(%s) error = %v", target, errWrite)
-	}
-	h := &Handler{
-		cfg: &config.Config{
-			Plugins: config.PluginsConfig{
-				Dir: "~/.cli-proxy-api/plugins",
-				Configs: map[string]config.PluginInstanceConfig{
-					"sample": pluginConfigFromYAML(t, "enabled: false\n"),
-				},
-			},
-		},
-		configFilePath: writeTestConfigFile(t),
-	}
-	rec := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(rec)
-	c.Params = gin.Params{{Key: "id", Value: "sample"}}
-	c.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/plugins/sample", nil)
-
-	h.DeletePlugin(c)
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusInternalServerError, rec.Body.String())
-	}
-	var body map[string]any
-	if errDecode := json.Unmarshal(rec.Body.Bytes(), &body); errDecode != nil {
-		t.Fatalf("Unmarshal() error = %v; body=%s", errDecode, rec.Body.String())
-	}
-	if body["error"] != "plugin_directory_invalid" {
-		t.Fatalf("error = %#v, want plugin_directory_invalid", body["error"])
-	}
-	if _, errStat := os.Stat(target); errStat != nil {
-		t.Fatalf("literal tilde target stat error = %v, want retained", errStat)
-	}
-	if _, configured := h.cfg.Plugins.Configs["sample"]; !configured {
-		t.Fatal("plugin config removed after directory resolution failure")
-	}
-}
-
 func TestDeletePluginRemovesDiscoveredFileAndConfig(t *testing.T) {
 	t.Parallel()
+	gin.SetMode(gin.TestMode)
 
 	pluginsDir := writeManagementPluginFile(t, "sample")
-	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	if errWrite := os.WriteFile(configPath, []byte("plugins:\n  configs:\n    sample:\n      enabled: true\n      mode: safe\n    keep:\n      enabled: true\n      mode: retained\n"), 0o600); errWrite != nil {
-		t.Fatalf("failed to write test config: %v", errWrite)
-	}
 	h := &Handler{
 		cfg: &config.Config{
 			Plugins: config.PluginsConfig{
 				Dir: pluginsDir,
 				Configs: map[string]config.PluginInstanceConfig{
 					"sample": pluginConfigFromYAML(t, "enabled: true\nmode: safe\n"),
-					"keep":   pluginConfigFromYAML(t, "enabled: true\nmode: retained\n"),
 				},
 			},
 		},
-		configFilePath: configPath,
+		configFilePath: writeTestConfigFile(t),
 	}
-	reloads := make(chan *config.Config, 1)
-	releaseReload := make(chan struct{})
-	reloadDone := make(chan struct{})
+	reloads := 0
 	h.SetConfigReloadHook(func(_ context.Context, cfg *config.Config) {
-		defer close(reloadDone)
-		reloads <- cfg
-		<-releaseReload
+		reloads++
+		if cfg != h.cfg {
+			t.Fatalf("reload config = %p, want handler config %p", cfg, h.cfg)
+		}
 	})
 
 	path, errPath := pluginFilePath(pluginsDir, "sample")
@@ -615,17 +363,7 @@ func TestDeletePluginRemovesDiscoveredFileAndConfig(t *testing.T) {
 	c.Params = gin.Params{{Key: "id", Value: "sample"}}
 	c.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/plugins/sample", nil)
 
-	done := make(chan struct{})
-	go func() {
-		h.DeletePlugin(c)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("DeletePlugin blocked waiting for config reload")
-	}
+	h.DeletePlugin(c)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
@@ -633,89 +371,17 @@ func TestDeletePluginRemovesDiscoveredFileAndConfig(t *testing.T) {
 	if _, ok := h.cfg.Plugins.Configs["sample"]; ok {
 		t.Fatal("plugin config still exists after delete")
 	}
-	if _, ok := h.cfg.Plugins.Configs["keep"]; !ok {
-		t.Fatal("retained plugin config was removed")
-	}
-	data, errReadConfig := os.ReadFile(configPath)
-	if errReadConfig != nil {
-		t.Fatalf("failed to read saved config: %v", errReadConfig)
-	}
-	text := string(data)
-	if strings.Contains(text, "sample:") || strings.Contains(text, "mode: safe") {
-		t.Fatalf("saved config still contains removed plugin:\n%s", text)
-	}
-	if !strings.Contains(text, "keep:") || !strings.Contains(text, "mode: retained") {
-		t.Fatalf("saved config lost retained plugin:\n%s", text)
-	}
 	if _, errStat := os.Stat(path); !os.IsNotExist(errStat) {
 		t.Fatalf("plugin file stat error = %v, want not exist", errStat)
 	}
-	cfgSnapshot := waitForAsyncReload(t, reloads)
-	if cfgSnapshot == h.cfg {
-		close(releaseReload)
-		waitForReloadDone(t, reloadDone)
-		t.Fatalf("reload config = handler config %p, want independent snapshot", h.cfg)
-	}
-	if _, ok := cfgSnapshot.Plugins.Configs["sample"]; ok {
-		close(releaseReload)
-		waitForReloadDone(t, reloadDone)
-		t.Fatal("snapshot plugin config still exists after delete")
-	}
-	close(releaseReload)
-	waitForReloadDone(t, reloadDone)
-}
-
-func TestDeletePluginUsesConfiguredStoreVersionWhenFilesCoexist(t *testing.T) {
-	t.Parallel()
-
-	pluginsDir := t.TempDir()
-	archDir := filepath.Join(pluginsDir, runtime.GOOS, runtime.GOARCH)
-	if errMkdirAll := os.MkdirAll(archDir, 0o755); errMkdirAll != nil {
-		t.Fatalf("MkdirAll(%s) error = %v", archDir, errMkdirAll)
-	}
-	extension := managementPluginExtension(runtime.GOOS)
-	pinnedPath := filepath.Join(archDir, "sample-provider-v0.1.0"+extension)
-	newerPath := filepath.Join(archDir, "sample-provider-v0.2.0"+extension)
-	for _, path := range []string{pinnedPath, newerPath} {
-		if errWriteFile := os.WriteFile(path, []byte("x"), 0o644); errWriteFile != nil {
-			t.Fatalf("WriteFile(%s) error = %v", path, errWriteFile)
-		}
-	}
-	h := &Handler{
-		cfg: &config.Config{
-			Plugins: config.PluginsConfig{
-				Dir: pluginsDir,
-				Configs: map[string]config.PluginInstanceConfig{
-					"sample-provider": pluginConfigFromYAML(t, "enabled: true\nstore:\n  version: 0.1.0\n"),
-				},
-			},
-		},
-		configFilePath: writeTestConfigFile(t),
-	}
-
-	rec := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(rec)
-	c.Params = gin.Params{{Key: "id", Value: "sample-provider"}}
-	c.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/plugins/sample-provider", nil)
-
-	h.DeletePlugin(c)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	if _, ok := h.cfg.Plugins.Configs["sample-provider"]; ok {
-		t.Fatal("plugin config still exists after delete")
-	}
-	if _, errStat := os.Stat(pinnedPath); !os.IsNotExist(errStat) {
-		t.Fatalf("pinned plugin stat error = %v, want not exist", errStat)
-	}
-	if _, errStat := os.Stat(newerPath); errStat != nil {
-		t.Fatalf("newer plugin stat error = %v, want still exists", errStat)
+	if reloads != 1 {
+		t.Fatalf("reloads = %d, want 1", reloads)
 	}
 }
 
 func TestDeletePluginReturnsNotFoundForUnknownPlugin(t *testing.T) {
 	t.Parallel()
+	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg:            &config.Config{},
@@ -827,26 +493,4 @@ func marshalPluginRaw(t *testing.T, item config.PluginInstanceConfig) string {
 		t.Fatalf("marshal plugin raw: %v", errMarshal)
 	}
 	return string(data)
-}
-
-func pluginRawScalarValue(t *testing.T, item config.PluginInstanceConfig, key string) string {
-	t.Helper()
-	for i := 0; i+1 < len(item.Raw.Content); i += 2 {
-		if item.Raw.Content[i] != nil && item.Raw.Content[i].Value == key && item.Raw.Content[i+1] != nil {
-			return item.Raw.Content[i+1].Value
-		}
-	}
-	t.Fatalf("plugin raw missing scalar key %q", key)
-	return ""
-}
-
-func setPluginRawScalarValue(t *testing.T, node *yaml.Node, key, value string) {
-	t.Helper()
-	for i := 0; i+1 < len(node.Content); i += 2 {
-		if node.Content[i] != nil && node.Content[i].Value == key && node.Content[i+1] != nil {
-			node.Content[i+1].Value = value
-			return
-		}
-	}
-	t.Fatalf("plugin raw missing scalar key %q", key)
 }

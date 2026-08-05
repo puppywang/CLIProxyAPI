@@ -3,7 +3,6 @@ package executor
 import "context"
 
 type downstreamWebsocketContextKey struct{}
-type requireUpstreamWebsocketContextKey struct{}
 
 // WithDownstreamWebsocket marks the current request as coming from a downstream websocket connection.
 func WithDownstreamWebsocket(ctx context.Context) context.Context {
@@ -19,24 +18,6 @@ func DownstreamWebsocket(ctx context.Context) bool {
 		return false
 	}
 	raw := ctx.Value(downstreamWebsocketContextKey{})
-	enabled, ok := raw.(bool)
-	return ok && enabled
-}
-
-// WithRequiredUpstreamWebsocket marks a request whose incremental context is valid only on the current upstream websocket.
-func WithRequiredUpstreamWebsocket(ctx context.Context) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, requireUpstreamWebsocketContextKey{}, true)
-}
-
-// RequiredUpstreamWebsocket reports whether falling back to an HTTP upstream would lose request context.
-func RequiredUpstreamWebsocket(ctx context.Context) bool {
-	if ctx == nil {
-		return false
-	}
-	raw := ctx.Value(requireUpstreamWebsocketContextKey{})
 	enabled, ok := raw.(bool)
 	return ok && enabled
 }

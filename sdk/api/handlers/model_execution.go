@@ -19,23 +19,6 @@ type modelExecutionOptions struct {
 	Query                   url.Values
 	InternalSource          bool
 	SkipInterceptorPluginID string
-	SkipRouterPluginID      string
-	ForcedProvider          string
-	AuthSelectionModel      string
-}
-
-// ProtocolExecutionRequest describes a route-level model execution request with explicit protocols.
-type ProtocolExecutionRequest struct {
-	EntryProtocol      string
-	ExitProtocol       string
-	ForcedProvider     string
-	AuthSelectionModel string
-	Model              string
-	Stream             bool
-	Body               []byte
-	Headers            http.Header
-	Query              url.Values
-	Alt                string
 }
 
 // ModelExecutionRequest describes an internal model execution request.
@@ -49,7 +32,6 @@ type ModelExecutionRequest struct {
 	Query                   url.Values
 	Alt                     string
 	SkipInterceptorPluginID string
-	SkipRouterPluginID      string
 }
 
 // ModelExecutionResponse describes a non-streaming internal model execution response.
@@ -92,8 +74,8 @@ func (e *ModelExecutionStreamError) Error() string {
 
 // ExecuteModel executes an internal non-streaming model request.
 // Host model callbacks are non-recursive for their caller: when
-// skip plugin IDs are set, that plugin's interceptors and router are skipped
-// for the nested model execution while other plugins may still run.
+// SkipInterceptorPluginID is set, that plugin's interceptors are skipped for the
+// nested model execution while other plugins may still run.
 func (h *BaseAPIHandler) ExecuteModel(ctx context.Context, req ModelExecutionRequest) (ModelExecutionResponse, *interfaces.ErrorMessage) {
 	if req.Stream {
 		return ModelExecutionResponse{}, modelExecutionModeError("ExecuteModel requires Stream=false")
@@ -103,7 +85,6 @@ func (h *BaseAPIHandler) ExecuteModel(ctx context.Context, req ModelExecutionReq
 		Query:                   req.Query,
 		InternalSource:          true,
 		SkipInterceptorPluginID: req.SkipInterceptorPluginID,
-		SkipRouterPluginID:      req.SkipRouterPluginID,
 	})
 	if errMsg != nil {
 		return ModelExecutionResponse{}, errMsg
@@ -117,8 +98,8 @@ func (h *BaseAPIHandler) ExecuteModel(ctx context.Context, req ModelExecutionReq
 
 // ExecuteModelStream executes an internal streaming model request.
 // Host model callbacks are non-recursive for their caller: when
-// skip plugin IDs are set, that plugin's interceptors and router are skipped
-// for the nested model execution while other plugins may still run.
+// SkipInterceptorPluginID is set, that plugin's interceptors are skipped for the
+// nested model execution while other plugins may still run.
 func (h *BaseAPIHandler) ExecuteModelStream(ctx context.Context, req ModelExecutionRequest) (ModelExecutionStream, *interfaces.ErrorMessage) {
 	if !req.Stream {
 		return ModelExecutionStream{}, modelExecutionModeError("ExecuteModelStream requires Stream=true")
@@ -128,50 +109,6 @@ func (h *BaseAPIHandler) ExecuteModelStream(ctx context.Context, req ModelExecut
 		Query:                   req.Query,
 		InternalSource:          true,
 		SkipInterceptorPluginID: req.SkipInterceptorPluginID,
-		SkipRouterPluginID:      req.SkipRouterPluginID,
-	})
-	chunks, errMsg := prepareModelExecutionStream(ctx, dataChan, errChan)
-	if errMsg != nil {
-		return ModelExecutionStream{}, errMsg
-	}
-	return ModelExecutionStream{
-		StatusCode: http.StatusOK,
-		Headers:    cloneHeader(headers),
-		Chunks:     chunks,
-	}, nil
-}
-
-// ExecuteProtocolWithAuthManager executes a route-level non-streaming request with explicit protocols.
-func (h *BaseAPIHandler) ExecuteProtocolWithAuthManager(ctx context.Context, req ProtocolExecutionRequest) (ModelExecutionResponse, *interfaces.ErrorMessage) {
-	if req.Stream {
-		return ModelExecutionResponse{}, modelExecutionModeError("ExecuteProtocolWithAuthManager requires Stream=false")
-	}
-	body, headers, errMsg := h.executeWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, false, modelExecutionOptions{
-		Headers:            req.Headers,
-		Query:              req.Query,
-		ForcedProvider:     req.ForcedProvider,
-		AuthSelectionModel: req.AuthSelectionModel,
-	})
-	if errMsg != nil {
-		return ModelExecutionResponse{}, errMsg
-	}
-	return ModelExecutionResponse{
-		StatusCode: http.StatusOK,
-		Headers:    cloneHeader(headers),
-		Body:       cloneBytes(body),
-	}, nil
-}
-
-// ExecuteProtocolStreamWithAuthManager executes a route-level streaming request with explicit protocols.
-func (h *BaseAPIHandler) ExecuteProtocolStreamWithAuthManager(ctx context.Context, req ProtocolExecutionRequest) (ModelExecutionStream, *interfaces.ErrorMessage) {
-	if !req.Stream {
-		return ModelExecutionStream{}, modelExecutionModeError("ExecuteProtocolStreamWithAuthManager requires Stream=true")
-	}
-	dataChan, headers, errChan := h.executeStreamWithAuthManagerFormats(ctx, req.EntryProtocol, req.ExitProtocol, req.Model, cloneBytes(req.Body), req.Alt, false, modelExecutionOptions{
-		Headers:            req.Headers,
-		Query:              req.Query,
-		ForcedProvider:     req.ForcedProvider,
-		AuthSelectionModel: req.AuthSelectionModel,
 	})
 	chunks, errMsg := prepareModelExecutionStream(ctx, dataChan, errChan)
 	if errMsg != nil {
@@ -200,17 +137,6 @@ func modelExecutionHeaders(ctx context.Context, headers http.Header) http.Header
 		return cloneHeader(headers)
 	}
 	return headersFromContext(ctx)
-}
-
-// modelExecutionQuery prefers an explicitly provided query and otherwise falls
-// back to the inbound query embedded in the request context. This lets model
-// routers observe query parameters for plain HTTP requests even when callers
-// do not populate execOptions.Query (mirrors modelExecutionHeaders).
-func modelExecutionQuery(ctx context.Context, query url.Values) url.Values {
-	if len(query) > 0 {
-		return cloneURLValues(query)
-	}
-	return queryFromContext(ctx)
 }
 
 func cloneURLValues(src url.Values) url.Values {

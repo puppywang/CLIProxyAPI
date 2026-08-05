@@ -6,7 +6,7 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
-func TestCodexWebsocketsExecutor_CloseAllReleasesSessions(t *testing.T) {
+func TestCodexWebsocketsExecutor_SessionStoreSurvivesExecutorReplacement(t *testing.T) {
 	sessionID := "test-session-store-survives-replace"
 
 	globalCodexWebsocketSessionStore.mu.Lock()
@@ -33,9 +33,16 @@ func TestCodexWebsocketsExecutor_CloseAllReleasesSessions(t *testing.T) {
 	globalCodexWebsocketSessionStore.mu.Lock()
 	_, stillPresent := globalCodexWebsocketSessionStore.sessions[sessionID]
 	globalCodexWebsocketSessionStore.mu.Unlock()
-	if stillPresent {
-		t.Fatalf("expected session to be removed after executor shutdown")
+	if !stillPresent {
+		t.Fatalf("expected session to remain after executor replacement close marker")
 	}
 
 	exec2.CloseExecutionSession(sessionID)
+
+	globalCodexWebsocketSessionStore.mu.Lock()
+	_, presentAfterClose := globalCodexWebsocketSessionStore.sessions[sessionID]
+	globalCodexWebsocketSessionStore.mu.Unlock()
+	if presentAfterClose {
+		t.Fatalf("expected session to be removed after explicit close")
+	}
 }

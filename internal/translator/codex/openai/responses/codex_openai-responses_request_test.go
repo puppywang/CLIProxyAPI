@@ -1,17 +1,10 @@
 package responses
 
 import (
-	"fmt"
-	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
-
-var benchmarkConvertSystemRoleOutput []byte
-var benchmarkConvertNormalizedOutput []byte
 
 // TestConvertSystemRoleToDeveloper_BasicConversion tests the basic system -> developer role conversion
 func TestConvertSystemRoleToDeveloper_BasicConversion(t *testing.T) {
@@ -226,69 +219,6 @@ func TestConvertOpenAIResponsesRequestToCodex_OriginalIssue(t *testing.T) {
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToCodexReusesNormalizedPayload(t *testing.T) {
-	inputJSON := []byte(`{"model":"gpt-5.6","stream":true,"store":false,"parallel_tool_calls":true,"include":["reasoning.encrypted_content"],"service_tier":"priority","input":[{"type":"message","role":"user","content":"hello"}]}`)
-
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.6", inputJSON, true)
-
-	if &output[0] != &inputJSON[0] {
-		t.Fatal("normalized request payload was copied")
-	}
-	if string(output) != string(inputJSON) {
-		t.Fatalf("normalized request changed:\n got: %s\nwant: %s", output, inputJSON)
-	}
-}
-
-func TestConvertOpenAIResponsesRequestToCodexNormalizesRequiredFields(t *testing.T) {
-	inputJSON := []byte(`{
-		"model":"gpt-5.6",
-		"stream":"true",
-		"store":true,
-		"parallel_tool_calls":false,
-		"include":["file_search_call.results","reasoning.encrypted_content"],
-		"max_output_tokens":4096,
-		"max_completion_tokens":4096,
-		"temperature":0.2,
-		"top_p":0.9,
-		"service_tier":"standard",
-		"truncation":"auto",
-		"user":"request-owner",
-		"input":[{"type":"message","role":"system","content":"hello"}]
-	}`)
-
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.6", inputJSON, true)
-
-	if stream := gjson.GetBytes(output, "stream"); stream.Type != gjson.True {
-		t.Fatalf("stream = %s, want true", stream.Raw)
-	}
-	if store := gjson.GetBytes(output, "store"); store.Type != gjson.False {
-		t.Fatalf("store = %s, want false", store.Raw)
-	}
-	if parallel := gjson.GetBytes(output, "parallel_tool_calls"); parallel.Type != gjson.True {
-		t.Fatalf("parallel_tool_calls = %s, want true", parallel.Raw)
-	}
-	include := gjson.GetBytes(output, "include").Array()
-	if len(include) != 1 || include[0].Type != gjson.String || include[0].String() != "reasoning.encrypted_content" {
-		t.Fatalf("include = %s, want reasoning.encrypted_content only", gjson.GetBytes(output, "include").Raw)
-	}
-	if role := gjson.GetBytes(output, "input.0.role").String(); role != "developer" {
-		t.Fatalf("input.0.role = %q, want developer", role)
-	}
-	for _, path := range []string{
-		"max_output_tokens",
-		"max_completion_tokens",
-		"temperature",
-		"top_p",
-		"service_tier",
-		"truncation",
-		"user",
-	} {
-		if gjson.GetBytes(output, path).Exists() {
-			t.Fatalf("%s should be removed: %s", path, output)
-		}
-	}
-}
-
 // TestConvertSystemRoleToDeveloper_AssistantRole tests that assistant role is preserved
 func TestConvertSystemRoleToDeveloper_AssistantRole(t *testing.T) {
 	inputJSON := []byte(`{
@@ -433,136 +363,4 @@ func TestTruncationRemovedForCodexCompatibility(t *testing.T) {
 	if gjson.Get(outputStr, "truncation").Exists() {
 		t.Fatalf("truncation should be removed for Codex compatibility")
 	}
-}
-
-func BenchmarkConvertSystemRoleToDeveloperLargeInput(b *testing.B) {
-	cases := []struct {
-		name      string
-		inputJSON []byte
-	}{
-		{
-			name:      "200_input_1_system",
-			inputJSON: makeLargeResponsesInputForBenchmark(200, 200),
-		},
-		{
-			name:      "200_input_2_system",
-			inputJSON: makeLargeResponsesInputForBenchmark(200, 100),
-		},
-		{
-			name:      "2000_input_20_system",
-			inputJSON: makeLargeResponsesInputForBenchmark(2000, 100),
-		},
-	}
-	benchmarks := []struct {
-		name string
-		fn   func([]byte) []byte
-	}{
-		{
-			name: "previous_root_path_rewrite",
-			fn:   convertSystemRoleToDeveloperPreviousRootPathRewriteForBenchmark,
-		},
-		{
-			name: "current_rebuilt_input_json_marshal",
-			fn:   convertSystemRoleToDeveloper,
-		},
-	}
-
-	for _, testCase := range cases {
-		for _, benchmark := range benchmarks {
-			b.Run(testCase.name+"/"+benchmark.name, func(b *testing.B) {
-				output := benchmark.fn(testCase.inputJSON)
-				if got := gjson.GetBytes(output, "input.0.role").String(); got != "developer" {
-					b.Fatalf("input.0.role = %q, want %q", got, "developer")
-				}
-				if got := gjson.GetBytes(output, "input.1.role").String(); got != "user" {
-					b.Fatalf("input.1.role = %q, want %q", got, "user")
-				}
-
-				b.ReportAllocs()
-				b.SetBytes(int64(len(testCase.inputJSON)))
-				b.ResetTimer()
-
-				var benchmarkOutput []byte
-				for i := 0; i < b.N; i++ {
-					benchmarkOutput = benchmark.fn(testCase.inputJSON)
-				}
-				benchmarkConvertSystemRoleOutput = benchmarkOutput
-			})
-		}
-	}
-}
-
-func BenchmarkConvertOpenAIResponsesRequestToCodexNormalizedPayload(b *testing.B) {
-	cases := []struct {
-		name      string
-		inputJSON []byte
-	}{
-		{name: "1KiB", inputJSON: makeNormalizedResponsesRequestForBenchmark(1 << 10)},
-		{name: "1MiB", inputJSON: makeNormalizedResponsesRequestForBenchmark(1 << 20)},
-		{name: "8MiB", inputJSON: makeNormalizedResponsesRequestForBenchmark(8 << 20)},
-	}
-
-	for _, testCase := range cases {
-		b.Run(testCase.name, func(b *testing.B) {
-			b.ReportAllocs()
-			b.SetBytes(int64(len(testCase.inputJSON)))
-			b.ResetTimer()
-
-			var output []byte
-			for b.Loop() {
-				output = ConvertOpenAIResponsesRequestToCodex("gpt-5.6", testCase.inputJSON, true)
-			}
-			benchmarkConvertNormalizedOutput = output
-		})
-	}
-}
-
-func makeNormalizedResponsesRequestForBenchmark(contentBytes int) []byte {
-	var builder strings.Builder
-	builder.Grow(contentBytes + 256)
-	builder.WriteString(`{"model":"gpt-5.6","stream":true,"store":false,"parallel_tool_calls":true,"include":["reasoning.encrypted_content"],"input":[{"type":"message","role":"user","content":"`)
-	builder.WriteString(strings.Repeat("x", contentBytes))
-	builder.WriteString(`"}]}`)
-	return []byte(builder.String())
-}
-
-func makeLargeResponsesInputForBenchmark(inputCount int, systemEvery int) []byte {
-	var builder strings.Builder
-	builder.Grow(inputCount * 96)
-	builder.WriteString(`{"model":"gpt-5.2","input":[`)
-	for i := 0; i < inputCount; i++ {
-		if i > 0 {
-			builder.WriteByte(',')
-		}
-		role := "user"
-		if i%systemEvery == 0 {
-			role = "system"
-		}
-		builder.WriteString(`{"type":"message","role":"`)
-		builder.WriteString(role)
-		builder.WriteString(`","content":[{"type":"input_text","text":"message `)
-		builder.WriteString(strconv.Itoa(i))
-		builder.WriteString(`"}]}`)
-	}
-	builder.WriteString(`]}`)
-	return []byte(builder.String())
-}
-
-func convertSystemRoleToDeveloperPreviousRootPathRewriteForBenchmark(rawJSON []byte) []byte {
-	inputResult := gjson.GetBytes(rawJSON, "input")
-	if !inputResult.IsArray() {
-		return rawJSON
-	}
-
-	inputArray := inputResult.Array()
-	result := rawJSON
-
-	for i := 0; i < len(inputArray); i++ {
-		rolePath := fmt.Sprintf("input.%d.role", i)
-		if gjson.GetBytes(result, rolePath).String() == "system" {
-			result, _ = sjson.SetBytes(result, rolePath, "developer")
-		}
-	}
-
-	return result
 }

@@ -76,10 +76,6 @@ func TestAPICallTransportAPIKeyAuthFallsBackToConfigProxyURL(t *testing.T) {
 				APIKey:   "codex-key",
 				ProxyURL: "http://codex-proxy.example.com:8080",
 			}},
-			XAIKey: []config.XAIKey{{
-				APIKey:   "xai-key",
-				ProxyURL: "http://xai-proxy.example.com:8080",
-			}},
 			OpenAICompatibility: []config.OpenAICompatibility{{
 				Name:    "bohe",
 				BaseURL: "https://bohe.example.com",
@@ -119,14 +115,6 @@ func TestAPICallTransportAPIKeyAuthFallsBackToConfigProxyURL(t *testing.T) {
 				Attributes: map[string]string{"api_key": "codex-key"},
 			},
 			wantProxy: "http://codex-proxy.example.com:8080",
-		},
-		{
-			name: "xai",
-			auth: &coreauth.Auth{
-				Provider:   "xai",
-				Attributes: map[string]string{"api_key": "xai-key"},
-			},
-			wantProxy: "http://xai-proxy.example.com:8080",
 		},
 		{
 			name: "openai-compatibility",

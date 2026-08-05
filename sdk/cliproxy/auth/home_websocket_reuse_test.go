@@ -4,17 +4,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-func TestPickNextViaHomeDoesNotReusePinnedWebsocketAuthWithoutSelection(t *testing.T) {
+func TestPickNextViaHomeReusesPinnedWebsocketAuthWithoutHomeDispatch(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
 	manager.RegisterExecutor(schedulerTestExecutor{})
@@ -46,15 +42,21 @@ func TestPickNextViaHomeDoesNotReusePinnedWebsocketAuthWithoutSelection(t *testi
 	}
 
 	got, executor, provider, errPick := manager.pickNextViaHome(ctx, "gpt-5.4", opts, nil)
-	if errPick == nil {
-		t.Fatal("pickNextViaHome() unexpectedly reused an auth without a Home selection")
+	if errPick != nil {
+		t.Fatalf("pickNextViaHome() error = %v", errPick)
 	}
-	if got != nil || executor != nil || provider != "" {
-		t.Fatalf("pickNextViaHome() returned unbound execution target: auth=%#v executor=%#v provider=%q", got, executor, provider)
+	if got == nil || got.ID != "home-auth-1" {
+		t.Fatalf("pickNextViaHome() auth = %#v, want home-auth-1", got)
+	}
+	if executor == nil {
+		t.Fatal("pickNextViaHome() executor is nil")
+	}
+	if provider != "test" {
+		t.Fatalf("pickNextViaHome() provider = %q, want test", provider)
 	}
 }
 
-func TestPickNextViaHomeRejectsSessionScopedAuthCache(t *testing.T) {
+func TestPickNextViaHomeKeepsSameAuthIDPayloadSessionScoped(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
 	manager.RegisterExecutor(schedulerTestExecutor{})
@@ -92,11 +94,20 @@ func TestPickNextViaHomeRejectsSessionScopedAuthCache(t *testing.T) {
 		},
 	}
 
-	if _, _, _, errSession1 := manager.pickNextViaHome(ctx, "gpt-5.4", optsSession1, nil); errSession1 == nil {
-		t.Fatal("pickNextViaHome(session-1) unexpectedly reused a session auth cache")
+	gotSession1, _, _, errSession1 := manager.pickNextViaHome(ctx, "gpt-5.4", optsSession1, nil)
+	if errSession1 != nil {
+		t.Fatalf("pickNextViaHome(session-1) error = %v", errSession1)
 	}
-	if _, _, _, errSession2 := manager.pickNextViaHome(ctx, "gpt-5.4", optsSession2, nil); errSession2 == nil {
-		t.Fatal("pickNextViaHome(session-2) unexpectedly reused a session auth cache")
+	if got := gotSession1.Attributes[homeUpstreamModelAttributeKey]; got != "upstream-model-a" {
+		t.Fatalf("pickNextViaHome(session-1) upstream model = %q, want upstream-model-a", got)
+	}
+
+	gotSession2, _, _, errSession2 := manager.pickNextViaHome(ctx, "gpt-5.4", optsSession2, nil)
+	if errSession2 != nil {
+		t.Fatalf("pickNextViaHome(session-2) error = %v", errSession2)
+	}
+	if got := gotSession2.Attributes[homeUpstreamModelAttributeKey]; got != "upstream-model-b" {
+		t.Fatalf("pickNextViaHome(session-2) upstream model = %q, want upstream-model-b", got)
 	}
 }
 
@@ -207,145 +218,6 @@ func TestPickNextViaHomeDoesNotReusePinnedNonWebsocketAuth(t *testing.T) {
 	}
 	if got != nil || executor != nil || provider != "" {
 		t.Fatalf("pickNextViaHome() reused non-websocket auth: auth=%#v executor=%#v provider=%q", got, executor, provider)
-	}
-}
-
-type homeAuthTransportErrorDispatcher struct {
-	err     error
-	aborts  atomic.Int32
-	onAbort func()
-}
-
-func (d *homeAuthTransportErrorDispatcher) HeartbeatOK() bool {
-	return true
-}
-
-func (d *homeAuthTransportErrorDispatcher) RPopAuth(context.Context, string, string, http.Header, int) ([]byte, error) {
-	return nil, d.err
-}
-
-func (d *homeAuthTransportErrorDispatcher) AbortAmbiguousDispatch() {
-	d.aborts.Add(1)
-	if d.onAbort != nil {
-		d.onAbort()
-	}
-}
-
-func TestPickNextViaHomeClassifiesTransportErrorsAsHomeUnavailable(t *testing.T) {
-	dispatcher := &homeAuthTransportErrorDispatcher{err: errors.New("read tcp 127.0.0.1:46704->127.0.0.1:8327: i/o timeout")}
-	oldCurrentHomeDispatcher := currentHomeDispatcher
-	currentHomeDispatcher = func() homeAuthDispatcher {
-		return dispatcher
-	}
-	t.Cleanup(func() {
-		currentHomeDispatcher = oldCurrentHomeDispatcher
-	})
-
-	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-	manager.SetHomeExecutionRegistry(executionregistry.New())
-
-	_, _, _, errPick := manager.pickNextViaHome(context.Background(), "gpt-5.4", cliproxyexecutor.Options{}, nil)
-	if errPick == nil {
-		t.Fatal("pickNextViaHome() error is nil, want home unavailable error")
-	}
-	var authErr *Error
-	if !errors.As(errPick, &authErr) {
-		t.Fatalf("pickNextViaHome() error = %T, want *Error", errPick)
-	}
-	if authErr.Code != "home_unavailable" {
-		t.Fatalf("pickNextViaHome() error code = %q, want home_unavailable (%v)", authErr.Code, errPick)
-	}
-	if authErr.StatusCode() != http.StatusServiceUnavailable {
-		t.Fatalf("pickNextViaHome() status = %d, want %d", authErr.StatusCode(), http.StatusServiceUnavailable)
-	}
-	if !authErr.Retryable {
-		t.Fatal("pickNextViaHome() retryable = false, want true")
-	}
-}
-
-func TestPickNextViaHomeAbortsBeforeEndingPendingDispatch(t *testing.T) {
-	registry := executionregistry.New()
-	abortSawPending := make(chan bool, 1)
-	dispatcher := &homeAuthTransportErrorDispatcher{
-		err: home.NewAmbiguousDispatchError(errors.New("response connection closed")),
-		onAbort: func() {
-			cancelledCtx, cancel := context.WithCancel(context.Background())
-			cancel()
-			abortSawPending <- errors.Is(registry.Drain(cancelledCtx), context.Canceled)
-		},
-	}
-	oldCurrentHomeDispatcher := currentHomeDispatcher
-	currentHomeDispatcher = func() homeAuthDispatcher {
-		return dispatcher
-	}
-	t.Cleanup(func() {
-		currentHomeDispatcher = oldCurrentHomeDispatcher
-	})
-
-	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-	manager.SetHomeExecutionRegistry(registry)
-
-	_, _, _, errPick := manager.pickNextViaHome(context.Background(), "gpt-5.4", cliproxyexecutor.Options{}, nil)
-	if errPick == nil {
-		t.Fatal("pickNextViaHome() error = nil, want home unavailable")
-	}
-	if sawPending := <-abortSawPending; !sawPending {
-		t.Fatal("AbortAmbiguousDispatch() observed an already-ended pending dispatch")
-	}
-}
-
-func TestPickNextViaHomeDoesNotAbortDeterministicDispatchFailure(t *testing.T) {
-	dispatcher := &homeAuthTransportErrorDispatcher{err: home.ErrNotConnected}
-	oldCurrentHomeDispatcher := currentHomeDispatcher
-	currentHomeDispatcher = func() homeAuthDispatcher {
-		return dispatcher
-	}
-	t.Cleanup(func() {
-		currentHomeDispatcher = oldCurrentHomeDispatcher
-	})
-
-	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-	manager.SetHomeExecutionRegistry(executionregistry.New())
-
-	_, _, _, errPick := manager.pickNextViaHome(context.Background(), "gpt-5.4", cliproxyexecutor.Options{}, nil)
-	if errPick == nil {
-		t.Fatal("pickNextViaHome() error = nil, want home unavailable")
-	}
-	if got := dispatcher.aborts.Load(); got != 0 {
-		t.Fatalf("AbortAmbiguousDispatch() calls = %d, want 0 for deterministic failure", got)
-	}
-}
-
-func TestPickNextViaHomeAbortsAmbiguousTransport(t *testing.T) {
-	dispatcher := &homeAuthTransportErrorDispatcher{err: home.NewAmbiguousDispatchError(errors.New("response connection closed"))}
-	oldCurrentHomeDispatcher := currentHomeDispatcher
-	currentHomeDispatcher = func() homeAuthDispatcher {
-		return dispatcher
-	}
-	t.Cleanup(func() {
-		currentHomeDispatcher = oldCurrentHomeDispatcher
-	})
-
-	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-	registry := executionregistry.New()
-	manager.SetHomeExecutionRegistry(registry)
-
-	_, _, _, errPick := manager.pickNextViaHome(context.Background(), "gpt-5.4", cliproxyexecutor.Options{}, nil)
-	if errPick == nil {
-		t.Fatal("pickNextViaHome() error = nil, want home unavailable")
-	}
-	if got := dispatcher.aborts.Load(); got != 1 {
-		t.Fatalf("AbortAmbiguousDispatch() calls = %d, want 1", got)
-	}
-
-	drainCtx, cancelDrain := context.WithTimeout(context.Background(), time.Second)
-	defer cancelDrain()
-	if errDrain := registry.Drain(drainCtx); errDrain != nil {
-		t.Fatalf("Drain() error = %v, ambiguous pending dispatch was not ended", errDrain)
 	}
 }
 

@@ -130,40 +130,6 @@ func TestAntigravityBuildRequest_UsesRouteModelWhenPayloadContainsDifferentModel
 	}
 }
 
-func TestAntigravityBuildRequestUsesDerivedSessionIDAndPreservesExplicit(t *testing.T) {
-	t.Parallel()
-
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
-	payload := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}}`)
-	req, err := executor.buildRequest(context.Background(), auth, "token", "gemini-3.1-pro", payload, false, "", "https://example.com", "-123456789")
-	if err != nil {
-		t.Fatalf("buildRequest error: %v", err)
-	}
-	body := requestBody(t, req)
-	request, ok := body["request"].(map[string]any)
-	if !ok {
-		t.Fatalf("request missing or invalid: %v", body["request"])
-	}
-	if got := request["sessionId"]; got != "-123456789" {
-		t.Fatalf("request.sessionId = %v, want -123456789", got)
-	}
-
-	explicitPayload := []byte(`{"request":{"sessionId":"-987654321","contents":[{"role":"user","parts":[{"text":"hello"}]}]}}`)
-	explicitReq, errExplicit := executor.buildRequest(context.Background(), auth, "token", "gemini-3.1-pro", explicitPayload, false, "", "https://example.com", "-123456789")
-	if errExplicit != nil {
-		t.Fatalf("buildRequest explicit error: %v", errExplicit)
-	}
-	explicitBody := requestBody(t, explicitReq)
-	explicitRequest, ok := explicitBody["request"].(map[string]any)
-	if !ok {
-		t.Fatalf("explicit request missing or invalid: %v", explicitBody["request"])
-	}
-	if got := explicitRequest["sessionId"]; got != "-987654321" {
-		t.Fatalf("explicit request.sessionId = %v, want -987654321", got)
-	}
-}
-
 func TestAntigravityBuildRequest_PreservesIndependentWebSearchRequestType(t *testing.T) {
 	body := buildRequestBodyFromRawPayload(t, "gemini-3.1-flash-lite", []byte(`{
 		"requestType": "web_search",
@@ -334,20 +300,17 @@ func buildRequestBodyFromPayload(t *testing.T, modelName string) map[string]any 
 							"parametersJsonSchema": {
 								"$schema": "http://json-schema.org/draft-07/schema#",
 								"$id": "root-schema",
-								"$comment": "root comment should be removed",
 								"type": "object",
 								"properties": {
 									"$id": {"type": "string"},
 									"arg": {
 										"type": "object",
-										"$comment": "nested comment should be removed",
 										"prefill": "hello",
 										"properties": {
 											"mode": {
 												"type": "string",
 												"deprecated": true,
 												"enum": ["a", "b"],
-												"enumDescriptions": ["Alpha", "Beta"],
 												"enumTitles": ["A", "B"]
 											}
 										}
@@ -426,9 +389,6 @@ func assertSchemaSanitizedAndPropertyPreserved(t *testing.T, params map[string]a
 	if _, ok := params["$id"]; ok {
 		t.Fatalf("root $id should be removed from schema")
 	}
-	if _, ok := params["$comment"]; ok {
-		t.Fatalf("root $comment should be removed from schema")
-	}
 	if _, ok := params["patternProperties"]; ok {
 		t.Fatalf("patternProperties should be removed from schema")
 	}
@@ -448,9 +408,6 @@ func assertSchemaSanitizedAndPropertyPreserved(t *testing.T, params map[string]a
 	if _, ok := arg["prefill"]; ok {
 		t.Fatalf("prefill should be removed from nested schema")
 	}
-	if _, ok := arg["$comment"]; ok {
-		t.Fatalf("nested $comment should be removed from schema")
-	}
 
 	argProps, ok := arg["properties"].(map[string]any)
 	if !ok {
@@ -462,9 +419,6 @@ func assertSchemaSanitizedAndPropertyPreserved(t *testing.T, params map[string]a
 	}
 	if _, ok := mode["enumTitles"]; ok {
 		t.Fatalf("enumTitles should be removed from nested schema")
-	}
-	if _, ok := mode["enumDescriptions"]; ok {
-		t.Fatalf("enumDescriptions should be removed from nested schema")
 	}
 	if _, ok := mode["deprecated"]; ok {
 		t.Fatalf("deprecated should be removed from nested schema")

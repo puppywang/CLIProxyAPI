@@ -11,6 +11,7 @@ import (
 )
 
 func TestGetUsageQueuePopsRequestedRecords(t *testing.T) {
+	gin.SetMode(gin.TestMode)
 	withManagementUsageQueue(t, func() {
 		redisqueue.Enqueue([]byte(`{"id":1}`))
 		redisqueue.Enqueue([]byte(`{"id":2}`))
@@ -45,6 +46,7 @@ func TestGetUsageQueuePopsRequestedRecords(t *testing.T) {
 }
 
 func TestGetUsageQueueInvalidCountDoesNotPop(t *testing.T) {
+	gin.SetMode(gin.TestMode)
 	withManagementUsageQueue(t, func() {
 		redisqueue.Enqueue([]byte(`{"id":1}`))
 

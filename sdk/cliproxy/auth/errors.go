@@ -1,7 +1,5 @@
 package auth
 
-const requestScopedErrorCode = "request_scoped"
-
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {
 	// Code is a short machine readable identifier.
@@ -12,6 +10,12 @@ type Error struct {
 	Retryable bool `json:"retryable"`
 	// HTTPStatus optionally records an HTTP-like status code for the error.
 	HTTPStatus int `json:"http_status,omitempty"`
+	// BoundAuthID, when set, identifies the auth that was session-bound
+	// at the moment the failure was raised. The selector populates this on
+	// strict-refuse so the request handler can surface "which credential
+	// was responsible" to the operator UI even though no auth was ever
+	// actually picked for this request.
+	BoundAuthID string `json:"bound_auth_id,omitempty"`
 }
 
 // Error implements the error interface.
@@ -31,10 +35,4 @@ func (e *Error) StatusCode() int {
 		return 0
 	}
 	return e.HTTPStatus
-}
-
-// IsRequestScoped reports whether the failure is tied to the current request
-// rather than the selected credential.
-func (e *Error) IsRequestScoped() bool {
-	return e != nil && e.Code == requestScopedErrorCode
 }

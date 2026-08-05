@@ -156,7 +156,6 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 					functionCall, _ = sjson.SetRawBytes(functionCall, "functionCall.args", []byte(argsStr))
 				}
 			}
-			functionCall = setGeminiFunctionCallID(functionCall, itemResult)
 
 			template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", functionCall)
 			template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
@@ -210,14 +209,11 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 			return [][]byte{template}
 		}
 		return [][]byte{}
-	} else if typeStr == "response.completed" || typeStr == "response.incomplete" { // Handle response completion with usage metadata
+	} else if typeStr == "response.completed" { // Handle response completion with usage metadata
 		template, _ = sjson.SetBytes(template, "usageMetadata.promptTokenCount", rootResult.Get("response.usage.input_tokens").Int())
 		template, _ = sjson.SetBytes(template, "usageMetadata.candidatesTokenCount", rootResult.Get("response.usage.output_tokens").Int())
 		totalTokens := rootResult.Get("response.usage.input_tokens").Int() + rootResult.Get("response.usage.output_tokens").Int()
 		template, _ = sjson.SetBytes(template, "usageMetadata.totalTokenCount", totalTokens)
-		if typeStr == "response.incomplete" {
-			template, _ = sjson.SetBytes(template, "candidates.0.finishReason", codexGeminiIncompleteFinishReason(rootResult.Get("response.incomplete_details.reason").String()))
-		}
 	} else {
 		return [][]byte{}
 	}
@@ -246,9 +242,8 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
 	rootResult := gjson.ParseBytes(rawJSON)
 
-	// Verify this is a terminal response event.
-	responseType := rootResult.Get("type").String()
-	if responseType != "response.completed" && responseType != "response.incomplete" {
+	// Verify this is a response.completed event
+	if rootResult.Get("type").String() != "response.completed" {
 		return []byte{}
 	}
 
@@ -261,9 +256,6 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 	// Set response metadata from the completed response
 	responseData := rootResult.Get("response")
 	if responseData.Exists() {
-		if responseType == "response.incomplete" {
-			template, _ = sjson.SetBytes(template, "candidates.0.finishReason", codexGeminiIncompleteFinishReason(responseData.Get("incomplete_details.reason").String()))
-		}
 		// Set response ID
 		if responseId := responseData.Get("id"); responseId.Exists() {
 			template, _ = sjson.SetBytes(template, "responseId", responseId.String())
@@ -286,6 +278,7 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 		}
 
 		// Process output content to build parts array
+		hasToolCall := false
 		var pendingFunctionCalls [][]byte
 
 		flushPendingFunctionCalls := func() {
@@ -350,6 +343,7 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 
 				case "function_call":
 					// Collect function call for potential merging with consecutive ones
+					hasToolCall = true
 					functionCall := []byte(`{"functionCall":{"args":{},"name":""}}`)
 					{
 						n := value.Get("name").String()
@@ -367,7 +361,6 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 							functionCall, _ = sjson.SetRawBytes(functionCall, "functionCall.args", []byte(argsStr))
 						}
 					}
-					functionCall = setGeminiFunctionCallID(functionCall, value)
 
 					pendingFunctionCalls = append(pendingFunctionCalls, functionCall)
 				}
@@ -376,6 +369,13 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 
 			// Handle any remaining pending function calls at the end
 			flushPendingFunctionCalls()
+		}
+
+		// Set finish reason based on whether there were tool calls
+		if hasToolCall {
+			template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
+		} else {
+			template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
 		}
 	}
 	return template
@@ -408,28 +408,6 @@ func buildReverseMapFromGeminiOriginal(original []byte) map[string]string {
 		}
 	}
 	return rev
-}
-
-func setGeminiFunctionCallID(functionCall []byte, item gjson.Result) []byte {
-	if callID := strings.TrimSpace(item.Get("call_id").String()); callID != "" {
-		functionCall, _ = sjson.SetBytes(functionCall, "functionCall.id", callID)
-		return functionCall
-	}
-	if id := strings.TrimSpace(item.Get("id").String()); id != "" {
-		functionCall, _ = sjson.SetBytes(functionCall, "functionCall.id", id)
-	}
-	return functionCall
-}
-
-func codexGeminiIncompleteFinishReason(reason string) string {
-	switch reason {
-	case "max_tokens", "max_output_tokens":
-		return "MAX_TOKENS"
-	case "content_filter":
-		return "SAFETY"
-	default:
-		return "OTHER"
-	}
 }
 
 func GeminiTokenCount(ctx context.Context, count int64) []byte {

@@ -2,7 +2,6 @@ package helps
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -10,9 +9,7 @@ import (
 	"time"
 
 	tls "github.com/refraction-networking/utls"
-	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/httpwire"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -20,14 +17,34 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// utlsRoundTripper implements http.RoundTripper using a Chrome fingerprint for
-// providers that require a browser-like TLS and HTTP/2 transport.
+// utlsRoundTripper implements http.RoundTripper using utls with Chrome fingerprint
+// to bypass Cloudflare's TLS fingerprinting on Anthropic domains.
 type utlsRoundTripper struct {
 	mu          sync.Mutex
 	connections map[string]*http2.ClientConn
 	pending     map[string]*sync.Cond
 	dialer      proxy.Dialer
 }
+
+// HTTP/2 keepalive for the utls transport. Without these, a silently-dead
+// upstream connection (packets stop but no RST — common when a shared egress
+// IP is throttled/tarpitted, which is exactly the "many accounts, one direct
+// IP" case) is never detected: the SSE stream blocks with no bytes until the
+// OS TCP timeout (10+ minutes). ReadIdleTimeout makes the client send a PING
+// once a connection has received no frames for that long; if no PONG arrives
+// within PingTimeout the connection is torn down and the in-flight stream
+// errors, so the caller can retry / fail over instead of hanging.
+//
+// This is a liveness probe, NOT a request deadline: a legitimately slow
+// (reasoning) stream keeps its connection alive via the PING/PONG round-trip
+// and is never reaped, so a healthy request's duration is not capped. That
+// keeps it consistent with the AGENTS.md "no timeouts after the connection is
+// established" rule, which already carves out liveness deadlines for the
+// websocket path. Package vars so they can be tuned/tested.
+var (
+	utlsReadIdleTimeout = 30 * time.Second
+	utlsPingTimeout     = 15 * time.Second
+)
 
 func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
 	var dialer proxy.Dialer = proxy.Direct
@@ -96,7 +113,10 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		return nil, err
 	}
 
-	tr := &http2.Transport{}
+	tr := &http2.Transport{
+		ReadIdleTimeout: utlsReadIdleTimeout,
+		PingTimeout:     utlsPingTimeout,
+	}
 	h2Conn, err := tr.NewClientConn(tlsConn)
 	if err != nil {
 		tlsConn.Close()
@@ -132,234 +152,32 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
-// claudeCodeSessionCacheCapacity bounds the per-transport TLS session cache for
-// the Anthropic inference plane.
-const claudeCodeSessionCacheCapacity = 32
-
-// newClaudeCodeTLSConfig builds the uTLS config for one inference-plane dial.
-//
-// OmitEmptyPsk keeps the pre_shared_key extension silent until a session is
-// cached, so an unresumed ClientHello stays byte-identical to the captured
-// native handshake. PreferSkipResumptionOnNilExtension turns uTLS's HelloCustom
-// "resume without the matching extension" panic into a skipped resumption.
-func newClaudeCodeTLSConfig(host string, sessionCache tls.ClientSessionCache) *tls.Config {
-	return &tls.Config{
-		ServerName:                         host,
-		ClientSessionCache:                 sessionCache,
-		OmitEmptyPsk:                       true,
-		PreferSkipResumptionOnNilExtension: true,
-	}
+// utlsProtectedHosts contains the hosts that should use utls Chrome TLS fingerprint
+// to bypass Cloudflare's TLS fingerprinting.
+var utlsProtectedHosts = map[string]struct{}{
+	"api.anthropic.com": {},
+	"chatgpt.com":       {},
 }
 
-// claudeCodeTLSClientHelloSpec reproduces the deterministic Node/OpenSSL
-// ClientHello emitted by Claude Code 2.1.220 on macOS arm64. Keep this spec in
-// sync with a fresh native capture whenever the advertised Claude Code version
-// changes.
-func claudeCodeTLSClientHelloSpec() *tls.ClientHelloSpec {
-	return &tls.ClientHelloSpec{
-		CipherSuites: []uint16{
-			tls.TLS_AES_128_GCM_SHA256,
-			tls.TLS_AES_256_GCM_SHA384,
-			tls.TLS_CHACHA20_POLY1305_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-			tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_RSA_WITH_AES_128_CBC_SHA,
-			tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-		},
-		CompressionMethods: []uint8{0},
-		Extensions: []tls.TLSExtension{
-			&tls.SNIExtension{},
-			&tls.ExtendedMasterSecretExtension{},
-			&tls.RenegotiationInfoExtension{Renegotiation: tls.RenegotiateOnceAsClient},
-			&tls.SupportedCurvesExtension{Curves: []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384}},
-			&tls.SupportedPointsExtension{SupportedPoints: []byte{0}},
-			&tls.SessionTicketExtension{},
-			&tls.ALPNExtension{AlpnProtocols: []string{"http/1.1"}},
-			&tls.StatusRequestExtension{},
-			&tls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []tls.SignatureScheme{
-				tls.ECDSAWithP256AndSHA256,
-				tls.PSSWithSHA256,
-				tls.PKCS1WithSHA256,
-				tls.ECDSAWithP384AndSHA384,
-				tls.PSSWithSHA384,
-				tls.PKCS1WithSHA384,
-				tls.PSSWithSHA512,
-				tls.PKCS1WithSHA512,
-				tls.PKCS1WithSHA1,
-			}},
-			&tls.SCTExtension{},
-			&tls.KeyShareExtension{KeyShares: []tls.KeyShare{{Group: tls.X25519}}},
-			&tls.PSKKeyExchangeModesExtension{Modes: []uint8{tls.PskModeDHE}},
-			&tls.SupportedVersionsExtension{Versions: []uint16{tls.VersionTLS13, tls.VersionTLS12}},
-			&tls.UtlsPaddingExtension{GetPaddingLen: tls.BoringPaddingStyle},
-			// pre_shared_key MUST be the final extension (RFC 8446 4.2.11), after
-			// padding. It contributes zero bytes until a cached session exists.
-			&tls.UtlsPreSharedKeyExtension{},
-		},
-	}
-}
-
-const claudeCodeRoundTripperCacheCapacity = 64
-
-var claudeCodeRoundTripperCache = internalcache.NewBoundedLRU[string, http.RoundTripper](
-	claudeCodeRoundTripperCacheCapacity,
-	func(_ string, roundTripper http.RoundTripper) {
-		if transport, ok := roundTripper.(interface{ CloseIdleConnections() }); ok {
-			transport.CloseIdleConnections()
-		}
-	},
-)
-
-var claudeCodeMessagesHeaderOrder = []string{
-	"Accept",
-	"Authorization",
-	"Content-Type",
-	"User-Agent",
-	"X-Claude-Code-Session-Id",
-	"X-Stainless-Arch",
-	"X-Stainless-Lang",
-	"X-Stainless-OS",
-	"X-Stainless-Package-Version",
-	"X-Stainless-Retry-Count",
-	"X-Stainless-Runtime",
-	"X-Stainless-Runtime-Version",
-	"X-Stainless-Timeout",
-	"anthropic-beta",
-	"anthropic-dangerous-direct-browser-access",
-	"anthropic-version",
-	"x-app",
-	"x-client-request-id",
-	"Connection",
-	"Host",
-	"Accept-Encoding",
-	"Content-Length",
-}
-
-var claudeCodeCountTokensHeaderOrder = []string{
-	"Accept",
-	"Authorization",
-	"Content-Type",
-	"User-Agent",
-	"X-Claude-Code-Session-Id",
-	"X-Stainless-Arch",
-	"X-Stainless-Lang",
-	"X-Stainless-OS",
-	"X-Stainless-Package-Version",
-	"X-Stainless-Retry-Count",
-	"X-Stainless-Runtime",
-	"X-Stainless-Runtime-Version",
-	"anthropic-beta",
-	"anthropic-dangerous-direct-browser-access",
-	"anthropic-version",
-	"x-app",
-	"x-client-request-id",
-	"Connection",
-	"Host",
-	"Accept-Encoding",
-	"Content-Length",
-}
-
-func claudeCodeRequestHeaderOrder(_, requestTarget string) []string {
-	if strings.HasPrefix(requestTarget, "/v1/messages/count_tokens") {
-		return claudeCodeCountTokensHeaderOrder
-	}
-	return claudeCodeMessagesHeaderOrder
-}
-
-func cachedClaudeCodeRoundTripper(proxyURL string) http.RoundTripper {
-	return claudeCodeRoundTripperCache.GetOrAdd(proxyURL, func() http.RoundTripper {
-		return newClaudeCodeRoundTripper(proxyURL)
-	})
-}
-
-func newClaudeCodeRoundTripper(proxyURL string) http.RoundTripper {
-	// The cache is scoped to this round tripper, which is already keyed by proxy,
-	// so resumption never crosses proxy boundaries.
-	sessionCache := tls.NewLRUClientSessionCache(claudeCodeSessionCacheCapacity)
-	var dialer proxy.Dialer = proxy.Direct
-	if proxyURL != "" {
-		proxyDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
-		if errBuild != nil {
-			log.Errorf("claude tls: failed to configure proxy dialer for %q: %v", proxyutil.Redact(proxyURL), errBuild)
-		} else if mode != proxyutil.ModeInherit && proxyDialer != nil {
-			dialer = proxyDialer
-		}
-	}
-
-	transport := &http.Transport{
-		ForceAttemptHTTP2: false,
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			var (
-				conn net.Conn
-				err  error
-			)
-			if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
-				conn, err = contextDialer.DialContext(ctx, network, addr)
-			} else {
-				conn, err = dialer.Dial(network, addr)
-			}
-			if err != nil {
-				return nil, fmt.Errorf("claude tls: dial upstream: %w", err)
-			}
-
-			host, _, errSplit := net.SplitHostPort(addr)
-			if errSplit != nil {
-				if errClose := conn.Close(); errClose != nil {
-					log.Debugf("claude tls: close failed connection: %v", errClose)
-				}
-				return nil, fmt.Errorf("claude tls: split upstream address: %w", errSplit)
-			}
-			tlsConn := tls.UClient(conn, newClaudeCodeTLSConfig(host, sessionCache), tls.HelloCustom)
-			if errPreset := tlsConn.ApplyPreset(claudeCodeTLSClientHelloSpec()); errPreset != nil {
-				if errClose := tlsConn.Close(); errClose != nil {
-					log.Debugf("claude tls: close connection after preset failure: %v", errClose)
-				}
-				return nil, fmt.Errorf("claude tls: apply Claude Code ClientHello: %w", errPreset)
-			}
-			if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
-				if errClose := tlsConn.Close(); errClose != nil {
-					log.Debugf("claude tls: close connection after handshake failure: %v", errClose)
-				}
-				return nil, fmt.Errorf("claude tls: handshake upstream: %w", errHandshake)
-			}
-			return httpwire.NewOrderedRequestConn(tlsConn, claudeCodeRequestHeaderOrder), nil
-		},
-	}
-	return transport
-}
-
-// fallbackRoundTripper uses provider-specific TLS fingerprints for protected
-// HTTPS hosts and falls back to the standard transport for all other requests.
+// fallbackRoundTripper uses utls for protected HTTPS hosts and falls back to
+// standard transport for all other requests.
 type fallbackRoundTripper struct {
-	anthropic http.RoundTripper
-	chrome    http.RoundTripper
-	fallback  http.RoundTripper
+	utls     http.RoundTripper
+	fallback http.RoundTripper
 }
 
 func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if IsAnthropicUpstreamURL(req.URL) {
-		return f.anthropic.RoundTrip(req)
-	}
-	if req.URL.Scheme == "https" && strings.EqualFold(req.URL.Hostname(), "chatgpt.com") {
-		return f.chrome.RoundTrip(req)
+	if req.URL.Scheme == "https" {
+		if _, ok := utlsProtectedHosts[strings.ToLower(req.URL.Hostname())]; ok {
+			return f.utls.RoundTrip(req)
+		}
 	}
 	return f.fallback.RoundTrip(req)
 }
 
-// NewUtlsHTTPClient creates an HTTP client using provider-specific TLS
-// fingerprints for protected hosts. It uses Claude Code's Node/OpenSSL profile
-// for Anthropic and a Chrome profile for ChatGPT, with a standard-transport
-// fallback for other hosts.
+// NewUtlsHTTPClient creates an HTTP client using utls Chrome TLS fingerprint.
+// Use this for provider requests that need a Chrome-like TLS fingerprint.
+// Falls back to standard transport for non-HTTPS requests.
 func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
 	var proxyURL string
 	if auth != nil {
@@ -374,24 +192,21 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 		ctxRoundTripper, _ = ctx.Value("cliproxy.roundtripper").(http.RoundTripper)
 	}
 
-	var chromeRT http.RoundTripper = newUtlsRoundTripper(proxyURL)
-	var anthropicRT http.RoundTripper = cachedClaudeCodeRoundTripper(proxyURL)
+	var utlsRT http.RoundTripper = newUtlsRoundTripper(proxyURL)
 	var standardTransport http.RoundTripper = http.DefaultTransport
 	if proxyURL != "" {
 		if transport := buildProxyTransport(proxyURL); transport != nil {
 			standardTransport = transport
 		}
 	} else if ctxRoundTripper != nil {
-		chromeRT = ctxRoundTripper
-		anthropicRT = ctxRoundTripper
+		utlsRT = ctxRoundTripper
 		standardTransport = ctxRoundTripper
 	}
 
 	client := &http.Client{
 		Transport: &fallbackRoundTripper{
-			anthropic: anthropicRT,
-			chrome:    chromeRT,
-			fallback:  standardTransport,
+			utls:     utlsRT,
+			fallback: standardTransport,
 		},
 	}
 	if timeout > 0 {

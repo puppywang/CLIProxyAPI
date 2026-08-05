@@ -3,14 +3,12 @@ package executor
 import (
 	"context"
 	"io"
-	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -67,32 +65,6 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	gotKey2 := gjson.GetBytes(body2, "prompt_cache_key").String()
 	if gotKey2 != expectedKey {
 		t.Fatalf("prompt_cache_key (second call) = %q, want %q", gotKey2, expectedKey)
-	}
-}
-
-func TestCodexExecutorCacheHelper_UsesDerivedSessionUUID(t *testing.T) {
-	t.Parallel()
-
-	executor := &CodexExecutor{}
-	req := cliproxyexecutor.Request{
-		Model:    "gpt-5.4",
-		Payload:  []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}`),
-		Metadata: map[string]any{cliproxyexecutor.DerivedSessionIDMetadataKey: "ctx:v1:derived-root"},
-	}
-	expectedKey := helps.DerivedSessionUUID("codex", req.Metadata)
-
-	httpReq, body, _, err := executor.cacheHelper(context.Background(), sdktranslator.FormatOpenAI, "https://example.com/responses", nil, req, req.Payload, []byte(`{"model":"gpt-5.4","stream":true}`))
-	if err != nil {
-		t.Fatalf("cacheHelper error: %v", err)
-	}
-	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != expectedKey {
-		t.Fatalf("prompt_cache_key = %q, want %q", got, expectedKey)
-	}
-	if got := httpReq.Header.Get("Session_id"); got != expectedKey {
-		t.Fatalf("Session_id = %q, want %q", got, expectedKey)
-	}
-	if _, errParse := uuid.Parse(expectedKey); errParse != nil {
-		t.Fatalf("derived prompt cache key %q is not a UUID: %v", expectedKey, errParse)
 	}
 }
 
@@ -288,107 +260,50 @@ func TestCodexIdentityConfuseKeepsClientBodySeparateFromUpstreamBody(t *testing.
 	}
 }
 
-func TestCodexExecutorCacheHelper_ClaudeUsesSessionHeader(t *testing.T) {
-	executor := &CodexExecutor{}
-	recorder := httptest.NewRecorder()
-	ginCtx, _ := gin.CreateTestContext(recorder)
-	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
-	ginCtx.Request.Header.Set(helps.ClaudeCodeSessionHeader, "cache-session-header")
-	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+// TestCodexIdentityConfuseUUIDFormat verifies the confused ids match the UUID
+// version real codex emits per field (v7 for thread/session/turn/prompt-cache,
+// v4 for installation), are deterministic + account-scoped, reuse the
+// original's v7 timestamp, and never equal the original. A v5 output (the old
+// behaviour) would be a fingerprint tell and must never occur.
+func TestCodexIdentityConfuseUUIDFormat(t *testing.T) {
+	// A genuine codex v7 id (019... ms-timestamp prefix).
+	origV7 := "019f20ed-3b0a-7301-abc2-a94d3b476f13"
 
-	firstReq := cliproxyexecutor.Request{
-		Model:   "gpt-5.4-claude-cache-header",
-		Payload: []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":[{"type":"text","text":"first"}]}]}`),
-	}
-	secondReq := cliproxyexecutor.Request{
-		Model:   "gpt-5.4-claude-cache-header",
-		Payload: []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":[{"type":"text","text":"next"}]}]}`),
-	}
-	rawJSON := []byte(`{"model":"gpt-5.4","stream":true}`)
-	url := "https://example.com/responses"
-
-	firstHTTPReq, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("claude"), url, nil, firstReq, firstReq.Payload, rawJSON)
-	if err != nil {
-		t.Fatalf("cacheHelper first error: %v", err)
-	}
-	secondHTTPReq, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("claude"), url, nil, secondReq, secondReq.Payload, rawJSON)
-	if err != nil {
-		t.Fatalf("cacheHelper second error: %v", err)
-	}
-
-	firstBody, errRead := io.ReadAll(firstHTTPReq.Body)
-	if errRead != nil {
-		t.Fatalf("read first request body: %v", errRead)
-	}
-	secondBody, errRead := io.ReadAll(secondHTTPReq.Body)
-	if errRead != nil {
-		t.Fatalf("read second request body: %v", errRead)
-	}
-	firstKey := gjson.GetBytes(firstBody, "prompt_cache_key").String()
-	secondKey := gjson.GetBytes(secondBody, "prompt_cache_key").String()
-	if firstKey == "" {
-		t.Fatalf("first prompt_cache_key is empty; body=%s", string(firstBody))
-	}
-	if secondKey != firstKey {
-		t.Fatalf("same Claude Code session header produced different prompt_cache_key: first=%q second=%q", firstKey, secondKey)
-	}
-}
-
-func TestCodexExecutorCacheHelper_ClaudeAgentScopeUsesResolvedModelAcrossHTTPAndWebsocket(t *testing.T) {
-	executor := &CodexExecutor{}
-	url := "https://example.com/responses"
-	req := cliproxyexecutor.Request{
-		Model:   "requested-alias-high",
-		Payload: []byte(`{"model":"requested-alias","messages":[{"role":"user","content":"hello"}]}`),
-	}
-	rootHeaders := http.Header{}
-	rootHeaders.Set(helps.ClaudeCodeSessionHeader, "resolved-model-session")
-	childHeaders := rootHeaders.Clone()
-	childHeaders.Set(helps.ClaudeCodeAgentHeader, "agent-a")
-	rawJSON := []byte(`{"model":"gpt-5.4","stream":true}`)
-
-	rootRequest, _, _, errRoot := executor.cacheHelper(context.Background(), sdktranslator.FromString("claude"), url, nil, req, req.Payload, rawJSON, rootHeaders)
-	if errRoot != nil {
-		t.Fatalf("root cacheHelper error: %v", errRoot)
-	}
-	rootBody, errReadRoot := io.ReadAll(rootRequest.Body)
-	if errReadRoot != nil {
-		t.Fatalf("read root body: %v", errReadRoot)
-	}
-	rootKey := gjson.GetBytes(rootBody, "prompt_cache_key").String()
-
-	childRequest, _, _, errChild := executor.cacheHelper(context.Background(), sdktranslator.FromString("claude"), url, nil, req, req.Payload, rawJSON, childHeaders)
-	if errChild != nil {
-		t.Fatalf("child cacheHelper error: %v", errChild)
-	}
-	childBody, errReadChild := io.ReadAll(childRequest.Body)
-	if errReadChild != nil {
-		t.Fatalf("read child body: %v", errReadChild)
-	}
-	childKey := gjson.GetBytes(childBody, "prompt_cache_key").String()
-	if rootKey == "" || childKey == "" || rootKey == childKey {
-		t.Fatalf("agent prompt keys are not isolated: root=%q child=%q", rootKey, childKey)
+	for _, kind := range []string{"turn", "prompt-cache", "thread", "session"} {
+		got := codexIdentityConfuseUUID("auth-A", kind, origV7)
+		u, err := uuid.Parse(got)
+		if err != nil {
+			t.Fatalf("kind=%s: not a valid UUID: %v", kind, err)
+		}
+		if u.Version() != 7 {
+			t.Errorf("kind=%s: version = %d, want 7 (%s)", kind, u.Version(), got)
+		}
+		if u.Variant() != uuid.RFC4122 {
+			t.Errorf("kind=%s: variant = %v, want RFC4122", kind, u.Variant())
+		}
+		// v7 must reuse the original's 48-bit ms timestamp (first 6 bytes).
+		orig := uuid.MustParse(origV7)
+		if got6, orig6 := u[:6], orig[:6]; string(got6) != string(orig6) {
+			t.Errorf("kind=%s: timestamp bytes not reused: got %x want %x", kind, got6, orig6)
+		}
+		if got == origV7 {
+			t.Errorf("kind=%s: confused id equals original", kind)
+		}
 	}
 
-	aliasReq := req
-	aliasReq.Model = "another-local-alias-low"
-	aliasRequest, _, _, errAlias := executor.cacheHelper(context.Background(), sdktranslator.FromString("claude"), url, nil, aliasReq, aliasReq.Payload, rawJSON, childHeaders)
-	if errAlias != nil {
-		t.Fatalf("alias cacheHelper error: %v", errAlias)
-	}
-	aliasBody, errReadAlias := io.ReadAll(aliasRequest.Body)
-	if errReadAlias != nil {
-		t.Fatalf("read alias body: %v", errReadAlias)
-	}
-	if aliasKey := gjson.GetBytes(aliasBody, "prompt_cache_key").String(); aliasKey != childKey {
-		t.Fatalf("resolved model key fragmented by request alias: first=%q alias=%q", childKey, aliasKey)
+	// installation_id is UUIDv4 in codex.
+	inst := codexIdentityConfuseUUID("auth-A", "installation", "41a7c984-ebd1-45d5-97d0-fa4ba9b80d44")
+	iu, err := uuid.Parse(inst)
+	if err != nil || iu.Version() != 4 {
+		t.Errorf("installation: version = %v (err=%v), want 4 (%s)", iu.Version(), err, inst)
 	}
 
-	websocketBody, _, errWebsocket := applyCodexPromptCacheHeadersWithContext(context.Background(), sdktranslator.FromString("claude"), aliasReq, rawJSON, childHeaders)
-	if errWebsocket != nil {
-		t.Fatalf("websocket prompt cache error: %v", errWebsocket)
+	// Deterministic: same inputs -> same output.
+	if a, b := codexIdentityConfuseUUID("auth-A", "turn", origV7), codexIdentityConfuseUUID("auth-A", "turn", origV7); a != b {
+		t.Errorf("not deterministic: %s != %s", a, b)
 	}
-	if websocketKey := gjson.GetBytes(websocketBody, "prompt_cache_key").String(); websocketKey != childKey {
-		t.Fatalf("HTTP/WebSocket prompt keys differ: http=%q websocket=%q", childKey, websocketKey)
+	// Account-scoped: different authID -> different output (unlinkable).
+	if a, b := codexIdentityConfuseUUID("auth-A", "turn", origV7), codexIdentityConfuseUUID("auth-B", "turn", origV7); a == b {
+		t.Errorf("accounts A and B produced the SAME confused id (%s) — would be linkable", a)
 	}
 }

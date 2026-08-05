@@ -53,7 +53,7 @@ func (o *AntigravityAuth) shortUserAgent() string {
 }
 
 func (o *AntigravityAuth) nodeUserAgent() string {
-	return misc.AntigravityOnboardUserUserAgent("")
+	return misc.AntigravityLoadCodeAssistUserAgent("")
 }
 
 func antigravityLoadCodeAssistMetadata() map[string]string {

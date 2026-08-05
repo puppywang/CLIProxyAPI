@@ -40,14 +40,6 @@ func (w *Watcher) scheduleConfigReload() {
 	})
 }
 
-// ReloadConfigIfChanged runs the same config reload path used by filesystem events.
-func (w *Watcher) ReloadConfigIfChanged() {
-	if w == nil {
-		return
-	}
-	w.reloadConfigIfChanged()
-}
-
 func (w *Watcher) reloadConfigIfChanged() {
 	data, err := os.ReadFile(w.configPath)
 	if err != nil {
@@ -125,9 +117,9 @@ func (w *Watcher) reloadConfig() bool {
 	if oldConfig != nil {
 		details := diff.BuildConfigChangeDetails(oldConfig, newConfig)
 		if len(details) > 0 {
-			log.Info("config changes detected:")
+			log.Debugf("config changes detected:")
 			for _, d := range details {
-				log.Infof("  %s", d)
+				log.Debugf("  %s", d)
 			}
 		} else {
 			log.Debugf("no material config field changes detected")

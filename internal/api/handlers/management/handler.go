@@ -20,7 +20,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -38,34 +37,80 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
-	cfg                     *config.Config
-	configFilePath          string
-	mu                      sync.Mutex
-	reloadMu                sync.Mutex
-	reloadGeneration        uint64
-	appliedReloadGeneration uint64
-	attemptsMu              sync.Mutex
-	failedAttempts          map[string]*attemptInfo // keyed by client IP
-	authManager             *coreauth.Manager
-	tokenStore              coreauth.Store
-	localPassword           string
-	allowRemoteOverride     bool
-	envSecret               string
-	logDir                  string
-	postAuthHook            coreauth.PostAuthHook
-	postAuthPersistHook     coreauth.PostAuthHook
-	pluginHost              *pluginhost.Host
-	configReloadHook        func(context.Context, *config.Config)
-	pluginStoreRegistryURL  string
-	pluginStoreHTTPClient   pluginstore.HTTPDoer
-	pluginReleaseCacheMu    sync.Mutex
-	pluginReleaseCache      map[string]pluginReleaseCacheEntry
+	cfg                    *config.Config
+	configFilePath         string
+	mu                     sync.Mutex
+	attemptsMu             sync.Mutex
+	failedAttempts         map[string]*attemptInfo // keyed by client IP
+	authManager            *coreauth.Manager
+	tokenStore             coreauth.Store
+	localPassword          string
+	allowRemoteOverride    bool
+	envSecret              string
+	logDir                 string
+	postAuthHook           coreauth.PostAuthHook
+	postAuthPersistHook    coreauth.PostAuthHook
+	pluginHost             *pluginhost.Host
+	configReloadHook       func(context.Context, *config.Config)
+	pluginStoreRegistryURL string
+	pluginStoreHTTPClient  pluginstore.HTTPDoer
+	pluginReleaseCacheMu   sync.Mutex
+	pluginReleaseCache     map[string]pluginReleaseCacheEntry
+
+	// Quota observation hooks injected by the cliproxy Service. quotaSnapshot
+	// returns the latest cached wham/usage snapshot for an auth (or ok=false
+	// when no fresh snapshot is available). quotaRefreshNow performs a
+	// synchronous out-of-cycle fetch — wired to the background refresher's
+	// RefreshNow so the management UI can drive an immediate re-check for one
+	// account. Both fields are optional: setups without the codex quota
+	// subsystem leave them nil and the corresponding endpoints respond 503.
+	quotaSnapshot    QuotaSnapshotFunc
+	quotaRefreshNow  QuotaRefreshNowFunc
+	quotaProvidersMu sync.RWMutex
 }
 
-type configReloadSnapshot struct {
-	cfg        *config.Config
-	generation uint64
+// QuotaSnapshotData mirrors the fields the management API exposes from the
+// LeastRemainingQuotaSelector's cache. UsedPercentPrimary / Secondary are
+// 0-100 ints; LimitReached mirrors upstream rate_limit.limit_reached; the
+// reset times are absolute timestamps from upstream's `resets_at` /
+// `resets_in_seconds`. FetchedAt records when the snapshot was last
+// captured.
+// Times use *time.Time so a zero value omits cleanly from JSON. Go's
+// encoder does NOT honour omitempty for a non-pointer time.Time zero
+// value — it serialises to "0001-01-01T00:00:00Z" which the UI then
+// renders as the absurd "739768d ago" (delta from year 1 to now).
+// Pointer-omit is the standard fix and the cooldowns endpoint applies
+// it for the same reason.
+type QuotaSnapshotData struct {
+	UsedPercentPrimary   int        `json:"used_percent_primary"`
+	UsedPercentSecondary int        `json:"used_percent_secondary"`
+	LimitReached         bool       `json:"limit_reached"`
+	ResetAtPrimary       *time.Time `json:"reset_at_primary,omitempty"`
+	ResetAtSecondary     *time.Time `json:"reset_at_secondary,omitempty"`
+	FetchedAt            *time.Time `json:"fetched_at,omitempty"`
+	// PlanType is the live ChatGPT subscription tier from wham/usage
+	// (free/plus/team/pro/…). Empty when the snapshot predates plan
+	// capture or the response omitted it. The refresher also writes this
+	// back onto the auth so agent-identity upgrades take effect without
+	// re-importing the credential file.
+	PlanType string `json:"plan_type,omitempty"`
+	// DeadReason / DeadSince surface a terminal "account unusable" signal
+	// observed by the quota fetcher (e.g. wham/usage 402 deactivated_workspace).
+	// Set only for permanently-dead credentials the operator should clean up;
+	// empty for healthy or merely-throttled accounts. Informational only — the
+	// selector never reads these.
+	DeadReason string     `json:"dead_reason,omitempty"`
+	DeadSince  *time.Time `json:"dead_since,omitempty"`
 }
+
+// QuotaSnapshotFunc returns the cached snapshot for authID. ok=false when
+// no fresh entry exists (cache miss or stale).
+type QuotaSnapshotFunc func(authID string) (QuotaSnapshotData, bool)
+
+// QuotaRefreshNowFunc performs a synchronous fetch via the refresher.
+// ok=false means the auth is not eligible (disabled / non-codex / missing).
+// err covers transient network/parse failures.
+type QuotaRefreshNowFunc func(ctx context.Context, authID string) (QuotaSnapshotData, bool, error)
 
 // NewHandler creates a new management handler instance.
 func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
@@ -160,77 +205,21 @@ func (h *Handler) SetConfigReloadHook(hook func(context.Context, *config.Config)
 	h.mu.Unlock()
 }
 
-// reloadSnapshotConfigLocked clones the runtime config and assigns a reload generation.
-// Callers must hold h.mu.
-func (h *Handler) reloadSnapshotConfigLocked() configReloadSnapshot {
-	if h == nil || h.cfg == nil {
-		return configReloadSnapshot{}
-	}
-	h.reloadGeneration++
-	return configReloadSnapshot{
-		cfg:        h.cfg.CloneForRuntime(),
-		generation: h.reloadGeneration,
-	}
-}
-
-// saveConfigAndSnapshotLocked saves h.cfg and returns a full runtime config snapshot.
-// Callers must hold h.mu.
-func (h *Handler) saveConfigAndSnapshotLocked(c *gin.Context) (configReloadSnapshot, bool) {
-	if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); errSave != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", errSave)})
-		return configReloadSnapshot{}, false
-	}
-	return h.reloadSnapshotConfigLocked(), true
-}
-
-// reloadConfigAfterManagementSave reloads from an independent config snapshot.
-// Callers must pass a full Config clone captured immediately after a successful save.
-func (h *Handler) reloadConfigAfterManagementSave(ctx context.Context, snapshot configReloadSnapshot) {
-	if h == nil || snapshot.cfg == nil || snapshot.generation == 0 {
+func (h *Handler) reloadConfigAfterManagementSave(ctx context.Context, cfg *config.Config) {
+	if h == nil || cfg == nil {
 		return
 	}
-	h.reloadMu.Lock()
-	defer h.reloadMu.Unlock()
-
 	h.mu.Lock()
-	if snapshot.generation < h.appliedReloadGeneration {
-		h.mu.Unlock()
-		return
-	}
 	hook := h.configReloadHook
 	host := h.pluginHost
 	h.mu.Unlock()
 	if hook != nil {
-		hook(ctx, snapshot.cfg)
-	} else if host != nil {
-		host.ApplyConfig(ctx, snapshot.cfg)
-	}
-
-	h.mu.Lock()
-	if snapshot.generation > h.appliedReloadGeneration {
-		h.appliedReloadGeneration = snapshot.generation
-	}
-	h.mu.Unlock()
-}
-
-// reloadConfigAfterManagementSaveAsync reloads from an independent config snapshot.
-// Callers must pass a full Config clone captured immediately after a successful save.
-func (h *Handler) reloadConfigAfterManagementSaveAsync(ctx context.Context, snapshot configReloadSnapshot) {
-	if h == nil || snapshot.cfg == nil || snapshot.generation == 0 {
+		hook(ctx, cfg)
 		return
 	}
-	reloadCtx := context.Background()
-	if ctx != nil {
-		reloadCtx = context.WithoutCancel(ctx)
+	if host != nil {
+		host.ApplyConfig(ctx, cfg)
 	}
-	go func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				log.WithField("panic", recovered).Error("management: async config reload panicked")
-			}
-		}()
-		h.reloadConfigAfterManagementSave(reloadCtx, snapshot)
-	}()
 }
 
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
@@ -257,6 +246,39 @@ func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 // SetPostAuthPersistHook registers a hook to be called after auth persistence.
 func (h *Handler) SetPostAuthPersistHook(hook coreauth.PostAuthHook) {
 	h.postAuthPersistHook = hook
+}
+
+// SetQuotaProviders wires the cached-snapshot reader and synchronous
+// refresh trigger to the LeastRemainingQuotaSelector + Refresher pair
+// that the cliproxy Service owns. Either argument can be nil to leave
+// the corresponding endpoint disabled; callers that don't use the
+// codex quota subsystem simply skip this call.
+func (h *Handler) SetQuotaProviders(snapshot QuotaSnapshotFunc, refreshNow QuotaRefreshNowFunc) {
+	if h == nil {
+		return
+	}
+	h.quotaProvidersMu.Lock()
+	h.quotaSnapshot = snapshot
+	h.quotaRefreshNow = refreshNow
+	h.quotaProvidersMu.Unlock()
+}
+
+func (h *Handler) getQuotaSnapshotFunc() QuotaSnapshotFunc {
+	if h == nil {
+		return nil
+	}
+	h.quotaProvidersMu.RLock()
+	defer h.quotaProvidersMu.RUnlock()
+	return h.quotaSnapshot
+}
+
+func (h *Handler) getQuotaRefreshFunc() QuotaRefreshNowFunc {
+	if h == nil {
+		return nil
+	}
+	h.quotaProvidersMu.RLock()
+	defer h.quotaProvidersMu.RUnlock()
+	return h.quotaRefreshNow
 }
 
 // Middleware enforces access control for management endpoints.
@@ -411,13 +433,7 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
 	}
-	snapshot := h.reloadSnapshotConfigLocked()
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	var reqCtx context.Context
-	if c != nil && c.Request != nil {
-		reqCtx = c.Request.Context()
-	}
-	h.reloadConfigAfterManagementSaveAsync(reqCtx, snapshot)
 	return true
 }
 

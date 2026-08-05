@@ -18,14 +18,12 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	claudemodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/claude/models"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // ClaudeCodeAPIHandler contains the handlers for Claude API endpoints.
@@ -80,9 +78,6 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
 		return
 	}
 
-	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
-	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
-
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if !streamResult.Exists() || streamResult.Type == gjson.False {
@@ -112,9 +107,6 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 		return
 	}
 
-	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
-	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
-
 	c.Header("Content-Type", "application/json")
 
 	alt := h.GetAlt(c)
@@ -133,29 +125,30 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
 	cliCancel()
 }
 
-// rewriteClaudeDDModelInBody decodes model IDs of the form claude-fable-5-dd-<reversed>
-// back into the original model name used for routing and upstream requests.
-func rewriteClaudeDDModelInBody(rawJSON []byte) []byte {
-	modelName := gjson.GetBytes(rawJSON, "model").String()
-	resolved := claudemodels.ResolveClaudeModelIDPrefix(modelName)
-	if resolved == modelName {
-		return rawJSON
-	}
-	updated, errSet := sjson.SetBytes(rawJSON, "model", resolved)
-	if errSet != nil {
-		return rawJSON
-	}
-	return updated
-}
-
 // ClaudeModels handles the Claude models listing endpoint.
 // It returns a JSON response containing available Claude models and their specifications.
 //
 // Parameters:
 //   - c: The Gin context for the request.
 func (h *ClaudeCodeAPIHandler) ClaudeModels(c *gin.Context) {
-	disableCloaking := h.Cfg != nil && h.Cfg.ClaudeCode.DisableCloakingModelList
-	c.JSON(http.StatusOK, claudemodels.BuildResponse(h.Models(), disableCloaking))
+	models := h.Models()
+	firstID := ""
+	lastID := ""
+	if len(models) > 0 {
+		if id, ok := models[0]["id"].(string); ok {
+			firstID = id
+		}
+		if id, ok := models[len(models)-1]["id"].(string); ok {
+			lastID = id
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data":     models,
+		"has_more": false,
+		"first_id": firstID,
+		"last_id":  lastID,
+	})
 }
 
 // handleNonStreamingResponse handles non-streaming content generation requests for Claude models.
@@ -378,28 +371,9 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	if msg != nil && msg.StatusCode > 0 {
 		status = msg.StatusCode
 	}
-	if msg != nil && msg.DirectResponse {
-		for key, values := range handlers.FilterUpstreamHeaders(msg.Headers) {
-			if len(values) == 0 || handlers.IsCPAReservedResponseHeader(key) {
-				continue
-			}
-			c.Writer.Header().Del(key)
-			for _, value := range values {
-				c.Writer.Header().Add(key, value)
-			}
-		}
-		body := bytes.Clone(msg.Body)
-		appendClaudeAPIResponse(c, body)
-		if !c.Writer.Written() && c.Writer.Header().Get("Content-Type") == "" {
-			c.Writer.Header().Set("Content-Type", "application/json")
-		}
-		c.Status(status)
-		_, _ = c.Writer.Write(body)
-		return
-	}
 	if msg != nil && msg.Addon != nil && handlers.PassthroughHeadersEnabled(h.Cfg) {
 		for key, values := range msg.Addon {
-			if len(values) == 0 || handlers.IsCPAReservedResponseHeader(key) {
+			if len(values) == 0 {
 				continue
 			}
 			c.Writer.Header().Del(key)

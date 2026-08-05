@@ -6,10 +6,13 @@ package cliproxy
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	configaccess "github.com/router-for-me/CLIProxyAPI/v7/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/quota"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
@@ -47,9 +50,6 @@ type Builder struct {
 
 	// coreManager handles core authentication and execution.
 	coreManager *coreauth.Manager
-
-	// cooldownStateStore overrides runtime cooldown persistence.
-	cooldownStateStore coreauth.CooldownStateStore
 
 	// pluginHost owns dynamic plugin lifecycle and adapters.
 	pluginHost *pluginhost.Host
@@ -149,12 +149,6 @@ func (b *Builder) WithCoreAuthManager(mgr *coreauth.Manager) *Builder {
 	return b
 }
 
-// WithCooldownStateStore overrides the store used for runtime cooldown persistence.
-func (b *Builder) WithCooldownStateStore(store coreauth.CooldownStateStore) *Builder {
-	b.cooldownStateStore = store
-	return b
-}
-
 // WithPluginHost overrides the dynamic plugin host used by the service.
 func (b *Builder) WithPluginHost(host *pluginhost.Host) *Builder {
 	b.pluginHost = host
@@ -194,13 +188,6 @@ func (b *Builder) Build() (*Service, error) {
 	if b.configPath == "" {
 		return nil, fmt.Errorf("cliproxy: configuration path is required")
 	}
-	if errValidate := b.cfg.ValidateCredentialWeights(); errValidate != nil {
-		return nil, fmt.Errorf("cliproxy: validate credential weights: %w", errValidate)
-	}
-	b.cfg.NormalizePluginsConfig()
-	if errResolvePluginsDir := b.cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && b.cfg.Plugins.Enabled {
-		return nil, fmt.Errorf("cliproxy: %w", errResolvePluginsDir)
-	}
 
 	tokenProvider := b.tokenProvider
 	if tokenProvider == nil {
@@ -238,23 +225,119 @@ func (b *Builder) Build() (*Service, error) {
 	}
 	accessManager.SetProviders(sdkaccess.RegisteredProviders())
 
+	// Declared at the outer scope so the constructed Service can pick them
+	// up even though they are only populated in the "build a fresh
+	// coreManager" branch below.
+	var (
+		quotaFetcher  *quota.CodexWhamFetcher
+		quotaSelector *coreauth.LeastRemainingQuotaSelector
+	)
+
 	coreManager := b.coreManager
-	cooldownStateStore := b.cooldownStateStore
-	var appliedRoutingState *routingRuntimeState
 	if coreManager == nil {
 		tokenStore := sdkAuth.GetTokenStore()
 		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
 			dirSetter.SetBaseDir(b.cfg.AuthDir)
 		}
-		if cooldownStateStore == nil {
-			if provider, ok := tokenStore.(coreauth.CooldownStateStoreProvider); ok {
-				cooldownStateStore = provider.CooldownStateStore()
+
+		strategy := ""
+		sessionAffinity := false
+		sessionAffinityTTL := time.Hour
+		if b.cfg != nil {
+			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
+			// Support both legacy ClaudeCodeSessionAffinity and new universal SessionAffinity
+			sessionAffinity = b.cfg.Routing.SessionAffinity
+			if ttlStr := strings.TrimSpace(b.cfg.Routing.SessionAffinityTTL); ttlStr != "" {
+				if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
+					sessionAffinityTTL = parsed
+				}
 			}
 		}
+		var selector coreauth.Selector
+		// leastBound is the inner-most selector for codex traffic: under
+		// the session cache's write lock, it picks the candidate with
+		// the fewest current bindings. Outside the lock it has no shared
+		// state. Wired below for both fill-first and the default path so
+		// strategy choice still routes through the binding-aware pick.
+		var leastBound *coreauth.LeastBoundSelector
+		switch strategy {
+		case "fill-first", "fillfirst", "ff":
+			selector = &coreauth.FillFirstSelector{}
+		default:
+			leastBound = coreauth.NewLeastBoundSelector(nil, nil)
+			selector = leastBound
+		}
 
-		routingState := normalizedRoutingRuntimeState(b.cfg)
-		coreManager = coreauth.NewManager(tokenStore, newRoutingSelector(routingState), nil)
-		appliedRoutingState = &routingState
+		// Wrap LeastBoundSelector with the quota-aware filter so that
+		// codex cache-miss picks land on whichever credential currently
+		// has the most remaining ChatGPT quota AND the fewest existing
+		// session bindings. The quota selector pre-partitions candidates
+		// into healthy/stressed tiers and hands the slimmed list to the
+		// inner LeastBoundSelector; the binding-count ranking then
+		// distributes new sessions evenly across that tier.
+		//
+		// Async mode keeps Pick latency bounded to in-memory cache reads —
+		// the quota.Refresher started in Service.Run owns wham/usage
+		// fetching so a slow SOCKS5 first call never collapses the
+		// candidate pool to whichever credential responded fastest.
+		quotaFetcher = quota.NewCodexWhamFetcher()
+		quotaSelector = coreauth.NewLeastRemainingQuotaSelector(coreauth.LeastRemainingQuotaConfig{
+			Inner:   selector,
+			Fetcher: quotaFetcher,
+			Async:   true,
+			// TTL must exceed the refresher's interval so a freshly
+			// pushed snapshot stays usable until the next refresh
+			// arrives. With 10-min interval + 5-min default TTL the
+			// cache was stale for half of every cycle and Pick fell
+			// back to the neutral 50/50 score — which is exactly what
+			// we saw in production (every picked log showed 50%/50%
+			// regardless of the auth's real wham data). Doubling the
+			// interval gives a small safety margin if a refresh round
+			// slips slightly.
+			TTL: 2 * quota.DefaultRefreshInterval,
+		})
+		selector = quotaSelector
+
+		// Wrap with session affinity if enabled. Strict mode (when set) makes
+		// the selector refuse to silently fail over to a different credential
+		// when the session-bound auth is unavailable.
+		if sessionAffinity {
+			strict := false
+			if b.cfg != nil {
+				strict = b.cfg.Routing.SessionAffinityStrict
+			}
+			affinity := coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
+				Fallback:        selector,
+				TTL:             sessionAffinityTTL,
+				PersistencePath: sessionAffinityCachePath(b.cfg),
+				Strict:          strict,
+			})
+			// Hook the LeastBoundSelector's secondary score into the quota
+			// cache so 0-binding ties prefer the freshest credential. The
+			// counter itself is supplied via WithBindingSnapshot on each
+			// Pick (the session affinity selector holds the cache lock and
+			// emits a snapshot before delegating).
+			if leastBound != nil {
+				qs := quotaSelector
+				// CombinedQuotaScore = primary*100 + secondary, so
+				// primary dominates the rank but secondary breaks
+				// ties cleanly (e.g. two accounts at 1% primary but
+				// 1% vs 63% weekly are no longer pure-ID tiebroken
+				// — the lighter-weekly one wins). Unknown / fresh
+				// accounts get the neutral midpoint applied to the
+				// primary axis only (no secondary bias).
+				leastBound.SetSecondaryScore(func(authID string) int {
+					score, ok := qs.CombinedQuotaScore(authID)
+					if !ok {
+						return coreauth.DefaultNeutralUsedPercent * 100
+					}
+					return score
+				})
+			}
+			selector = affinity
+		}
+
+		coreManager = coreauth.NewManager(tokenStore, selector, nil)
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
@@ -265,19 +348,17 @@ func (b *Builder) Build() (*Service, error) {
 	}
 
 	service := &Service{
-		cfg:                 b.cfg,
-		configPath:          b.configPath,
-		tokenProvider:       tokenProvider,
-		apiKeyProvider:      apiKeyProvider,
-		watcherFactory:      watcherFactory,
-		hooks:               b.hooks,
-		authManager:         authManager,
-		accessManager:       accessManager,
-		coreManager:         coreManager,
-		cooldownStateStore:  cooldownStateStore,
-		pluginHost:          pluginHost,
-		appliedRoutingState: appliedRoutingState,
-		serverOptions:       append([]api.ServerOption(nil), b.serverOptions...),
+		cfg:            b.cfg,
+		configPath:     b.configPath,
+		tokenProvider:  tokenProvider,
+		apiKeyProvider: apiKeyProvider,
+		watcherFactory: watcherFactory,
+		hooks:          b.hooks,
+		authManager:    authManager,
+		accessManager:  accessManager,
+		coreManager:    coreManager,
+		pluginHost:     pluginHost,
+		serverOptions:  append([]api.ServerOption(nil), b.serverOptions...),
 	}
 	if b.postAuthHook != nil {
 		service.serverOptions = append(service.serverOptions, api.WithPostAuthHook(b.postAuthHook))
@@ -285,10 +366,15 @@ func (b *Builder) Build() (*Service, error) {
 	service.serverOptions = append(service.serverOptions,
 		api.WithPostAuthPersistHook(service.runtimeAuthSyncHook()),
 		api.WithPluginHost(pluginHost),
-		api.WithConfigReloadHook(func(_ context.Context, _ *config.Config) {
-			service.reloadConfigFromWatcher()
+		api.WithConfigReloadHook(func(ctx context.Context, cfg *config.Config) {
+			service.applyConfigUpdate(cfg)
 		}),
 	)
+	// Capture the quota-aware components only when they were constructed
+	// here. A caller that supplied a pre-built coreManager (rare; the SDK
+	// embed path) drives its own quota subsystem.
+	service.quotaFetcher = quotaFetcher
+	service.quotaSelector = quotaSelector
 	return service, nil
 }
 

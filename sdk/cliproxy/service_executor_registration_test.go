@@ -6,16 +6,12 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
 type serviceTestPluginExecutor struct{}
-type serviceTestSDKExecutor struct{ serviceTestPluginExecutor }
-
-func (serviceTestSDKExecutor) Identifier() string { return "sdk-provider" }
 
 func (serviceTestPluginExecutor) Identifier() string {
 	return "plugin-provider"
@@ -82,8 +78,8 @@ func TestRegisterAvailableExecutors(t *testing.T) {
 		"codex",
 		"claude",
 		"gemini",
-		"gemini-interactions",
 		"vertex",
+		"gemini-cli",
 		"aistudio",
 		"antigravity",
 		"kimi",
@@ -101,92 +97,5 @@ func TestRegisterAvailableExecutors(t *testing.T) {
 	resolved, _ := service.coreManager.Executor("plugin-provider")
 	if _, isPlugin := resolved.(serviceTestPluginExecutor); !isPlugin {
 		t.Fatalf("executor type = %T, want serviceTestPluginExecutor", resolved)
-	}
-}
-
-func TestSyncPluginModelRuntimePreservesSDKExecutorUnlessForced(t *testing.T) {
-	manager := coreauth.NewManager(nil, nil, nil)
-	custom := serviceTestSDKExecutor{}
-	manager.RegisterExecutor(custom)
-	auth := &coreauth.Auth{ID: "private-auth", Provider: custom.Identifier()}
-	if _, err := manager.Register(context.Background(), auth); err != nil {
-		t.Fatal(err)
-	}
-	service := &Service{cfg: &config.Config{}, coreManager: manager, pluginHost: pluginhost.New()}
-
-	service.syncPluginModelRuntime(context.Background())
-	got, ok := manager.Executor(custom.Identifier())
-	if !ok || got != custom {
-		t.Fatalf("plugin model sync replaced SDK executor with %T", got)
-	}
-
-	service.registerExecutorForAuth(auth, true)
-	got, ok = manager.Executor(custom.Identifier())
-	if !ok {
-		t.Fatal("forced registration removed executor")
-	}
-	if _, replaced := got.(*runtimeexecutor.OpenAICompatExecutor); !replaced {
-		t.Fatalf("forced registration kept %T, want *executor.OpenAICompatExecutor", got)
-	}
-}
-
-func TestRegisterExecutorForAuth_OpenAICompatUsesNamespacedProviderKey(t *testing.T) {
-	testCases := []struct {
-		name  string
-		auths []*coreauth.Auth
-	}{
-		{
-			name: "native first",
-			auths: []*coreauth.Auth{
-				{ID: "native-kimi", Provider: "kimi"},
-				openAICompatKimiAuth(),
-			},
-		},
-		{
-			name: "compat first",
-			auths: []*coreauth.Auth{
-				openAICompatKimiAuth(),
-				{ID: "native-kimi", Provider: "kimi"},
-			},
-		},
-	}
-
-	for _, tt := range testCases {
-		t.Run(tt.name, func(t *testing.T) {
-			service := &Service{
-				cfg:         &config.Config{},
-				coreManager: coreauth.NewManager(nil, nil, nil),
-			}
-
-			service.registerExecutorsForAuths(tt.auths, true)
-
-			nativeExecutor, okNative := service.coreManager.Executor("kimi")
-			if !okNative {
-				t.Fatal("expected native kimi executor")
-			}
-			if _, okKimi := nativeExecutor.(*runtimeexecutor.KimiExecutor); !okKimi {
-				t.Fatalf("native executor type = %T, want *executor.KimiExecutor", nativeExecutor)
-			}
-
-			compatExecutor, okCompat := service.coreManager.Executor("openai-compatible-kimi")
-			if !okCompat {
-				t.Fatal("expected namespaced OpenAI-compatible executor")
-			}
-			if _, okOpenAICompat := compatExecutor.(*runtimeexecutor.OpenAICompatExecutor); !okOpenAICompat {
-				t.Fatalf("compat executor type = %T, want *executor.OpenAICompatExecutor", compatExecutor)
-			}
-		})
-	}
-}
-
-func openAICompatKimiAuth() *coreauth.Auth {
-	return &coreauth.Auth{
-		ID:       "compat-kimi",
-		Provider: "openai-compatibility",
-		Label:    "kimi",
-		Attributes: map[string]string{
-			"compat_name":  "kimi",
-			"provider_key": "kimi",
-		},
 	}
 }

@@ -178,6 +178,16 @@ claude-code:
 # - true: disable image_generation everywhere (also returns 404 for /v1/images/generations and /v1/images/edits).
 # - "chat": disable image_generation injection on non-images endpoints, but keep /v1/images/generations and /v1/images/edits enabled.
 # - "passthrough": never inject or strip image_generation on non-images endpoints (forward the client payload unchanged); behaves like "chat" on /v1/images/* endpoints.
+#
+# Why "chat" matters for recent Codex (>= 0.146): by default this proxy injects a
+# {"type":"image_generation"} tool declaration into every /v1/responses request.
+# Newer Codex clients that also expose the standalone `image_gen.imagegen` tool
+# (extension path, standalone POST /v1/images/generations) will then have the
+# upstream model pick the server-side image_generation_call instead of the tool,
+# and those legacy calls are NOT rendered in the new UI (image "generated" but
+# never shown). Setting "chat" strips the injected declaration on non-images
+# endpoints so the model is forced onto the image_gen tool path, while keeping
+# /v1/images/generations and /v1/images/edits fully functional.
 disable-image-generation: false
 
 # Base model used by the legacy hosted image_generation tool path when a Codex image request is not proxied directly through the Image API.

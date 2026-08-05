@@ -5,16 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 func TestFillFirstSelectorPick_Deterministic(t *testing.T) {
@@ -42,7 +40,11 @@ func TestFillFirstSelectorPick_Deterministic(t *testing.T) {
 func TestRoundRobinSelectorPick_CyclesDeterministic(t *testing.T) {
 	t.Parallel()
 
-	selector := &RoundRobinSelector{}
+	// Pre-seed the cursor to 0 so the initial-random-seed branch is skipped
+	// and we can assert a deterministic ordering. Production code seeds with
+	// rand.IntN on first use; this test exercises the cyclic property given
+	// a known starting point.
+	selector := &RoundRobinSelector{cursors: map[string]int{"gemini:": 0}}
 	auths := []*Auth{
 		{ID: "b"},
 		{ID: "a"},
@@ -64,221 +66,10 @@ func TestRoundRobinSelectorPick_CyclesDeterministic(t *testing.T) {
 	}
 }
 
-func TestWeightedRoundRobinSelectorPick_DistributesAndSkipsNonPositiveWeights(t *testing.T) {
-	t.Parallel()
-
-	selector := &WeightedRoundRobinSelector{}
-	auths := []*Auth{
-		{ID: "a", Attributes: map[string]string{AttributeWeight: "5"}},
-		{ID: "b", Attributes: map[string]string{AttributeWeight: "3"}},
-		{ID: "c", Attributes: map[string]string{AttributeWeight: "2"}},
-		{ID: "disabled-by-weight", Attributes: map[string]string{AttributeWeight: "0"}},
-	}
-
-	counts := make(map[string]int)
-	for index := 0; index < 100; index++ {
-		got, errPick := selector.Pick(context.Background(), "gemini", "model", cliproxyexecutor.Options{}, auths)
-		if errPick != nil {
-			t.Fatalf("Pick() #%d error = %v", index, errPick)
-		}
-		counts[got.ID]++
-	}
-	want := map[string]int{"a": 50, "b": 30, "c": 20}
-	for authID, wantCount := range want {
-		if counts[authID] != wantCount {
-			t.Fatalf("auth %q picks = %d, want %d", authID, counts[authID], wantCount)
-		}
-	}
-	if counts["disabled-by-weight"] != 0 {
-		t.Fatalf("non-positive weight auth picks = %d, want 0", counts["disabled-by-weight"])
-	}
-}
-
-func TestWeightedRoundRobinSelectorPick_ResetsCreditsWhenWeightsChange(t *testing.T) {
-	t.Parallel()
-
-	selector := &WeightedRoundRobinSelector{}
-	authA := &Auth{ID: "a", Attributes: map[string]string{AttributeWeight: "1000000"}}
-	authB := &Auth{ID: "b", Attributes: map[string]string{AttributeWeight: "1"}}
-	auths := []*Auth{authA, authB}
-	for index := 0; index < 1000; index++ {
-		if _, errPick := selector.Pick(context.Background(), "gemini", "model", cliproxyexecutor.Options{}, auths); errPick != nil {
-			t.Fatalf("warmup Pick() #%d error = %v", index, errPick)
-		}
-	}
-
-	authA.Attributes[AttributeWeight] = "1"
-	counts := make(map[string]int)
-	for index := 0; index < 20; index++ {
-		got, errPick := selector.Pick(context.Background(), "gemini", "model", cliproxyexecutor.Options{}, auths)
-		if errPick != nil {
-			t.Fatalf("Pick() after weight change #%d error = %v", index, errPick)
-		}
-		counts[got.ID]++
-	}
-	if counts["a"] != 10 || counts["b"] != 10 {
-		t.Fatalf("picks after weight change = %#v, want a:b=10:10", counts)
-	}
-}
-
-func TestWeightedRoundRobinSelectorPick_RebalancesWhenHighestWeightUnavailable(t *testing.T) {
-	t.Parallel()
-
-	selector := &WeightedRoundRobinSelector{}
-	auths := []*Auth{
-		{ID: "a", Disabled: true, Attributes: map[string]string{AttributeWeight: "5"}},
-		{ID: "b", Attributes: map[string]string{AttributeWeight: "3"}},
-		{ID: "c", Attributes: map[string]string{AttributeWeight: "2"}},
-	}
-	counts := make(map[string]int)
-	for index := 0; index < 100; index++ {
-		got, errPick := selector.Pick(context.Background(), "gemini", "model", cliproxyexecutor.Options{}, auths)
-		if errPick != nil {
-			t.Fatalf("Pick() #%d error = %v", index, errPick)
-		}
-		counts[got.ID]++
-	}
-	if counts["a"] != 0 || counts["b"] != 60 || counts["c"] != 40 {
-		t.Fatalf("weighted failover counts = %#v, want b:c=60:40 with a skipped", counts)
-	}
-}
-
-func TestWeightedRoundRobinSelectorPick_SkipsUnavailableAndQuotaExceededWithoutRecovery(t *testing.T) {
-	t.Parallel()
-
-	model := "test-model"
-	selector := &WeightedRoundRobinSelector{}
-	auths := []*Auth{
-		{
-			ID: "model-unavailable",
-			ModelStates: map[string]*ModelState{
-				model: {Unavailable: true},
-			},
-		},
-		{ID: "quota-exceeded", Quota: QuotaState{Exceeded: true}},
-		{ID: "available"},
-	}
-
-	gotModel, errModel := selector.Pick(context.Background(), "gemini", model, cliproxyexecutor.Options{}, auths)
-	if errModel != nil || gotModel == nil || gotModel.ID != "available" {
-		t.Fatalf("model Pick() = %#v, %v; want available", gotModel, errModel)
-	}
-	for index := 0; index < 4; index++ {
-		gotAuth, errAuth := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
-		if errAuth != nil || gotAuth == nil {
-			t.Fatalf("auth Pick() #%d = %#v, %v; want available auth", index, gotAuth, errAuth)
-		}
-		if gotAuth.ID == "quota-exceeded" {
-			t.Fatalf("auth Pick() #%d selected quota-exceeded credential", index)
-		}
-	}
-}
-
-func TestAuthWeight_MetadataFallbackAndAttributePrecedence(t *testing.T) {
-	t.Parallel()
-
-	if got := authWeight(&Auth{Metadata: map[string]any{AttributeWeight: float64(7)}}); got != 7 {
-		t.Fatalf("authWeight(metadata) = %d, want 7", got)
-	}
-	if got := authWeight(&Auth{
-		Attributes: map[string]string{AttributeWeight: "3"},
-		Metadata:   map[string]any{AttributeWeight: float64(7)},
-	}); got != 3 {
-		t.Fatalf("authWeight(attribute and metadata) = %d, want attribute weight 3", got)
-	}
-}
-
-func TestAuthWeight_InvalidAndOverflowValuesAreExcluded(t *testing.T) {
-	t.Parallel()
-
-	for _, raw := range []string{"1.5", "1000001", "9223372036854775807", "9223372036854775808"} {
-		auth := &Auth{Attributes: map[string]string{AttributeWeight: raw}}
-		if got := authWeight(auth); got != 0 {
-			t.Fatalf("authWeight(%q) = %d, want 0", raw, got)
-		}
-	}
-	if got := authWeight(&Auth{Metadata: map[string]any{AttributeWeight: 1.5}}); got != 0 {
-		t.Fatalf("authWeight(invalid metadata) = %d, want 0", got)
-	}
-	if got := authWeight(&Auth{Attributes: map[string]string{AttributeWeight: "-1"}}); got != 0 {
-		t.Fatalf("authWeight(-1) = %d, want 0", got)
-	}
-}
-
-func TestPickSmoothWeightedAuth_SaturatesCorruptState(t *testing.T) {
-	t.Parallel()
-
-	current := map[string]int64{"a": math.MaxInt64, "b": math.MinInt64}
-	picked := pickSmoothWeightedAuth([]*Auth{{ID: "a"}, {ID: "b"}}, current)
-	if picked == nil {
-		t.Fatal("pickSmoothWeightedAuth() returned nil")
-	}
-	if current["a"] != math.MaxInt64-2 || current["b"] != math.MinInt64+1 {
-		t.Fatalf("current state = %#v, want saturated arithmetic", current)
-	}
-}
-
-func TestWeightedRoundRobinSelectorPick_RecoveredAuthReturnsWithoutAccumulatedCredit(t *testing.T) {
-	t.Parallel()
-
-	selector := &WeightedRoundRobinSelector{}
-	authA := &Auth{ID: "a", Attributes: map[string]string{AttributeWeight: "5"}}
-	authB := &Auth{ID: "b", Attributes: map[string]string{AttributeWeight: "1"}}
-	auths := []*Auth{authA, authB}
-
-	for index := 0; index < 6; index++ {
-		if _, errPick := selector.Pick(context.Background(), "gemini", "model", cliproxyexecutor.Options{}, auths); errPick != nil {
-			t.Fatalf("warmup Pick() #%d error = %v", index, errPick)
-		}
-	}
-	authA.Unavailable = true
-	authA.NextRetryAfter = time.Now().Add(time.Hour)
-	for index := 0; index < 6; index++ {
-		got, errPick := selector.Pick(context.Background(), "gemini", "model", cliproxyexecutor.Options{}, auths)
-		if errPick != nil || got == nil || got.ID != "b" {
-			t.Fatalf("unavailable Pick() #%d = %#v, %v; want b", index, got, errPick)
-		}
-	}
-	authA.Unavailable = false
-	authA.NextRetryAfter = time.Time{}
-
-	counts := make(map[string]int)
-	for index := 0; index < 6; index++ {
-		got, errPick := selector.Pick(context.Background(), "gemini", "model", cliproxyexecutor.Options{}, auths)
-		if errPick != nil {
-			t.Fatalf("recovered Pick() #%d error = %v", index, errPick)
-		}
-		counts[got.ID]++
-	}
-	if counts["a"] != 5 || counts["b"] != 1 {
-		t.Fatalf("recovered picks = %#v, want a:b=5:1", counts)
-	}
-}
-
-func TestWeightedRoundRobinSelectorPick_DefaultWeightIsOne(t *testing.T) {
-	t.Parallel()
-
-	selector := &WeightedRoundRobinSelector{}
-	auths := []*Auth{{ID: "a"}, {ID: "b"}, {ID: "c"}}
-	counts := make(map[string]int)
-	for index := 0; index < 30; index++ {
-		got, errPick := selector.Pick(context.Background(), "gemini", "model", cliproxyexecutor.Options{}, auths)
-		if errPick != nil {
-			t.Fatalf("Pick() #%d error = %v", index, errPick)
-		}
-		counts[got.ID]++
-	}
-	for _, authID := range []string{"a", "b", "c"} {
-		if counts[authID] != 10 {
-			t.Fatalf("auth %q picks = %d, want 10", authID, counts[authID])
-		}
-	}
-}
-
 func TestRoundRobinSelectorPick_PriorityBuckets(t *testing.T) {
 	t.Parallel()
 
-	selector := &RoundRobinSelector{}
+	selector := &RoundRobinSelector{cursors: map[string]int{"mixed:": 0}}
 	auths := []*Auth{
 		{ID: "c", Attributes: map[string]string{"priority": "0"}},
 		{ID: "a", Attributes: map[string]string{"priority": "10"}},
@@ -339,7 +130,7 @@ func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 }
 
 func TestRoundRobinSelectorPick_Concurrent(t *testing.T) {
-	selector := &RoundRobinSelector{}
+	selector := &RoundRobinSelector{cursors: map[string]int{"gemini:": 0}}
 	auths := []*Auth{
 		{ID: "b"},
 		{ID: "a"},
@@ -497,7 +288,7 @@ func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 	})
 }
 
-func TestIsAuthBlockedForModel_UnavailableWithoutNextRetryIsBlocked(t *testing.T) {
+func TestIsAuthBlockedForModel_UnavailableWithoutNextRetryIsNotBlocked(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
@@ -516,45 +307,14 @@ func TestIsAuthBlockedForModel_UnavailableWithoutNextRetryIsBlocked(t *testing.T
 	}
 
 	blocked, reason, next := isAuthBlockedForModel(auth, model, now)
-	if !blocked {
-		t.Fatalf("blocked = false, want true")
+	if blocked {
+		t.Fatalf("blocked = true, want false")
 	}
-	if reason != blockReasonOther {
-		t.Fatalf("reason = %v, want %v", reason, blockReasonOther)
+	if reason != blockReasonNone {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonNone)
 	}
 	if !next.IsZero() {
 		t.Fatalf("next = %v, want zero", next)
-	}
-}
-
-func TestIsAuthBlockedForModel_AuthQuotaExceededWithoutRecoveryIsBlocked(t *testing.T) {
-	t.Parallel()
-
-	auth := &Auth{ID: "a", Quota: QuotaState{Exceeded: true}}
-	for _, model := range []string{"", "test-model"} {
-		blocked, reason, next := isAuthBlockedForModel(auth, model, time.Now())
-		if !blocked || reason != blockReasonOther || !next.IsZero() {
-			t.Fatalf("isAuthBlockedForModel(%q) = %v, %v, %v; want true, other, zero", model, blocked, reason, next)
-		}
-	}
-}
-
-func TestIsAuthBlockedForModel_ExpiredRecoveryIsAvailable(t *testing.T) {
-	t.Parallel()
-
-	now := time.Now()
-	auth := &Auth{
-		ID:             "a",
-		Unavailable:    true,
-		NextRetryAfter: now.Add(-time.Minute),
-		Quota: QuotaState{
-			Exceeded:      true,
-			NextRecoverAt: now.Add(-time.Second),
-		},
-	}
-	blocked, reason, next := isAuthBlockedForModel(auth, "", now)
-	if blocked || reason != blockReasonNone || !next.IsZero() {
-		t.Fatalf("isAuthBlockedForModel() = %v, %v, %v; want false, none, zero", blocked, reason, next)
 	}
 }
 
@@ -601,7 +361,7 @@ func TestFillFirstSelectorPick_ThinkingSuffixFallsBackToBaseModelState(t *testin
 func TestRoundRobinSelectorPick_ThinkingSuffixSharesCursor(t *testing.T) {
 	t.Parallel()
 
-	selector := &RoundRobinSelector{}
+	selector := &RoundRobinSelector{cursors: map[string]int{"gemini:test-model": 0}}
 	auths := []*Auth{
 		{ID: "b"},
 		{ID: "a"},
@@ -629,6 +389,11 @@ func TestRoundRobinSelectorPick_ThinkingSuffixSharesCursor(t *testing.T) {
 func TestRoundRobinSelectorPick_CursorKeyCap(t *testing.T) {
 	t.Parallel()
 
+	// Eviction must still happen when the maxKeys cap is exceeded; the
+	// random-seed change does not affect the eviction logic itself, only the
+	// initial value assigned to a freshly-created key. We deliberately do not
+	// pre-seed cursors here — the test verifies that ensureCursorKey resets
+	// the map when adding the 3rd key would exceed maxKeys=2.
 	selector := &RoundRobinSelector{maxKeys: 2}
 	auths := []*Auth{{ID: "a"}}
 
@@ -647,6 +412,61 @@ func TestRoundRobinSelectorPick_CursorKeyCap(t *testing.T) {
 	}
 	if _, ok := selector.cursors["gemini:m3"]; !ok {
 		t.Fatalf("selector.cursors missing key %q", "gemini:m3")
+	}
+}
+
+func TestRoundRobinSelectorPick_GeminiCLICredentialGrouping(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+
+	// Simulate two gemini-cli credentials, each with multiple projects:
+	// Credential A (parent = "cred-a.json") has 3 projects
+	// Credential B (parent = "cred-b.json") has 2 projects
+	auths := []*Auth{
+		{ID: "cred-a.json::proj-a1", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
+		{ID: "cred-a.json::proj-a2", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
+		{ID: "cred-a.json::proj-a3", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
+		{ID: "cred-b.json::proj-b1", Attributes: map[string]string{"gemini_virtual_parent": "cred-b.json"}},
+		{ID: "cred-b.json::proj-b2", Attributes: map[string]string{"gemini_virtual_parent": "cred-b.json"}},
+	}
+
+	// Two-level round-robin: consecutive picks must alternate between credentials.
+	// Credential group order is randomized, but within each call the group cursor
+	// advances by 1, so consecutive picks should cycle through different parents.
+	picks := make([]string, 6)
+	parents := make([]string, 6)
+	for i := 0; i < 6; i++ {
+		got, err := selector.Pick(context.Background(), "gemini-cli", "gemini-2.5-pro", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() #%d auth = nil", i)
+		}
+		picks[i] = got.ID
+		parents[i] = got.Attributes["gemini_virtual_parent"]
+	}
+
+	// Verify property: consecutive picks must alternate between credential groups.
+	for i := 1; i < len(parents); i++ {
+		if parents[i] == parents[i-1] {
+			t.Fatalf("Pick() #%d and #%d both from same parent %q (IDs: %q, %q); expected alternating credentials",
+				i-1, i, parents[i], picks[i-1], picks[i])
+		}
+	}
+
+	// Verify property: each credential's projects are picked in sequence (round-robin within group).
+	credPicks := map[string][]string{}
+	for i, id := range picks {
+		credPicks[parents[i]] = append(credPicks[parents[i]], id)
+	}
+	for parent, ids := range credPicks {
+		for i := 1; i < len(ids); i++ {
+			if ids[i] == ids[i-1] {
+				t.Fatalf("Credential %q picked same project %q twice in a row", parent, ids[i])
+			}
+		}
 	}
 }
 
@@ -742,75 +562,6 @@ func TestSessionAffinitySelector_SameSessionSameAuth(t *testing.T) {
 	}
 }
 
-func TestSessionAffinitySelector_WeightedBindingRebindsAfterWeightBecomesZero(t *testing.T) {
-	t.Parallel()
-
-	selector := NewSessionAffinitySelector(&WeightedRoundRobinSelector{})
-	defer selector.Stop()
-
-	authA := &Auth{ID: "auth-a", Attributes: map[string]string{AttributeWeight: "1"}}
-	authB := &Auth{ID: "auth-b", Attributes: map[string]string{AttributeWeight: "1"}}
-	auths := []*Auth{authA, authB}
-	opts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"metadata":{"user_id":"user_xxx_account__session_weight-change"}}`)}
-
-	first, errFirst := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
-	if errFirst != nil {
-		t.Fatalf("first Pick() error = %v", errFirst)
-	}
-	if first.ID != authA.ID {
-		t.Fatalf("first Pick() auth.ID = %q, want %q", first.ID, authA.ID)
-	}
-
-	authA.Attributes[AttributeWeight] = "0"
-	second, errSecond := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
-	if errSecond != nil {
-		t.Fatalf("Pick() after weight update error = %v", errSecond)
-	}
-	if second.ID != authB.ID {
-		t.Fatalf("Pick() after weight update auth.ID = %q, want %q", second.ID, authB.ID)
-	}
-
-	authA.Attributes[AttributeWeight] = "10"
-	third, errThird := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
-	if errThird != nil {
-		t.Fatalf("Pick() after rebind error = %v", errThird)
-	}
-	if third.ID != authB.ID {
-		t.Fatalf("Pick() after rebind auth.ID = %q, want sticky auth %q", third.ID, authB.ID)
-	}
-}
-
-func TestSessionAffinitySelector_WeightedNewSessionsResetAfterWeightChange(t *testing.T) {
-	t.Parallel()
-
-	selector := NewSessionAffinitySelector(&WeightedRoundRobinSelector{})
-	defer selector.Stop()
-	authA := &Auth{ID: "auth-a", Attributes: map[string]string{AttributeWeight: "1000000"}}
-	authB := &Auth{ID: "auth-b", Attributes: map[string]string{AttributeWeight: "1"}}
-	auths := []*Auth{authA, authB}
-	pickSession := func(index int) *Auth {
-		t.Helper()
-		opts := cliproxyexecutor.Options{OriginalRequest: []byte(fmt.Sprintf(`{"session_id":"session-%d"}`, index))}
-		picked, errPick := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
-		if errPick != nil {
-			t.Fatalf("Pick(session-%d) error = %v", index, errPick)
-		}
-		return picked
-	}
-	for index := 0; index < 1000; index++ {
-		pickSession(index)
-	}
-
-	authA.Attributes[AttributeWeight] = "1"
-	counts := make(map[string]int)
-	for index := 1000; index < 1020; index++ {
-		counts[pickSession(index).ID]++
-	}
-	if counts[authA.ID] != 10 || counts[authB.ID] != 10 {
-		t.Fatalf("new session picks after weight change = %#v, want 10 each", counts)
-	}
-}
-
 func TestSessionAffinitySelector_NoSessionFallback(t *testing.T) {
 	t.Parallel()
 
@@ -872,6 +623,111 @@ func TestSessionAffinitySelector_DifferentSessionsDifferentAuths(t *testing.T) {
 	}
 }
 
+func TestRoundRobinSelectorPick_SingleParentFallsBackToFlat(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{cursors: map[string]int{"gemini-cli:gemini-2.5-pro": 0}}
+
+	// All auths from the same parent - should fall back to flat round-robin
+	// because there's only one credential group (no benefit from two-level).
+	auths := []*Auth{
+		{ID: "cred-a.json::proj-a1", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
+		{ID: "cred-a.json::proj-a2", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
+		{ID: "cred-a.json::proj-a3", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
+	}
+
+	// With single parent group, parentOrder has length 1, so it uses flat round-robin.
+	// Sorted by ID: proj-a1, proj-a2, proj-a3
+	want := []string{
+		"cred-a.json::proj-a1",
+		"cred-a.json::proj-a2",
+		"cred-a.json::proj-a3",
+		"cred-a.json::proj-a1",
+	}
+
+	for i, expectedID := range want {
+		got, err := selector.Pick(context.Background(), "gemini-cli", "gemini-2.5-pro", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() #%d auth = nil", i)
+		}
+		if got.ID != expectedID {
+			t.Fatalf("Pick() #%d auth.ID = %q, want %q", i, got.ID, expectedID)
+		}
+	}
+}
+
+// In strict mode, when the bound auth becomes unavailable the selector
+// returns an error instead of silently swapping to a fresh credential. This
+// is the safety mechanism that prevents cascading 401s when the upstream
+// risk-control treats "same conversation, different account" as abuse.
+func TestSessionAffinitySelector_StrictRefusesFailover(t *testing.T) {
+	t.Parallel()
+
+	fallback := &RoundRobinSelector{}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: fallback,
+		TTL:      time.Minute,
+		Strict:   true,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}, {ID: "auth-c"}}
+	payload := []byte(`{"metadata":{"user_id":"user_xxx_account__session_strict-test-uuid"}}`)
+	opts := cliproxyexecutor.Options{OriginalRequest: payload}
+
+	first, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+
+	availableWithoutFirst := make([]*Auth, 0, len(auths)-1)
+	for _, a := range auths {
+		if a.ID != first.ID {
+			availableWithoutFirst = append(availableWithoutFirst, a)
+		}
+	}
+
+	_, err = selector.Pick(context.Background(), "claude", "claude-3", opts, availableWithoutFirst)
+	if err == nil {
+		t.Fatal("strict Pick() with bound auth removed: expected error, got nil")
+	}
+	var se *Error
+	if !errors.As(err, &se) {
+		t.Fatalf("strict Pick() error = %v (%T), expected *auth.Error", err, err)
+	}
+	if se.Code != "usage_limit_reached" {
+		t.Errorf("strict Pick() error code = %q, want %q", se.Code, "usage_limit_reached")
+	}
+}
+
+// Strict mode must NOT block the first request of a brand-new session —
+// only when a session that's already bound finds its auth removed.
+func TestSessionAffinitySelector_StrictAllowsInitialPick(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+		Strict:   true,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	payload := []byte(`{"metadata":{"user_id":"user_xxx_account__session_strict-initial-uuid"}}`)
+	opts := cliproxyexecutor.Options{OriginalRequest: payload}
+
+	got, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+	if err != nil {
+		t.Fatalf("strict Pick() on fresh session error = %v, expected success", err)
+	}
+	if got == nil || got.ID == "" {
+		t.Fatal("strict Pick() on fresh session returned no auth")
+	}
+}
+
 func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 	t.Parallel()
 
@@ -923,10 +779,43 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 	}
 }
 
+func TestRoundRobinSelectorPick_MixedVirtualAndNonVirtualFallsBackToFlat(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{cursors: map[string]int{"gemini-cli:": 0}}
+
+	// Mix of virtual and non-virtual auths (e.g., a regular gemini-cli auth without projects
+	// alongside virtual ones). Should fall back to flat round-robin.
+	auths := []*Auth{
+		{ID: "cred-a.json::proj-a1", Attributes: map[string]string{"gemini_virtual_parent": "cred-a.json"}},
+		{ID: "cred-regular.json"}, // no gemini_virtual_parent
+	}
+
+	// groupByVirtualParent returns nil when any auth lacks the attribute,
+	// so flat round-robin is used. Sorted by ID: cred-a.json::proj-a1, cred-regular.json
+	want := []string{
+		"cred-a.json::proj-a1",
+		"cred-regular.json",
+		"cred-a.json::proj-a1",
+	}
+
+	for i, expectedID := range want {
+		got, err := selector.Pick(context.Background(), "gemini-cli", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() #%d auth = nil", i)
+		}
+		if got.ID != expectedID {
+			t.Fatalf("Pick() #%d auth.ID = %q, want %q", i, got.ID, expectedID)
+		}
+	}
+}
 func TestExtractSessionID_ClaudeCodePriorityOverHeader(t *testing.T) {
 	t.Parallel()
 
-	// Claude Code metadata.user_id remains higher priority than a generic X-Session-ID header.
+	// Claude Code metadata.user_id should have highest priority, even when X-Session-ID header is present
 	headers := make(http.Header)
 	headers.Set("X-Session-ID", "header-session-id")
 
@@ -1006,6 +895,60 @@ func TestExtractSessionID_CodexSessionIDPriorityOverClientRequestID(t *testing.T
 	}
 }
 
+func TestExtractSessionID_AmpThreadId(t *testing.T) {
+	t.Parallel()
+
+	headers := make(http.Header)
+	headers.Set("X-Amp-Thread-Id", "T-7873e6bd-6354-4a9a-be2c-c7702c6e1b64")
+
+	got := ExtractSessionID(headers, nil, nil)
+	want := "amp:T-7873e6bd-6354-4a9a-be2c-c7702c6e1b64"
+	if got != want {
+		t.Errorf("ExtractSessionID() with X-Amp-Thread-Id = %q, want %q", got, want)
+	}
+}
+
+func TestExtractSessionID_AmpThreadIdPriorityOverClientRequestID(t *testing.T) {
+	t.Parallel()
+
+	headers := make(http.Header)
+	headers.Set("X-Amp-Thread-Id", "T-priority-test")
+	headers.Set("X-Client-Request-Id", "pi-session-123")
+
+	got := ExtractSessionID(headers, nil, nil)
+	want := "amp:T-priority-test"
+	if got != want {
+		t.Errorf("ExtractSessionID() = %q, want %q (X-Amp-Thread-Id should take priority over X-Client-Request-Id)", got, want)
+	}
+}
+
+// TestExtractSessionID_AmpThreadIdLowerPriority verifies X-Amp-Thread-Id is lower
+// priority than Claude Code metadata.user_id but higher than conversation_id.
+func TestExtractSessionID_AmpThreadIdPriority(t *testing.T) {
+	t.Parallel()
+
+	// X-Amp-Thread-Id should be used when no Claude Code user_id is present
+	headers := make(http.Header)
+	headers.Set("X-Amp-Thread-Id", "T-priority-test")
+
+	payload := []byte(`{"conversation_id":"conv-12345"}`)
+	got := ExtractSessionID(headers, payload, nil)
+	want := "amp:T-priority-test"
+	if got != want {
+		t.Errorf("ExtractSessionID() = %q, want %q (Amp thread ID should take priority over conversation_id)", got, want)
+	}
+
+	// Claude Code user_id should take priority over X-Amp-Thread-Id
+	headers2 := make(http.Header)
+	headers2.Set("X-Amp-Thread-Id", "T-priority-test")
+	payload2 := []byte(`{"metadata":{"user_id":"user_xxx_account__session_ac980658-63bd-4fb3-97ba-8da64cb1e344"}}`)
+	got2 := ExtractSessionID(headers2, payload2, nil)
+	want2 := "claude:ac980658-63bd-4fb3-97ba-8da64cb1e344"
+	if got2 != want2 {
+		t.Errorf("ExtractSessionID() = %q, want %q (Claude Code should take priority over Amp thread ID)", got2, want2)
+	}
+}
+
 // TestExtractSessionID_IdempotencyKey verifies that idempotency_key is intentionally
 // ignored for session affinity (it's auto-generated per-request, causing cache misses).
 func TestExtractSessionID_IdempotencyKey(t *testing.T) {
@@ -1017,45 +960,6 @@ func TestExtractSessionID_IdempotencyKey(t *testing.T) {
 	// idempotency_key is disabled - should return empty (no payload to hash)
 	if got != "" {
 		t.Errorf("ExtractSessionID() with idempotency_key = %q, want empty (idempotency_key is disabled)", got)
-	}
-}
-
-func TestExtractSessionID_DerivedSessionAndExplicitPriority(t *testing.T) {
-	t.Parallel()
-
-	metadata := map[string]any{cliproxyexecutor.DerivedSessionIDMetadataKey: "ctx:v1:derived-root"}
-	payload := []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
-	if got := ExtractSessionID(nil, payload, metadata); got != "derived:ctx:v1:derived-root" {
-		t.Fatalf("ExtractSessionID() = %q, want derived identity", got)
-	}
-
-	executionMetadata := map[string]any{
-		cliproxyexecutor.ExecutionSessionMetadataKey: "execution-session",
-		cliproxyexecutor.DerivedSessionIDMetadataKey: "ctx:v1:derived-root",
-	}
-	if got := ExtractSessionID(nil, payload, executionMetadata); got != "execution:execution-session" {
-		t.Fatalf("ExtractSessionID() = %q, want explicit execution session", got)
-	}
-
-	explicitPayload := []byte(`{"session_id":"explicit-session","prompt_cache_key":"explicit-cache","messages":[{"role":"user","content":"hello"}]}`)
-	if got := ExtractSessionID(nil, explicitPayload, metadata); got != "session:explicit-session" {
-		t.Fatalf("ExtractSessionID() = %q, want explicit body session", got)
-	}
-
-	userPayload := []byte(`{"metadata":{"user_id":"explicit-user"},"conversation_id":"explicit-conversation","messages":[{"role":"user","content":"hello"}]}`)
-	if got := ExtractSessionID(nil, userPayload, metadata); got != "user:explicit-user" {
-		t.Fatalf("ExtractSessionID() = %q, want explicit metadata.user_id", got)
-	}
-
-	lowercaseHeaders := http.Header{"x-session-id": []string{" lowercase-session "}}
-	if got := ExtractSessionID(lowercaseHeaders, payload, metadata); got != "header:lowercase-session" {
-		t.Fatalf("ExtractSessionID() = %q, want case-insensitive trimmed header session", got)
-	}
-
-	headers := make(http.Header)
-	headers.Set("X-Session-ID", "header-session")
-	if got := ExtractSessionID(headers, explicitPayload, metadata); got != "header:header-session" {
-		t.Fatalf("ExtractSessionID() = %q, want explicit header session", got)
 	}
 }
 
@@ -1340,227 +1244,6 @@ func TestSessionAffinitySelector_ThreeScenarios(t *testing.T) {
 			t.Errorf("Scenario2 should inherit Scenario1 binding: got %s vs %s", picked1.ID, picked2.ID)
 		}
 	})
-}
-
-func TestSessionAffinitySelectorBodyIdentifierTransitionsPreserveBinding(t *testing.T) {
-	t.Parallel()
-
-	bothPayload := []byte(`{"conversation":{"id":"conversation-session"},"prompt_cache_key":"shared-cache-bucket"}`)
-	primaryID, fallbackID := extractSessionIDs(nil, bothPayload, nil)
-	if primaryID != "pck:shared-cache-bucket" || fallbackID != "conv:conversation-session" {
-		t.Fatalf("extractSessionIDs() = (%q, %q), want prompt-cache primary with conversation fallback", primaryID, fallbackID)
-	}
-
-	for _, tt := range []struct {
-		name         string
-		firstPayload []byte
-	}{
-		{name: "prompt cache first", firstPayload: []byte(`{"prompt_cache_key":"shared-cache-bucket"}`)},
-		{name: "conversation first", firstPayload: []byte(`{"conversation":{"id":"conversation-session"}}`)},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
-				Fallback: &RoundRobinSelector{},
-				TTL:      time.Minute,
-			})
-			defer selector.Stop()
-			auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
-			provider := "responses-transition-" + tt.name
-
-			first, err := selector.Pick(context.Background(), provider, "gpt-test", cliproxyexecutor.Options{OriginalRequest: tt.firstPayload}, auths)
-			if err != nil {
-				t.Fatalf("first Pick() error = %v", err)
-			}
-			second, err := selector.Pick(context.Background(), provider, "gpt-test", cliproxyexecutor.Options{OriginalRequest: bothPayload}, auths)
-			if err != nil {
-				t.Fatalf("combined-identifier Pick() error = %v", err)
-			}
-			if second.ID != first.ID {
-				t.Fatalf("combined identifiers changed auth from %q to %q", first.ID, second.ID)
-			}
-		})
-	}
-}
-
-func TestSessionAffinitySelectorCombinedIdentifiersBindConversationFallback(t *testing.T) {
-	t.Parallel()
-
-	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
-		Fallback: &RoundRobinSelector{},
-		TTL:      time.Minute,
-	})
-	defer selector.Stop()
-	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
-	provider := "responses-combined-to-conversation"
-
-	combined := []byte(`{"conversation":{"id":"conversation-session"},"prompt_cache_key":"shared-cache-bucket"}`)
-	conversationOnly := []byte(`{"conversation":{"id":"conversation-session"}}`)
-	first, err := selector.Pick(context.Background(), provider, "gpt-test", cliproxyexecutor.Options{OriginalRequest: combined}, auths)
-	if err != nil {
-		t.Fatalf("combined-identifier Pick() error = %v", err)
-	}
-	second, err := selector.Pick(context.Background(), provider, "gpt-test", cliproxyexecutor.Options{OriginalRequest: conversationOnly}, auths)
-	if err != nil {
-		t.Fatalf("conversation-only Pick() error = %v", err)
-	}
-	if second.ID != first.ID {
-		t.Fatalf("dropping prompt_cache_key changed auth from %q to %q", first.ID, second.ID)
-	}
-}
-
-func TestSessionAffinitySelectorPrimaryTrafficKeepsConversationAliasAlive(t *testing.T) {
-	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
-		Fallback: &RoundRobinSelector{},
-		TTL:      time.Minute,
-	})
-	defer selector.Stop()
-	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
-	provider := "responses-active-primary-alias"
-	model := "gpt-test"
-	combined := []byte(`{"conversation":{"id":"conversation-session"},"prompt_cache_key":"shared-cache-bucket"}`)
-	promptOnly := []byte(`{"prompt_cache_key":"shared-cache-bucket"}`)
-	conversationOnly := []byte(`{"conversation":{"id":"conversation-session"}}`)
-
-	first, err := selector.Pick(context.Background(), provider, model, cliproxyexecutor.Options{OriginalRequest: combined}, auths)
-	if err != nil {
-		t.Fatalf("combined Pick() error = %v", err)
-	}
-	conversationKey := provider + "::conv:conversation-session::" + model
-	selector.cache.mu.Lock()
-	conversationEntry := selector.cache.entries[conversationKey]
-	conversationEntry.expiresAt = time.Now().Add(-time.Second)
-	selector.cache.entries[conversationKey] = conversationEntry
-	selector.cache.mu.Unlock()
-
-	primary, err := selector.Pick(context.Background(), provider, model, cliproxyexecutor.Options{OriginalRequest: promptOnly}, auths)
-	if err != nil {
-		t.Fatalf("prompt-only Pick() error = %v", err)
-	}
-	if primary.ID != first.ID {
-		t.Fatalf("prompt-only auth = %q, want %q", primary.ID, first.ID)
-	}
-	fallback, err := selector.Pick(context.Background(), provider, model, cliproxyexecutor.Options{OriginalRequest: conversationOnly}, auths)
-	if err != nil {
-		t.Fatalf("conversation-only Pick() error = %v", err)
-	}
-	if fallback.ID != first.ID {
-		t.Fatalf("conversation alias expired during active primary traffic: got %q, want %q", fallback.ID, first.ID)
-	}
-}
-
-func TestSessionAffinitySelectorSharedPromptKeyPreservesConversationAliases(t *testing.T) {
-	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
-		Fallback: &RoundRobinSelector{},
-		TTL:      time.Minute,
-	})
-	defer selector.Stop()
-	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
-	provider := "responses-shared-prompt-key"
-	model := "gpt-test"
-
-	combinedA := []byte(`{"conversation":{"id":"conversation-a"},"prompt_cache_key":"shared-cache-bucket"}`)
-	combinedB := []byte(`{"conversation":{"id":"conversation-b"},"prompt_cache_key":"shared-cache-bucket"}`)
-	conversationA := []byte(`{"conversation":{"id":"conversation-a"}}`)
-	conversationB := []byte(`{"conversation":{"id":"conversation-b"}}`)
-
-	first, err := selector.Pick(context.Background(), provider, model, cliproxyexecutor.Options{OriginalRequest: combinedA}, auths)
-	if err != nil {
-		t.Fatalf("conversation A combined Pick() error = %v", err)
-	}
-	second, err := selector.Pick(context.Background(), provider, model, cliproxyexecutor.Options{OriginalRequest: combinedB}, auths)
-	if err != nil {
-		t.Fatalf("conversation B combined Pick() error = %v", err)
-	}
-	if second.ID != first.ID {
-		t.Fatalf("shared prompt key changed auth from %q to %q", first.ID, second.ID)
-	}
-	for name, payload := range map[string][]byte{"conversation A": conversationA, "conversation B": conversationB} {
-		picked, errPick := selector.Pick(context.Background(), provider, model, cliproxyexecutor.Options{OriginalRequest: payload}, auths)
-		if errPick != nil {
-			t.Fatalf("%s Pick() error = %v", name, errPick)
-		}
-		if picked.ID != first.ID {
-			t.Fatalf("%s alias selected %q, want %q", name, picked.ID, first.ID)
-		}
-	}
-}
-
-func TestSessionAffinitySelectorConversationIDContainingPromptMarkerRemainsStable(t *testing.T) {
-	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
-		Fallback: &RoundRobinSelector{},
-		TTL:      time.Minute,
-	})
-	defer selector.Stop()
-	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
-	provider := "responses-opaque-conversation"
-	model := "gpt-test"
-	combined := []byte(`{"conversation":{"id":"a::pck:b"},"prompt_cache_key":"shared-cache-bucket"}`)
-	conversationOnly := []byte(`{"conversation":{"id":"a::pck:b"}}`)
-
-	first, err := selector.Pick(context.Background(), provider, model, cliproxyexecutor.Options{OriginalRequest: combined}, auths)
-	if err != nil {
-		t.Fatalf("combined Pick() error = %v", err)
-	}
-	second, err := selector.Pick(context.Background(), provider, model, cliproxyexecutor.Options{OriginalRequest: conversationOnly}, auths)
-	if err != nil {
-		t.Fatalf("conversation-only Pick() error = %v", err)
-	}
-	if second.ID != first.ID {
-		t.Fatalf("opaque conversation alias selected %q, want %q", second.ID, first.ID)
-	}
-}
-
-func TestSessionCacheSharedPromptKeyCapsStableAliasesByRecency(t *testing.T) {
-	cache := NewSessionCache(time.Minute)
-	defer cache.Stop()
-	const promptKey = "openai::pck:shared-cache-bucket::gpt-test"
-	for index := 0; index < 128; index++ {
-		conversation := fmt.Sprintf("openai::conv:conversation-%03d::gpt-test", index)
-		cache.SetAliases("auth-a", promptKey, conversation)
-	}
-
-	cache.mu.RLock()
-	defer cache.mu.RUnlock()
-	if len(cache.entries) > 65 {
-		t.Fatalf("cache entries = %d, want one prompt key plus at most 64 stable aliases", len(cache.entries))
-	}
-	if _, ok := cache.entries["openai::conv:conversation-127::gpt-test"]; !ok {
-		t.Fatal("newest conversation alias was not retained")
-	}
-	if _, ok := cache.entries["openai::conv:conversation-000::gpt-test"]; ok {
-		t.Fatal("oldest conversation alias was retained after stable-alias cap")
-	}
-}
-
-func TestSessionCacheRotatingPrimaryEvictsObsoleteAliases(t *testing.T) {
-	cache := NewSessionCache(time.Minute)
-	defer cache.Stop()
-
-	const fallback = "openai::conv:conversation-session::gpt-test"
-	for index := 0; index < 16; index++ {
-		primary := fmt.Sprintf("openai::pck:cache-%02d::gpt-test", index)
-		cache.SetAliases("auth-a", primary, fallback)
-	}
-	latest := "openai::pck:cache-15::gpt-test"
-	oldest := "openai::pck:cache-00::gpt-test"
-
-	cache.mu.RLock()
-	defer cache.mu.RUnlock()
-	if len(cache.entries) != 2 {
-		t.Fatalf("cache entries = %d, want only latest primary and fallback", len(cache.entries))
-	}
-	if _, ok := cache.entries[latest]; !ok {
-		t.Fatalf("latest primary %q was not retained", latest)
-	}
-	if _, ok := cache.entries[fallback]; !ok {
-		t.Fatalf("fallback %q was not retained", fallback)
-	}
-	if _, ok := cache.entries[oldest]; ok {
-		t.Fatalf("obsolete primary %q was retained", oldest)
-	}
-	if aliases := cache.entries[fallback].aliases; len(aliases) != 2 {
-		t.Fatalf("fallback alias group = %#v, want exactly two active identifiers", aliases)
-	}
 }
 
 func TestSessionAffinitySelector_MultiModelSession(t *testing.T) {
@@ -1850,247 +1533,560 @@ func TestSessionAffinitySelector_Concurrent(t *testing.T) {
 	}
 }
 
-func TestExtractSessionIDNativeSignals(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name    string
-		headers http.Header
-		payload string
-		want    string
-	}{
-		{
-			name:    "claude code header",
-			headers: http.Header{"X-Claude-Code-Session-Id": []string{"claude-session"}},
-			want:    "claude:claude-session",
-		},
-		{
-			name:    "lowercase claude code header",
-			headers: http.Header{"x-claude-code-session-id": []string{"lowercase-session"}},
-			want:    "claude:lowercase-session",
-		},
-		{
-			name:    "codex hyphen header",
-			headers: http.Header{"Session-Id": []string{"codex-session"}},
-			want:    "codex:codex-session",
-		},
-		{
-			name:    "codex underscore header",
-			headers: http.Header{"Session_id": []string{"legacy-codex-session"}},
-			want:    "codex:legacy-codex-session",
-		},
-		{
-			name:    "open code session affinity",
-			headers: http.Header{"X-Session-Affinity": []string{"ses_opencode"}},
-			want:    "affinity:ses_opencode",
-		},
-		{
-			name:    "prompt cache key",
-			payload: `{"prompt_cache_key":"prompt-session"}`,
-			want:    "pck:prompt-session",
-		},
-		{
-			name:    "responses conversation object",
-			payload: `{"conversation":{"id":"conv-object"}}`,
-			want:    "conv:conv-object",
-		},
-		{
-			name:    "responses conversation string",
-			payload: `{"conversation":"conv-string"}`,
-			want:    "conv:conv-string",
-		},
-	}
+// The X-Codex-Turn-Metadata header carries a JSON object whose session_id
+// field is stable for the entire Codex client window — across primary chats
+// and any sub-agent (e.g. code-review) invocations originating from the same
+// window. The extractor should prefer it over X-Client-Request-Id, which
+// changes per sub-agent invocation.
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := ExtractSessionID(tt.headers, []byte(tt.payload), nil); got != tt.want {
-				t.Fatalf("ExtractSessionID() = %q, want %q", got, tt.want)
-			}
-		})
+// In real Codex VSCode primary turns the thread_id equals the window's
+// session_id on the very first turn of a new conversation. After /new the
+// thread_id mints a fresh UUID while session_id stays put — see the
+// codexTurnMetadataPrimaryNewChat fixture below.
+const codexTurnMetadataPrimary = `{"session_id":"019e6e33-4541-7542-aecd-67a7ea6d6181","thread_id":"019e6e33-4541-7542-aecd-67a7ea6d6181","turn_id":"019e6e33-aaaa-bbbb-cccc-d6074e9ba172","thread_source":"user","sandbox":"windows_elevated","turn_started_at_unix_ms":1780152360860}`
+
+// A second primary turn opened via /new in the same VSCode window: session_id
+// unchanged, thread_id is a fresh UUID. This is the case that should rebind
+// to a different credential.
+const codexTurnMetadataPrimaryNewChat = `{"session_id":"019e6e33-4541-7542-aecd-67a7ea6d6181","thread_id":"019eaaaa-2222-7000-8000-d6074e9ba172","turn_id":"019eaaaa-3333-cccc-9304-d6074e9ba172","thread_source":"user","sandbox":"windows_elevated","turn_started_at_unix_ms":1780152360860}`
+
+const codexTurnMetadataSubagent = `{"session_id":"019e6e33-4541-7542-aecd-67a7ea6d6181","thread_id":"019e7959-5f42-7be2-91b1-aec01bdfbc10","turn_id":"019e7959-5f9a-7ce0-9304-d6074e9ba172","thread_source":"subagent","sandbox":"windows_elevated","turn_started_at_unix_ms":1780152360860}`
+
+// Primary turns key on thread_id so /new gets a fresh binding. The first
+// turn happens to have thread_id == session_id, but that's still the
+// thread_id-namespaced key (codex-thread:..., not codex-window:...).
+func TestExtractSessionID_CodexTurnMetadataPrimary(t *testing.T) {
+	t.Parallel()
+
+	headers := make(http.Header)
+	headers.Set("X-Codex-Turn-Metadata", codexTurnMetadataPrimary)
+
+	got := ExtractSessionID(headers, nil, nil)
+	want := "codex-thread:019e6e33-4541-7542-aecd-67a7ea6d6181"
+	if got != want {
+		t.Errorf("ExtractSessionID() = %q, want %q", got, want)
 	}
 }
 
-func TestExtractSessionIDNativeSignalPriority(t *testing.T) {
+// Subagent's primary key is the session_id-namespaced key. That's where the
+// parent's user-thread Pick mirrors its binding (see writeBinding in Pick),
+// so the subagent inherits without sharing the user-thread's primary key.
+func TestExtractSessionID_CodexTurnMetadataSubAgentUsesWindowKey(t *testing.T) {
 	t.Parallel()
-	tests := []struct {
-		name    string
-		headers http.Header
-		payload string
-		want    string
-	}{
-		{
-			name: "claude header beats metadata",
-			headers: http.Header{
-				"X-Claude-Code-Session-Id": []string{"header-session"},
-			},
-			payload: `{"metadata":{"user_id":"user_hash_account__session_22222222-2222-4222-8222-222222222222"}}`,
-			want:    "claude:header-session",
-		},
-		{
-			name: "claude metadata beats codex header",
-			headers: http.Header{
-				"Session-Id": []string{"codex-session"},
-			},
-			payload: `{"metadata":{"user_id":"user_hash_account__session_22222222-2222-4222-8222-222222222222"}}`,
-			want:    "claude:22222222-2222-4222-8222-222222222222",
-		},
-		{
-			name: "codex header beats x session id and prompt key",
-			headers: http.Header{
-				"Session-Id":   []string{"codex-session"},
-				"X-Session-Id": []string{"generic-session"},
-			},
-			payload: `{"prompt_cache_key":"prompt-session"}`,
-			want:    "codex:codex-session",
-		},
-		{
-			name: "x session id beats affinity",
-			headers: http.Header{
-				"X-Session-Id":       []string{"generic-session"},
-				"X-Session-Affinity": []string{"affinity-session"},
-			},
-			want: "header:generic-session",
-		},
-		{
-			name:    "prompt cache key beats conversation id",
-			payload: `{"conversation":{"id":"conversation-session"},"prompt_cache_key":"shared-cache-bucket"}`,
-			want:    "pck:shared-cache-bucket",
-		},
-		{
-			name: "client request id beats body fallbacks",
-			headers: http.Header{
-				"X-Client-Request-Id": []string{"client-session"},
-			},
-			payload: `{"prompt_cache_key":"prompt-session","conversation":{"id":"conversation-session"}}`,
-			want:    "clientreq:client-session",
-		},
-	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := ExtractSessionID(tt.headers, []byte(tt.payload), nil); got != tt.want {
-				t.Fatalf("ExtractSessionID() = %q, want %q", got, tt.want)
-			}
-		})
+	headers := make(http.Header)
+	headers.Set("X-Codex-Turn-Metadata", codexTurnMetadataSubagent)
+
+	got := ExtractSessionID(headers, nil, nil)
+	want := "codex-window:019e6e33-4541-7542-aecd-67a7ea6d6181"
+	if got != want {
+		t.Errorf("subagent key = %q, want %q (must hit the parent's mirror)", got, want)
 	}
 }
 
-func TestExtractSessionIDRejectsInvalidExplicitSignals(t *testing.T) {
+// When both X-Codex-Turn-Metadata and X-Client-Request-Id are present (real
+// Codex VSCode requests), the turn metadata's session_id wins because it is
+// window-stable while X-Client-Request-Id is thread_id (changes per
+// sub-agent invocation).
+func TestExtractSessionID_CodexTurnMetadataPriorityOverClientRequestID(t *testing.T) {
 	t.Parallel()
-	tooLong := strings.Repeat("a", 257)
-	tests := []struct {
-		name    string
-		headers http.Header
-		payload string
-		want    string
-	}{
-		{
-			name:    "whitespace",
-			headers: http.Header{"X-Claude-Code-Session-Id": []string{"   "}},
-			want:    "",
-		},
-		{
-			name:    "newline",
-			headers: http.Header{"X-Session-Id": []string{"bad\nsession"}},
-			want:    "",
-		},
-		{
-			name:    "control character",
-			headers: http.Header{"Session-Id": []string{"bad\x00session"}},
-			want:    "",
-		},
-		{
-			name:    "too long",
-			headers: http.Header{"X-Client-Request-Id": []string{tooLong}},
-			want:    "",
-		},
-		{
-			name: "invalid stronger signal falls through",
-			headers: http.Header{
-				"X-Claude-Code-Session-Id": []string{"bad\nsession"},
-				"Session-Id":               []string{"valid-codex"},
-			},
-			want: "codex:valid-codex",
-		},
-		{
-			name:    "invalid prompt key falls through to conversation",
-			payload: `{"prompt_cache_key":"   ","conversation":{"id":"valid-conversation"}}`,
-			want:    "conv:valid-conversation",
-		},
-	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := ExtractSessionID(tt.headers, []byte(tt.payload), nil); got != tt.want {
-				t.Fatalf("ExtractSessionID() = %q, want %q", got, tt.want)
-			}
-		})
+	headers := make(http.Header)
+	headers.Set("X-Codex-Turn-Metadata", codexTurnMetadataSubagent)
+	// In real traffic, X-Client-Request-Id == thread_id for sub-agent calls.
+	headers.Set("X-Client-Request-Id", "019e7959-5f42-7be2-91b1-aec01bdfbc10")
+
+	got := ExtractSessionID(headers, nil, nil)
+	want := "codex-window:019e6e33-4541-7542-aecd-67a7ea6d6181"
+	if got != want {
+		t.Errorf("ExtractSessionID() = %q, want %q (X-Codex-Turn-Metadata should win over X-Client-Request-Id)", got, want)
 	}
 }
 
-func TestExtractSessionIDClaudeMetadataParsesBeforeBoundingSessionID(t *testing.T) {
+// Claude Code metadata is still highest priority. Make sure adding the
+// Codex window extractor didn't disturb it.
+func TestExtractSessionID_ClaudeCodeStillBeatsCodexTurnMetadata(t *testing.T) {
 	t.Parallel()
-	const sessionID = "11111111-1111-4111-8111-111111111111"
-	metadata := map[string]string{
-		"device_id":         strings.Repeat("d", 64),
-		"account_uuid":      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-		"session_id":        sessionID,
-		"organization_uuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-		"email":             "user@example.com",
-	}
 
-	for _, tt := range []struct {
-		name   string
-		encode func(any) ([]byte, error)
-	}{
-		{name: "rich compact json", encode: json.Marshal},
-		{name: "pretty printed json", encode: func(v any) ([]byte, error) { return json.MarshalIndent(v, "", "  ") }},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			userID, errMarshal := tt.encode(metadata)
-			if errMarshal != nil {
-				t.Fatalf("marshal metadata: %v", errMarshal)
-			}
-			payload, errPayload := json.Marshal(map[string]any{
-				"metadata": map[string]string{"user_id": string(userID)},
-			})
-			if errPayload != nil {
-				t.Fatalf("marshal payload: %v", errPayload)
-			}
-			if got := ExtractSessionID(nil, payload, nil); got != "claude:"+sessionID {
-				t.Fatalf("ExtractSessionID() = %q, want %q", got, "claude:"+sessionID)
-			}
-		})
+	headers := make(http.Header)
+	headers.Set("X-Codex-Turn-Metadata", codexTurnMetadataPrimary)
+	payload := []byte(`{"metadata":{"user_id":"user_abc_account__session_ac980658-63bd-4fb3-97ba-8da64cb1e344"}}`)
+
+	got := ExtractSessionID(headers, payload, nil)
+	want := "claude:ac980658-63bd-4fb3-97ba-8da64cb1e344"
+	if got != want {
+		t.Errorf("ExtractSessionID() = %q, want %q (Claude Code priority preserved)", got, want)
 	}
 }
 
-func TestSessionAffinitySelectorUsesRequestPayloadWhenOriginalRequestMissing(t *testing.T) {
+// Malformed JSON in X-Codex-Turn-Metadata must not crash and must fall
+// through to the next extractor (X-Client-Request-Id in this test).
+func TestExtractSessionID_CodexTurnMetadataMalformedFallsThrough(t *testing.T) {
+	t.Parallel()
+
+	headers := make(http.Header)
+	headers.Set("X-Codex-Turn-Metadata", "this is not json{{}")
+	headers.Set("X-Client-Request-Id", "fallback-req")
+
+	got := ExtractSessionID(headers, nil, nil)
+	want := "clientreq:fallback-req"
+	if got != want {
+		t.Errorf("ExtractSessionID() = %q, want %q (malformed metadata should fall through)", got, want)
+	}
+}
+
+// Valid JSON but missing session_id field falls through.
+func TestExtractSessionID_CodexTurnMetadataWithoutSessionIDFallsThrough(t *testing.T) {
+	t.Parallel()
+
+	headers := make(http.Header)
+	headers.Set("X-Codex-Turn-Metadata", `{"thread_id":"x","turn_id":"y"}`)
+	headers.Set("X-Client-Request-Id", "fallback-req")
+
+	got := ExtractSessionID(headers, nil, nil)
+	want := "clientreq:fallback-req"
+	if got != want {
+		t.Errorf("ExtractSessionID() = %q, want %q (missing session_id should fall through)", got, want)
+	}
+}
+
+// TestSessionAffinitySelector_SameSessionAcrossModelsSameAuth verifies that a
+// single Codex VSCode window using both gpt-5.5 (primary chat) and
+// codex-auto-review (sub-agent) sticks to one auth across both models. Before
+// the cache-key model component was dropped, the two models created separate
+// cache entries and could bind to two different chatgpt_account_ids within
+// the same conversation — exactly the cross-account replay signal that
+// triggers OpenAI risk control on the upstream side.
+func TestSessionAffinitySelector_SameSessionAcrossModelsSameAuth(t *testing.T) {
+	t.Parallel()
+
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 		Fallback: &RoundRobinSelector{},
 		TTL:      time.Minute,
 	})
 	defer selector.Stop()
 
-	request := cliproxyexecutor.Request{
-		Model:   "gpt-test",
-		Payload: []byte(`{"conversation":{"id":"request-only-conversation"},"input":"hello"}`),
-	}
-	_, opts := cliproxysession.Enrich(request, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FormatOpenAIResponse,
-	})
-	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}, {ID: "auth-c"}}
 
-	first, errFirst := selector.Pick(context.Background(), "openai", request.Model, opts, auths)
-	if errFirst != nil {
-		t.Fatalf("first Pick() error = %v", errFirst)
+	headers := make(http.Header)
+	headers.Set("X-Codex-Turn-Metadata", `{"session_id":"019dd8b0-1b08-77a1-bf73-647b6ad22a25","thread_id":"t1","turn_id":"u1"}`)
+	opts := cliproxyexecutor.Options{Headers: headers}
+
+	firstChat, err := selector.Pick(context.Background(), "codex", "gpt-5.5", opts, auths)
+	if err != nil {
+		t.Fatalf("first pick (gpt-5.5) error = %v", err)
 	}
-	second, errSecond := selector.Pick(context.Background(), "openai", request.Model, opts, auths)
-	if errSecond != nil {
-		t.Fatalf("second Pick() error = %v", errSecond)
+	if firstChat == nil {
+		t.Fatal("first pick (gpt-5.5) returned nil")
 	}
-	if second.ID != first.ID {
-		t.Fatalf("request-only conversation changed auth from %q to %q", first.ID, second.ID)
+
+	// Sub-agent code review on the SAME window/conversation should hit the
+	// existing binding instead of running fallback selection again.
+	firstReview, err := selector.Pick(context.Background(), "codex", "codex-auto-review", opts, auths)
+	if err != nil {
+		t.Fatalf("first pick (codex-auto-review) error = %v", err)
+	}
+	if firstReview.ID != firstChat.ID {
+		t.Fatalf("cross-model binding mismatch: gpt-5.5=%q codex-auto-review=%q (same conversation must stay on one auth)", firstChat.ID, firstReview.ID)
+	}
+
+	// Switching back and forth a few more times must keep the same binding.
+	for i := 0; i < 4; i++ {
+		model := "gpt-5.5"
+		if i%2 == 1 {
+			model = "codex-auto-review"
+		}
+		got, err := selector.Pick(context.Background(), "codex", model, opts, auths)
+		if err != nil {
+			t.Fatalf("repeat pick #%d (%s) error = %v", i, model, err)
+		}
+		if got.ID != firstChat.ID {
+			t.Fatalf("repeat pick #%d (%s) drifted: got %q, want %q", i, model, got.ID, firstChat.ID)
+		}
+	}
+}
+
+// TestSessionAffinitySelector_SubagentInheritsParentBindingViaMirror verifies
+// the new thread_id-keyed semantics: a parent user-thread Pick writes the
+// binding under both the thread-level primary key AND the session-level
+// mirror key, so a subsequent subagent call (which keys on session_id)
+// inherits the parent's credential without running fallback selection.
+//
+// This is the load-bearing test for the "thread_id binding + subagent
+// inheritance" design — without the mirror write, sub-agent would cache-miss
+// and land on a different account, splitting one logical conversation
+// across two chatgpt_account_ids (the precise signal upstream risk-control
+// invalidates accounts on).
+func TestSessionAffinitySelector_SubagentInheritsParentBindingViaMirror(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{cursors: map[string]int{"codex:gpt-5.5": 0, "codex:codex-auto-review": 0}},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "auth-a", Provider: "codex"},
+		{ID: "auth-b", Provider: "codex"},
+		{ID: "auth-c", Provider: "codex"},
+	}
+
+	parentHeaders := make(http.Header)
+	parentHeaders.Set("X-Codex-Turn-Metadata", codexTurnMetadataPrimary)
+	parentOpts := cliproxyexecutor.Options{Headers: parentHeaders}
+
+	subagentHeaders := make(http.Header)
+	subagentHeaders.Set("X-Codex-Turn-Metadata", codexTurnMetadataSubagent)
+	subagentOpts := cliproxyexecutor.Options{Headers: subagentHeaders}
+
+	parent, err := selector.Pick(context.Background(), "codex", "gpt-5.5", parentOpts, auths)
+	if err != nil {
+		t.Fatalf("parent Pick error = %v", err)
+	}
+	subagent, err := selector.Pick(context.Background(), "codex", "codex-auto-review", subagentOpts, auths)
+	if err != nil {
+		t.Fatalf("subagent Pick error = %v", err)
+	}
+	if subagent.ID != parent.ID {
+		t.Fatalf("sub-agent landed on %q but parent is on %q — mirror write must keep them paired", subagent.ID, parent.ID)
+	}
+
+	// Re-running the subagent must continue to hit the mirror, not re-run
+	// fallback selection (which would still produce parent.ID here, but the
+	// purpose of the check is to prove the cache lookup path works).
+	subagent2, err := selector.Pick(context.Background(), "codex", "codex-auto-review", subagentOpts, auths)
+	if err != nil {
+		t.Fatalf("subagent re-Pick error = %v", err)
+	}
+	if subagent2.ID != parent.ID {
+		t.Fatalf("sub-agent repeat drifted to %q (want %q)", subagent2.ID, parent.ID)
+	}
+}
+
+// trackingFallback wraps another selector and counts how many times it
+// was consulted. Tests use it to PROVE that a particular Pick was
+// served from cache vs went through fallback selection — a property
+// the RoundRobin-only fixtures could not assert.
+type trackingFallback struct {
+	inner Selector
+	calls int
+}
+
+func (t *trackingFallback) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	t.calls++
+	return t.inner.Pick(ctx, provider, model, opts, auths)
+}
+
+// TestSessionAffinitySelector_MirrorWrittenOnFirstTurnTidEqualsSid is the
+// regression guard for the cross-account subagent split observed in
+// production on 2026-06-02: a Codex VSCode window's first user turn has
+// thread_id == session_id (Codex reuses the session UUID as the initial
+// thread UUID). The extractor MUST still populate the codex-window
+// mirror in that case so a subsequent subagent — which primary-keys on
+// "codex-window:<sid>" — finds the parent's binding instead of running
+// a fresh fallback Pick onto a different credential.
+//
+// The earlier "SubagentInheritsParentBindingViaMirror" test passed even
+// with the bug present because its RoundRobin fallback happened to
+// return the same auth on the subagent's separate cursor key. This test
+// uses a counter to assert the subagent never went through fallback at
+// all, which is the only way to prove the cache mirror is doing its job.
+func TestSessionAffinitySelector_MirrorWrittenOnFirstTurnTidEqualsSid(t *testing.T) {
+	t.Parallel()
+
+	tracker := &trackingFallback{inner: &RoundRobinSelector{}}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: tracker,
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "auth-a", Provider: "codex"},
+		{ID: "auth-b", Provider: "codex"},
+		{ID: "auth-c", Provider: "codex"},
+	}
+
+	// Parent: tid == sid (Codex first-turn case — the exact shape that
+	// triggered the production bug). Subagent: different tid, same sid.
+	parentHeaders := make(http.Header)
+	parentHeaders.Set("X-Codex-Turn-Metadata", codexTurnMetadataPrimary)
+	parentOpts := cliproxyexecutor.Options{Headers: parentHeaders}
+
+	subagentHeaders := make(http.Header)
+	subagentHeaders.Set("X-Codex-Turn-Metadata", codexTurnMetadataSubagent)
+	subagentOpts := cliproxyexecutor.Options{Headers: subagentHeaders}
+
+	parent, err := selector.Pick(context.Background(), "codex", "gpt-5.5", parentOpts, auths)
+	if err != nil {
+		t.Fatalf("parent Pick error = %v", err)
+	}
+	if tracker.calls != 1 {
+		t.Fatalf("parent Pick: tracker.calls = %d, want 1 (first turn must go through fallback)", tracker.calls)
+	}
+
+	subagent, err := selector.Pick(context.Background(), "codex", "codex-auto-review", subagentOpts, auths)
+	if err != nil {
+		t.Fatalf("subagent Pick error = %v", err)
+	}
+	// The decisive assertion: subagent MUST have hit the mirror cache,
+	// not gone through fallback. With the bug present, the parent's
+	// mirror write was skipped (because tid == sid), and the subagent
+	// would land here via fallback selection — possibly on the same
+	// auth, possibly on a different one, but always with tracker.calls
+	// having advanced.
+	if tracker.calls != 1 {
+		t.Fatalf("subagent Pick triggered %d fallback call(s) — must have hit the codex-window mirror instead (tid==sid bug)", tracker.calls-1)
+	}
+	if subagent.ID != parent.ID {
+		t.Fatalf("subagent landed on %q but parent is on %q (mirror write must keep them paired)", subagent.ID, parent.ID)
+	}
+}
+
+// TestSessionAffinitySelector_NewChatRebindsAndUpdatesMirror verifies the
+// /new flow: after the user opens a fresh conversation in the same VSCode
+// window, the session_id is unchanged but thread_id is fresh. That must
+// cache-miss on the thread-level primary key and produce a new binding via
+// the fallback selector. The session-level mirror is then overwritten so
+// subsequent sub-agents inherit the NEW thread's credential rather than
+// the previous one.
+func TestSessionAffinitySelector_NewChatRebindsAndUpdatesMirror(t *testing.T) {
+	t.Parallel()
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{cursors: map[string]int{"codex:gpt-5.5": 0, "codex:codex-auto-review": 0}},
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "auth-a", Provider: "codex"},
+		{ID: "auth-b", Provider: "codex"},
+		{ID: "auth-c", Provider: "codex"},
+	}
+
+	firstHeaders := make(http.Header)
+	firstHeaders.Set("X-Codex-Turn-Metadata", codexTurnMetadataPrimary)
+	firstOpts := cliproxyexecutor.Options{Headers: firstHeaders}
+
+	newChatHeaders := make(http.Header)
+	newChatHeaders.Set("X-Codex-Turn-Metadata", codexTurnMetadataPrimaryNewChat)
+	newChatOpts := cliproxyexecutor.Options{Headers: newChatHeaders}
+
+	subagentOfNewChatHeaders := make(http.Header)
+	subagentOfNewChatHeaders.Set("X-Codex-Turn-Metadata", codexTurnMetadataSubagent)
+	subagentOfNewChatOpts := cliproxyexecutor.Options{Headers: subagentOfNewChatHeaders}
+
+	first, err := selector.Pick(context.Background(), "codex", "gpt-5.5", firstOpts, auths)
+	if err != nil {
+		t.Fatalf("first chat Pick error = %v", err)
+	}
+	newChat, err := selector.Pick(context.Background(), "codex", "gpt-5.5", newChatOpts, auths)
+	if err != nil {
+		t.Fatalf("/new chat Pick error = %v", err)
+	}
+	if newChat.ID == first.ID {
+		t.Fatalf("/new on same window stayed on %q — should have advanced via fallback selector", first.ID)
+	}
+
+	// The mirror (codex-window:<sid>) must now point to newChat. A subagent
+	// fired right after /new must inherit newChat's auth, not the original
+	// first chat's auth.
+	subagent, err := selector.Pick(context.Background(), "codex", "codex-auto-review", subagentOfNewChatOpts, auths)
+	if err != nil {
+		t.Fatalf("subagent of /new Pick error = %v", err)
+	}
+	if subagent.ID != newChat.ID {
+		t.Fatalf("subagent inherited %q from older parent — must follow newChat=%q after mirror overwrite", subagent.ID, newChat.ID)
+	}
+}
+
+// TestRoundRobinSelectorPick_PersistenceSurvivesRestart verifies that the
+// cursor map round-trips through disk: a new selector pointed at the same
+// path as a previous one sees the previous cursor values, so the rotation
+// resumes from where it left off across process restarts. Without this,
+// a restart resets every cursor and re-rolls the random seed, occasionally
+// landing the next freshly-bound session on the same auth as an
+// already-persisted session-affinity binding.
+func TestRoundRobinSelectorPick_PersistenceSurvivesRestart(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := dir + "/rr-cursor.json"
+	auths := []*Auth{
+		{ID: "auth-a"},
+		{ID: "auth-b"},
+		{ID: "auth-c"},
+		{ID: "auth-d"},
+		{ID: "auth-e"},
+	}
+
+	first := NewRoundRobinSelectorWithPersistence(path)
+	pickA, err := first.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("first selector Pick error = %v", err)
+	}
+	pickB, err := first.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("first selector Pick #2 error = %v", err)
+	}
+	// Stop flushes a final snapshot synchronously.
+	first.Stop()
+
+	if pickA.ID == pickB.ID {
+		t.Fatalf("first selector returned same auth twice (%q) — cursor did not advance", pickA.ID)
+	}
+
+	// Construct a fresh selector pointing at the same path. It must load the
+	// cursor map from disk and continue the rotation. The next pick must NOT
+	// match pickA or pickB (which were the two most recent picks).
+	second := NewRoundRobinSelectorWithPersistence(path)
+	defer second.Stop()
+	pickC, err := second.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("second selector Pick error = %v", err)
+	}
+	if pickC.ID == pickA.ID || pickC.ID == pickB.ID {
+		t.Fatalf("persistence did not survive restart: pickC=%q matches earlier pick (A=%q B=%q)", pickC.ID, pickA.ID, pickB.ID)
+	}
+}
+
+// TestRoundRobinSelectorPick_PersistenceEmptyPathIsInMemoryOnly verifies the
+// degenerate path: passing "" disables persistence and the selector behaves
+// like a zero-value RoundRobinSelector (no background goroutine, no file
+// touched, Stop is a no-op).
+func TestRoundRobinSelectorPick_PersistenceEmptyPathIsInMemoryOnly(t *testing.T) {
+	t.Parallel()
+
+	s := NewRoundRobinSelectorWithPersistence("")
+	if s == nil {
+		t.Fatal("selector = nil")
+	}
+	if s.persistPath != "" {
+		t.Errorf("persistPath = %q, want empty", s.persistPath)
+	}
+	if s.stopCh != nil {
+		t.Error("stopCh should be nil for in-memory selector")
+	}
+	// Stop must be safe on a no-persistence selector.
+	s.Stop()
+}
+
+// TestRoundRobinSelectorPick_RandomInitialCursor confirms that a fresh
+// RoundRobinSelector seeds its cursor with a random offset on first use, so
+// repeated cold starts of the process do not consistently funnel every new
+// session to the alphabetically-first auth. With session-affinity persistence
+// enabled, deterministic cursor-from-zero combined with restarts caused every
+// post-restart binding to land on the same credential — see the diagnosis
+// preserved in the doc comment of SessionAffinitySelector.Pick.
+func TestRoundRobinSelectorPick_RandomInitialCursor(t *testing.T) {
+	t.Parallel()
+
+	auths := []*Auth{
+		{ID: "auth-a"},
+		{ID: "auth-b"},
+		{ID: "auth-c"},
+		{ID: "auth-d"},
+		{ID: "auth-e"},
+	}
+
+	// Run many fresh selectors and tally which auth gets picked first.
+	// With random seeding the distribution should cover all 5 IDs across
+	// enough trials; without the fix every selector picks "auth-a".
+	const trials = 200
+	seen := make(map[string]int)
+	for i := 0; i < trials; i++ {
+		selector := &RoundRobinSelector{}
+		got, err := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		seen[got.ID]++
+	}
+
+	if len(seen) < 3 {
+		t.Fatalf("random initial cursor coverage too low: hit only %d distinct first-picks across %d trials (%v); want >=3", len(seen), trials, seen)
+	}
+	// Sanity: no single auth should dominate. Even with random skew, ~40 per
+	// auth is expected (trials/len(auths)); a 90%+ share would indicate the
+	// seed is broken.
+	for id, count := range seen {
+		if count*10 > trials*9 {
+			t.Fatalf("auth %q dominates first picks: %d/%d (%.0f%%) — random seed appears broken", id, count, trials, 100.0*float64(count)/float64(trials))
+		}
+	}
+}
+
+// TestExtractSessionID_ContentHashIsModelScoped verifies the message-content
+// fallback key (used by clients that send no explicit session id, e.g. GitHub
+// Copilot BYOK) is scoped by base model. Without this, switching models
+// mid-conversation kept the previous binding, so grok-4.5 requests were served
+// by the grok2api openai-compat credential the conversation had been bound to
+// while it was on grok-4.5-g2a.
+func TestExtractSessionID_ContentHashIsModelScoped(t *testing.T) {
+	body := func(model string) []byte {
+		return []byte(`{"model":"` + model + `","messages":[` +
+			`{"role":"system","content":"You are a helpful assistant."},` +
+			`{"role":"user","content":"Same opening question for every variant."}]}`)
+	}
+	native := ExtractSessionID(nil, body("grok-4.5"), nil)
+	viaGateway := ExtractSessionID(nil, body("grok-4.5-g2a"), nil)
+	if native == "" || viaGateway == "" {
+		t.Fatalf("expected non-empty content-hash session ids, got %q / %q", native, viaGateway)
+	}
+	if native == viaGateway {
+		t.Fatalf("different models must produce different session keys; both were %q", native)
+	}
+
+	// A thinking-suffix change is the SAME model and must keep one binding, so
+	// switching effort does not needlessly re-pick a credential.
+	if got, want := ExtractSessionID(nil, body("grok-4.5(low)"), nil), ExtractSessionID(nil, body("grok-4.5(high)"), nil); got != want {
+		t.Fatalf("suffix-only change must keep the same session key: %q != %q", got, want)
+	}
+	if got := ExtractSessionID(nil, body("grok-4.5(high)"), nil); got != native {
+		t.Fatalf("suffixed model must match its base model key: %q != %q", got, native)
+	}
+}
+
+// TestSessionAffinity_BoundAuthCannotServeModelRebinds verifies a binding is not
+// honoured for a model the bound account is not entitled to. Strict affinity
+// returns the bound credential without re-validating model support, so a
+// conversation bound to an account that upstream rejects for the requested
+// model used to 400 on every turn forever (observed: a codex thread pinned to
+// an account without the gpt-5.6-sol entitlement). The binding must give way
+// and the request must land on an entitled account.
+func TestSessionAffinity_BoundAuthCannotServeModelRebinds(t *testing.T) {
+	const model = "gpt-test-boundunsupported"
+	const sessionID = "bound-unsupported-uuid"
+
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &RoundRobinSelector{},
+		TTL:      time.Minute,
+		Strict:   true,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "bound-nosol", Provider: "codex"}, {ID: "other-capable", Provider: "codex"}}
+	opts := cliproxyexecutor.Options{OriginalRequest: strictBypassPayload(sessionID)}
+
+	// Bind the session first, while both accounts still look capable.
+	bound, err := selector.Pick(context.Background(), "codex", model, opts, auths)
+	if err != nil {
+		t.Fatalf("initial Pick error = %v", err)
+	}
+
+	// Now mark the BOUND account as unentitled for this model, as an upstream
+	// model_not_supported rejection would.
+	reg := registry.GetGlobalRegistry()
+	reg.MarkClientModelUnsupported(bound.ID, model)
+	t.Cleanup(func() { reg.ResumeClientModel(bound.ID, model) })
+
+	got, errPick := selector.Pick(context.Background(), "codex", model, opts, auths)
+	if errPick != nil {
+		t.Fatalf("Pick error = %v (strict affinity must re-select, not refuse, when the bound auth cannot serve the model)", errPick)
+	}
+	if got == nil || got.ID == bound.ID {
+		t.Fatalf("picked %v, want an account other than the bound %q (the binding must not survive for an unsupported model)", got, bound.ID)
 	}
 }

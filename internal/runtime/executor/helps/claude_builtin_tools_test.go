@@ -11,35 +11,22 @@ func TestClaudeBuiltinToolRegistry_DefaultSeedFallback(t *testing.T) {
 	}
 }
 
-func TestClaudeBuiltinToolRegistry_AugmentsKnownTypedBuiltinsFromBody(t *testing.T) {
+func TestClaudeBuiltinToolRegistry_AugmentsTypedBuiltinsFromBody(t *testing.T) {
 	registry := AugmentClaudeBuiltinToolRegistry([]byte(`{
 		"tools": [
 			{"type": "web_search_20250305", "name": "web_search"},
-			{"type": "custom", "name": "client_custom"},
-			{"type": "custom_builtin_20250401", "name": "unknown_typed"},
+			{"type": "custom_builtin_20250401", "name": "special_builtin"},
 			{"name": "Read"}
 		]
 	}`), nil)
 
 	if !registry["web_search"] {
-		t.Fatal("expected known typed builtin web_search in registry")
+		t.Fatal("expected default typed builtin web_search in registry")
 	}
-	for _, name := range []string{"client_custom", "unknown_typed", "Read"} {
-		if registry[name] {
-			t.Fatalf("expected client tool %q to stay out of builtin registry", name)
-		}
+	if !registry["special_builtin"] {
+		t.Fatal("expected typed builtin from body to be added to registry")
 	}
-}
-
-func TestIsClaudeServerToolType(t *testing.T) {
-	for _, toolType := range []string{"web_search_20250305", "code_execution_20250522", "tool_search_tool_regex_20251119"} {
-		if !IsClaudeServerToolType(toolType) {
-			t.Fatalf("IsClaudeServerToolType(%q) = false, want true", toolType)
-		}
-	}
-	for _, toolType := range []string{"", "custom", "custom_builtin_20250401"} {
-		if IsClaudeServerToolType(toolType) {
-			t.Fatalf("IsClaudeServerToolType(%q) = true, want false", toolType)
-		}
+	if registry["Read"] {
+		t.Fatal("expected untyped custom tool to stay out of builtin registry")
 	}
 }

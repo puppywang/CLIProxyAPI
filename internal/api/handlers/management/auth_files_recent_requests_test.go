@@ -14,6 +14,7 @@ import (
 
 func TestListAuthFiles_IncludesRecentRequestsBuckets(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
 
 	manager := coreauth.NewManager(nil, nil, nil)
 	record := &coreauth.Auth{
