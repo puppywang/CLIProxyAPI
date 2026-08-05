@@ -5,12 +5,14 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -24,6 +26,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/access"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
@@ -37,6 +40,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/monitor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	helps "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -518,6 +522,7 @@ func (s *Server) setupRoutes() {
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
+		v1.POST("/alpha/search", s.codexAlphaSearch)
 	}
 
 	// Codex CLI direct route aliases (chatgpt_base_url compatible)
@@ -527,6 +532,7 @@ func (s *Server) setupRoutes() {
 		codexDirect.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
 		codexDirect.POST("/responses/compact", openaiResponsesHandlers.Compact)
+		codexDirect.POST("/alpha/search", s.codexAlphaSearch)
 	}
 
 	// Gemini compatible API routes
@@ -625,6 +631,99 @@ func (s *Server) setupRoutes() {
 	})
 
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
+}
+
+// codexAlphaSearch forwards the standalone search endpoint used by current
+// Codex clients (codex_vscode >= 0.146). Unlike /responses, this payload is
+// already in Codex search format and must not pass through a protocol
+// translator. This is a backport of upstream PR #4239 adapted to the local
+// monitor-feature auth manager API.
+func (s *Server) codexAlphaSearch(c *gin.Context) {
+	if s == nil || s.handlers == nil || s.handlers.AuthManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Codex auth manager unavailable"})
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 16<<20))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read search request"})
+		return
+	}
+
+	// Select the first available Codex OAuth credential.
+	var selected *auth.Auth
+	for _, candidate := range s.handlers.AuthManager.List() {
+		if candidate != nil && candidate.Provider == "codex" && !candidate.Disabled && !candidate.Unavailable {
+			selected = candidate
+			break
+		}
+	}
+	if selected == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "No available Codex OAuth credential"})
+		return
+	}
+
+	token := ""
+	if selected.Attributes != nil {
+		token = selected.Attributes["api_key"]
+	}
+	if token == "" && selected.Metadata != nil {
+		if v, ok := selected.Metadata["access_token"].(string); ok {
+			token = v
+		}
+	}
+
+	upstreamURL := "https://chatgpt.com/backend-api/codex/alpha/search"
+	if selected.Attributes != nil {
+		if base := strings.TrimSpace(selected.Attributes["base_url"]); base != "" {
+			upstreamURL = strings.TrimRight(base, "/") + "/alpha/search"
+		}
+	}
+
+	client := helps.NewUtlsHTTPClient(c.Request.Context(), s.cfg, selected, 120*time.Second)
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Originator", "codex_cli_rs")
+
+	// Agent-identity (K12 / education) credentials authenticate with an
+	// ed25519-signed assertion instead of a bearer access token.
+	if selected.Metadata != nil && codexauth.IsAgentIdentityMetadata(selected.Metadata) {
+		if assertion, errAssert := codexauth.AgentAssertionFromMetadata(selected.Metadata, time.Now()); errAssert == nil {
+			req.Header.Set("Authorization", assertion)
+		} else {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+	} else if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	for _, name := range []string{"Version", "User-Agent", "Session-Id", "Session_id", "Thread-Id", "X-Client-Request-Id", "X-Codex-Window-Id", "X-Codex-Turn-Metadata"} {
+		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
+			req.Header.Set(name, value)
+		}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	upstreamBody, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to read Codex search response"})
+		return
+	}
+	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
+		c.Header("Content-Type", contentType)
+	}
+	c.Status(resp.StatusCode)
+	_, _ = c.Writer.Write(upstreamBody)
 }
 
 // SetQuotaProviders forwards the wham/usage snapshot reader and the
