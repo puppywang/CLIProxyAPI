@@ -10,7 +10,7 @@ config.yaml
 
 # Generated content
 bin/*
-logs/*
+/logs
 conv/*
 temp/*
 refs/*
@@ -27,6 +27,7 @@ static/*
 
 # Authentication data
 auths/*
+/auths
 !auths/.gitkeep
 
 # Documentation
@@ -40,10 +41,12 @@ GEMINI.md
 .worktrees/
 .codex/*
 .claude/*
+.claude
 .gemini/*
 .serena/*
 .agent/*
 .agents
+.pi
 .agents/*
 .opencode/*
 .idea/*

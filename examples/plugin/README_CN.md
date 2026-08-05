@@ -14,6 +14,7 @@
 - `request-translator/`：只演示请求转换能力。
 - `request-normalizer/`：只演示请求规整能力。
 - `codex-service-tier/`：仅 Go 实现的请求规整插件，启用后会将 Codex `gpt-5.5` 请求设置为 priority service tier。
+- `request-lifecycle/`：仅 Go 实现的请求生命周期插件，演示并发控制、主动终止 HTTP 请求和终态回调。
 - `scheduler/`：仅 Go 实现的调度插件，可选择指定 auth ID、委托内置调度器或拒绝调度。
 - `response-translator/`：只演示响应转换能力。
 - `response-normalizer/`：只演示响应规整能力。
@@ -22,6 +23,7 @@
 - `cli/`：只演示命令行扩展能力。
 - `management-api/`：只演示 Management API 和资源扩展能力。
 - `host-callback/`：使用最小插件资源演示宿主回调。
+- `host-callback-auth-files/`：仅 Go 实现的插件资源，演示 host 凭证文件回调。
 - `host-model-callback/`：仅 Go 实现的插件资源，演示调用宿主模型执行回调。
 
 多数标准能力示例都包含 `go/`、`c/` 和 `rust/` 三个子目录。专用示例可能只提供所需的实现语言。
@@ -38,6 +40,36 @@ plugins:
       priority: 1
       fast: false
 ```
+
+## 请求生命周期
+
+`request-lifecycle` 同时声明 `request_interceptor` 和 `request_lifecycle_plugin`。它会在认证选择前占用并发槽位，可以直接返回自定义 `403` 或 `429` 响应而不请求上游模型，并在成功、失败、拒绝或取消时通过 `request.complete` 释放已接入请求的槽位。
+
+```yaml
+plugins:
+  configs:
+    request-lifecycle:
+      enabled: true
+      priority: 100
+      max_concurrency: 2
+      reject_keyword: "blocked"
+```
+
+构建方式和生命周期语义详见 `request-lifecycle/README.md`。
+
+## Host Auth Files 回调
+
+`host-callback-auth-files` 声明 Management API 能力，并暴露名为 `Host Auth Files` 的浏览器资源，演示 `host.auth.list`、`host.auth.get`（物理 JSON 文件）、`host.auth.get_runtime` 与 `host.auth.save`。
+
+```yaml
+plugins:
+  configs:
+    host-callback-auth-files:
+      enabled: true
+      priority: 1
+```
+
+详见 `host-callback-auth-files/README.md`。
 
 ## Host Model Callback
 
