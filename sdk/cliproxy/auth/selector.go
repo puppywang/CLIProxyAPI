@@ -1172,6 +1172,23 @@ func (s *SessionAffinitySelector) InvalidateAuthBindings(authID string) int {
 	return s.cache.InvalidateAuthCount(authID)
 }
 
+// InvalidateWindowBinding removes the cache rows for ONE conversation
+// (uuid) but only while it is still bound to authID. This is the
+// per-window counterpart of InvalidateAuthBindings: the management UI's
+// bindings popup lets an operator drop a single stranded conversation
+// instead of the account's whole binding set. The authID guard means
+// stale popup data can never release a conversation that has since
+// re-bound to a different account. Returns the number of rows removed
+// (usually 1–2 per conversation — the thread key and its window
+// mirror); 0 when the uuid isn't bound to that auth or no cache is
+// configured.
+func (s *SessionAffinitySelector) InvalidateWindowBinding(authID, uuid string) int {
+	if s == nil || s.cache == nil {
+		return 0
+	}
+	return s.cache.InvalidateWindowForAuth(authID, uuid)
+}
+
 // BindingsByAuthSnapshot returns the live session-cache contents
 // grouped by auth_id. Used by the management endpoint that renders
 // the bindings reverse-index panel. Nil-safe; returns nil when the

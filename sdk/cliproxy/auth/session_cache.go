@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -373,6 +374,53 @@ func (c *SessionCache) InvalidateAuthCount(authID string) int {
 	for sid, entry := range c.entries {
 		if entry.authID == authID {
 			delete(c.entries, sid)
+			removed++
+		}
+	}
+	c.mu.Unlock()
+	if removed > 0 {
+		c.dirty.Store(true)
+	}
+	return removed
+}
+
+// splitCacheKeyID returns the trailing conversation id of a session cache
+// key. Keys have the shape "<provider>::<kind>:<id>", e.g.
+// "mixed::codex-thread:1f2e…a9" or "mixed::codex-window:1f2e…a9".
+// ok=false for keys without a kind:id tail (malformed rows) — callers
+// skip those rather than guessing an id to release.
+func splitCacheKeyID(key string) (id string, ok bool) {
+	if idx := strings.Index(key, "::"); idx >= 0 {
+		key = key[idx+2:]
+	}
+	colon := strings.Index(key, ":")
+	if colon <= 0 {
+		return "", false
+	}
+	id = key[colon+1:]
+	return id, id != ""
+}
+
+// InvalidateWindowForAuth removes every cache row for the given
+// conversation uuid that is currently bound to authID. A single
+// conversation normally holds two rows — the codex-thread key and its
+// codex-window mirror — so this drops the whole conversation from the
+// account's binding set. The authID filter makes the call safe against
+// stale UI data: if the conversation has since re-bound to another
+// account (or expired), nothing is removed. Returns the number of rows
+// removed; 0 when the uuid isn't bound to that auth.
+func (c *SessionCache) InvalidateWindowForAuth(authID, uuid string) int {
+	if authID == "" || uuid == "" {
+		return 0
+	}
+	removed := 0
+	c.mu.Lock()
+	for key, entry := range c.entries {
+		if entry.authID != authID {
+			continue
+		}
+		if id, ok := splitCacheKeyID(key); ok && id == uuid {
+			delete(c.entries, key)
 			removed++
 		}
 	}

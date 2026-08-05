@@ -690,7 +690,6 @@
   tr.quota-row-dead:hover > td { background: rgba(255,92,92,0.12); }
   .quota-refresh-btn,
   .cooldown-force-btn,
-  .force-usable-btn,
   .codex-invite-btn {
     background: transparent;
     color: rgba(255,255,255,0.6);
@@ -708,22 +707,12 @@
     font-size: 13px;
     line-height: 1;
   }
-  /* Force-schedulable (▶) toggle: the inverse of ⏸. When active, the quota
-     selector ignores this account's limit_reached / 100%-used snapshot and
-     keeps it in rotation. Highlighted while engaged so an override can never
-     be left on unnoticed. */
-  .force-usable-btn.is-on {
-    color: #7ee787;
-    border-color: rgba(126,231,135,0.55);
-    background: rgba(126,231,135,0.16);
-  }
   .cooldown-force-btn {
     /* Visual cue: this is a destructive operator action, not just a
        refresh. Reuse the same colour family as the cooldown-clear
        button so the two manual cooldown controls feel related. */
     color: #f5c98a;
   }
-  .force-usable-btn:hover:not(:disabled),
   .cooldown-force-btn:hover:not(:disabled) {
     background: rgba(245,201,138,0.08);
     border-color: rgba(245,201,138,0.35);
@@ -738,7 +727,6 @@
     border-color: rgba(127,212,212,0.35);
   }
   .quota-refresh-btn:disabled,
-  .force-usable-btn:disabled,
   .cooldown-force-btn:disabled,
   .codex-invite-btn:disabled {
     opacity: 0.35;
@@ -842,6 +830,44 @@
   .release-bindings-btn:hover:not(:disabled) {
     background: rgba(245,201,138,0.08);
     border-color: rgba(245,201,138,0.35);
+  }
+  /* Sync ChatGPT plan_type from live wham/usage (free→plus without re-import). */
+  .plan-refresh-btn {
+    background: transparent;
+    color: #9ad0ff;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 4px;
+    padding: 0;
+    box-sizing: border-box;
+    width: 28px;
+    height: 24px;
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+  }
+  .plan-refresh-btn:hover:not(:disabled) {
+    background: rgba(154,208,255,0.1);
+    border-color: rgba(154,208,255,0.4);
+  }
+  .plan-refresh-btn:disabled { opacity: 0.45; cursor: default; }
+  .plan-pill {
+    display: inline-block;
+    flex: 0 0 auto;
+    padding: 0 5px;
+    border-radius: 3px;
+    font-size: 10px;
+    line-height: 16px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    border: 1px solid rgba(255,255,255,0.18);
+    color: rgba(255,255,255,0.65);
+  }
+  .plan-pill.plan-plus, .plan-pill.plan-pro, .plan-pill.plan-team {
+    color: #9ad0ff;
+    border-color: rgba(154,208,255,0.4);
+  }
+  .plan-pill.plan-free {
+    color: rgba(255,255,255,0.45);
   }
   .delete-account-btn {
     background: transparent;
@@ -1291,6 +1317,9 @@
     overflow: auto;
   }
   .bm-sessions .binding-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     padding: 6px 8px;
     background: rgba(255,255,255,0.03);
     border: 1px solid rgba(255,255,255,0.08);
@@ -1298,6 +1327,31 @@
     white-space: normal;
     word-break: break-all;
   }
+  .bm-sessions .binding-main {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  /* Per-row release: drop ONE conversation's binding without touching
+     the account's other conversations (see releaseBindingOne). */
+  .binding-release-btn {
+    flex: 0 0 auto;
+    background: transparent;
+    color: #f5c98a;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 4px;
+    padding: 0;
+    box-sizing: border-box;
+    width: 26px;
+    height: 22px;
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+  }
+  .binding-release-btn:hover:not(:disabled) {
+    background: rgba(245,201,138,0.08);
+    border-color: rgba(245,201,138,0.35);
+  }
+  .binding-release-btn:disabled { opacity: 0.45; cursor: default; }
   .bm-empty { color: rgba(255,255,255,0.4); font-size: 12px; }
   #quotaSection th:last-child,
   #quotaSection td:last-child {
@@ -1548,14 +1602,15 @@
       <summary>Past invites & reset-credit ledger</summary>
       <div class="ci-history" id="ciHistory"></div>
     </details>
-    <div class="ci-rules-warn">
-      ⚠ Failed / undelivered / unaccepted sends still consume the quota. Verify
-      the recipient is eligible (Plus/Pro, not currently using Codex) before
+    <div class="ci-rules-warn" id="ciRulesWarn">
+      ⚠ Offer details load from the account’s live eligibility response
+      (amount can be 250 / 500 / 1000 credits, etc.). Failed or unaccepted
+      sends still consume send capacity — verify recipient eligibility before
       sending.
     </div>
     <label class="ci-label" for="ciEmails">
       Target emails
-      <span class="ci-hint">newline / comma / space separated · max 3 per account</span>
+      <span class="ci-hint">newline / comma / space separated · max 5 per batch</span>
     </label>
     <textarea id="ciEmails" rows="6" spellcheck="false"
               placeholder="alice@example.com&#10;bob@example.com, carol@example.com"></textarea>
@@ -3040,6 +3095,13 @@
     const prioPill = priority > 0
       ? '<span class="prio-pill" title="Drain priority ' + priority + ' — higher drains first">⚑' + priority + '</span>'
       : '';
+    // ChatGPT plan tier (free/plus/team/pro). Drives the codex model catalog
+    // — free has no gpt-5.6-sol. Shown so an upgrade is visible without
+    // digging into the auth file.
+    const planType = String(a.plan_type || (q && q.plan_type) || '').trim().toLowerCase();
+    const planPill = (!isXai && !isClaude && planType)
+      ? '<span class="plan-pill plan-' + escapeAttr(planType) + '" title="ChatGPT plan: ' + escapeAttr(planType) + '">' + escapeHtml(planType) + '</span>'
+      : '';
     // Dead-account flag: the quota fetcher saw a terminal "account unusable"
     // signal (e.g. wham/usage 402 deactivated_workspace). Purely informational
     // — pinned at the very front of the row so the operator can find and
@@ -3059,7 +3121,7 @@
     // the email truncates with an ellipsis when the (now narrow) column can't
     // fit it. The pill used to be appended after the email and got pushed out
     // of view once the column shrank — this keeps it pinned at the front.
-    const nameCell = '<div class="qc-acct-line1">' + deadFlag + prioPill + providerPill + buildPill +
+    const nameCell = '<div class="qc-acct-line1">' + deadFlag + prioPill + planPill + providerPill + buildPill +
       '<span class="qc-acct-email" title="' + escapeAttr(a.label || a.email || a.name || a.id) + '">' + label + '</span></div>';
 
     let statusPill;
@@ -3068,7 +3130,6 @@
     // very state the operator is trying to spot.
     if (deadReason) statusPill = '<span class="status-pill dead" title="' + escapeAttr(deadTitle) + '">deactivated</span>';
     else if (a.disabled) statusPill = '<span class="status-pill disabled">disabled</span>';
-    else if (q && q.limit_reached && a.ignore_quota_limit) statusPill = '<span class="status-pill limit" title="Upstream reports the window exhausted, but the ignore-quota-limit override keeps this account in rotation">limit_reached (forced)</span>';
     else if (q && q.limit_reached) statusPill = '<span class="status-pill limit">limit_reached</span>';
     else if (a.unavailable) statusPill = '<span class="status-pill unavail">unavailable</span>';
     else statusPill = '<span class="status-pill active">active</span>';
@@ -3103,25 +3164,22 @@
     // dead account's bindings is harmless whatever its state.
     const prioBtn = '<button type="button" class="prio-set-btn" data-prio-set="' + escapeAttr(a.id) + '" data-prio-cur="' + priority + '" title="Set drain priority (higher drains first; 0 = normal)">⚑</button>';
     const releaseBtn = '<button type="button" class="release-bindings-btn" data-release-bindings="' + escapeAttr(a.id) + '" title="Release all conversations bound to this account so they re-pick a fresh account on their next turn (server-side fork — use after a 429)">⏏</button>';
+    // Sync plan from live wham/usage — codex only. After a free→plus upgrade
+    // this rewrites plan_type and re-registers the model catalog (adds sol)
+    // without re-importing the credential file.
+    const planBtn = (isXai || isClaude)
+      ? ''
+      : '<button type="button" class="plan-refresh-btn" data-plan-refresh="' + escapeAttr(a.id) + '" title="Sync ChatGPT plan from server (wham/usage plan_type) and re-register models">♛</button>';
     // Delete is always available (even for a disabled account) — it removes
     // the credential file from disk. Guarded by a confirm in the handler.
     const deleteBtn = '<button type="button" class="delete-account-btn" data-delete-account="' + escapeAttr(a.id) + '" title="Delete this account (removes the auth file from disk — irreversible)">🗑</button>';
-    // Force-usable toggle: ignore an over-reported quota limit and keep this
-    // account schedulable. Only meaningful for providers with a quota snapshot.
-    const forceUsableOn = !!a.ignore_quota_limit;
-    const forceUsableBtn = '<button type="button" class="force-usable-btn' + (forceUsableOn ? ' is-on' : '') +
-      '" data-force-usable="' + escapeAttr(a.id) + '" data-force-usable-on="' + (forceUsableOn ? '1' : '0') +
-      '" title="' + (forceUsableOn
-        ? 'Ignoring the quota limit for this account — click to stop forcing it into rotation'
-        : 'Keep scheduling this account even when its quota snapshot says the window is exhausted (use when it still serves requests despite limit_reached)') +
-      '">▶</button>';
     let actions;
     if (a.disabled) {
       actions =
         '<button type="button" class="quota-refresh-btn" disabled title="auth disabled">↻</button>' +
         '<button type="button" class="cooldown-force-btn" disabled title="auth disabled">⏸</button>' +
         '<button type="button" class="codex-invite-btn" disabled title="auth disabled">✉</button>' +
-        ' <button type="button" class="force-usable-btn" disabled title="auth disabled">▶</button>' +
+        (planBtn ? ' <button type="button" class="plan-refresh-btn" disabled title="auth disabled">♛</button>' : '') +
         ' ' + prioBtn +
         ' ' + releaseBtn +
         ' ' + deleteBtn;
@@ -3144,7 +3202,7 @@
         '<button type="button" class="cooldown-force-btn" data-cooldown-force="' + escapeAttr(a.id) + '" title="Force this account into cooldown (use when quota data is returning wrong values)">⏸</button>' +
         ' ' +
         inviteBtn +
-        ' ' + forceUsableBtn +
+        (planBtn ? ' ' + planBtn : '') +
         ' ' + prioBtn +
         ' ' + releaseBtn +
         ' ' + deleteBtn;
@@ -3310,8 +3368,10 @@
   }
 
   // Render one session row for the bindings popup — full uuid, kind badge,
-  // closed/forked markers, and the workspace path.
-  function renderBindingSessionRow(w) {
+  // closed/forked markers, the workspace path, and a per-row release
+  // button that drops just this conversation's binding (see
+  // releaseBindingOne) instead of the account's whole set.
+  function renderBindingSessionRow(w, authID) {
     const wsCell = w.workspace
       ? '<span class="workspace-cell" title="' + escapeAttr(w.workspace) + '">' + escapeHtml(shortWorkspace(w.workspace)) + '</span>'
       : '<span class="muted">—</span>';
@@ -3323,7 +3383,13 @@
         (w.forked_to ? '<span class="muted forked-arrow">→ ' + escapeHtml(w.forked_to || '') + '</span>' : '')
       : '';
     const rowClass = w.closed ? 'binding-row binding-closed' : 'binding-row';
-    return '<div class="' + rowClass + '"><code>' + escapeHtml(w.uuid || '') + '</code> ' + kindBadge + closedSuffix + ' ' + wsCell + '</div>';
+    const releaseBtn = '<button type="button" class="binding-release-btn" ' +
+      'data-release-binding="' + escapeAttr(authID) + '" data-binding-uuid="' + escapeAttr(w.uuid || '') + '" ' +
+      'title="Release this conversation\u2019s binding so it re-picks a fresh account on its next turn (others unaffected)">⏏</button>';
+    return '<div class="' + rowClass + '">' +
+      '<div class="binding-main"><code>' + escapeHtml(w.uuid || '') + '</code> ' + kindBadge + closedSuffix + ' ' + wsCell + '</div>' +
+      releaseBtn +
+      '</div>';
   }
 
   function openBindingsModal(authID) {
@@ -3338,7 +3404,7 @@
     if (closedCount > 0) acct += ' + ' + closedCount + ' closed';
     $('bmAccount').textContent = acct;
     $('bmSessions').innerHTML = windows.length
-      ? windows.map(renderBindingSessionRow).join('')
+      ? windows.map(w => renderBindingSessionRow(w, authID)).join('')
       : '<div class="bm-empty">No sessions bound.</div>';
     $('bindingsModal').hidden = false;
   }
@@ -3414,6 +3480,32 @@
       try { await loadAccountQuota(); } catch (_) { /* best-effort */ }
     } finally {
       if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || '↻'; }
+    }
+  }
+
+  // Sync ChatGPT plan_type from live wham/usage and re-register the codex
+  // model catalog when it changes. After a free→plus upgrade this is the
+  // one-click alternative to re-importing the credential file.
+  async function refreshPlanOne(authID, btnEl) {
+    if (!authID) return;
+    const originalText = btnEl ? btnEl.textContent : '';
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = '…'; }
+    try {
+      const res = await apiFetch('/v0/management/auth-files/' + encodeURIComponent(authID) + '/refresh-plan', { method: 'POST' });
+      const data = await res.json();
+      const prev = (data && data.previous_plan) || '?';
+      const next = (data && data.plan_type) || '?';
+      if (data && data.changed) {
+        setStatus('plan ' + authID + ': ' + prev + ' → ' + next + ' (models re-registered)');
+      } else {
+        setStatus('plan ' + authID + ': still ' + next + ' (unchanged)');
+      }
+      await loadAccountQuota();
+    } catch (err) {
+      setStatus('plan refresh failed: ' + (err && err.message ? err.message : err), true);
+      try { await loadAccountQuota(); } catch (_) { /* best-effort */ }
+    } finally {
+      if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || '♛'; }
     }
   }
 
@@ -3557,34 +3649,45 @@
     }
   }
 
+  // releaseBindingOne drops a SINGLE conversation's session-affinity
+  // binding from an account, leaving the account's other conversations
+  // untouched. Used from the bindings popup when just one conversation is
+  // stranded (e.g. one window hit the upstream limit) and the operator
+  // doesn't want to release the account's whole binding set. Confirms
+  // first so a misclick can't unpin a healthy conversation; the server
+  // guards the uuid against the account, so a stale row releases nothing.
+  async function releaseBindingOne(authID, uuid, btnEl) {
+    if (!authID || !uuid) return;
+    if (!window.confirm(
+      'Release this one binding?\n\n' +
+      'Account: ' + authID + '\n' +
+      'Conversation: ' + uuid + '\n\n' +
+      'This conversation will re-pick a fresh account on its next turn. ' +
+      'Other conversations bound to this account are unaffected.'
+    )) return;
+    const originalText = btnEl ? btnEl.textContent : '';
+    if (btnEl) { btnEl.disabled = true; btnEl.textContent = '…'; }
+    try {
+      const url = '/v0/management/auth-cooldowns/' + encodeURIComponent(authID) +
+                  '/release-binding?uuid=' + encodeURIComponent(uuid);
+      const res = await apiFetch(url, { method: 'POST' });
+      const data = await res.json();
+      const n = (data && typeof data.released === 'number') ? data.released : '?';
+      setStatus('released binding ' + uuid.slice(0, 8) + '… (' + n + ' row' + (n === 1 ? '' : 's') + ') from ' + authID + ' — next turn will re-pick');
+      await loadAccountQuota();
+      // Refresh the open popup so the row disappears in place.
+      if (!$('bindingsModal').hidden) openBindingsModal(authID);
+    } catch (err) {
+      setStatus('release binding failed: ' + (err && err.message ? err.message : err), true);
+    } finally {
+      if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || '⏏'; }
+    }
+  }
+
   // deleteAccountOne removes an account's credential file from disk via
   // DELETE /v0/management/auth-files?name=<file>. Irreversible — the auth
   // file is gone and the account drops out of the pool immediately. Guarded
   // by a confirm that names the account so a misclick can't nuke a credential.
-  // toggleForceUsable flips the per-account ignore-quota-limit override via the
-  // generic auth-file field patch (the same endpoint the priority setter uses),
-  // so it persists across restarts; the selector reads it back through the
-  // synthesizer.
-  async function toggleForceUsable(authID, btnEl) {
-    if (!authID) return;
-    const turningOn = btnEl && btnEl.getAttribute('data-force-usable-on') !== '1';
-    if (turningOn && !window.confirm(
-      '强制调度 ' + authID + ' ？即使上游报告额度已用尽（limit_reached / 100%）也继续把请求派给它。适用于上游误报、实际还能用的账号；它仍会排在真正有余量的账号之后。'
-    )) return;
-    if (btnEl) btnEl.disabled = true;
-    try {
-      await apiFetch('/v0/management/auth-files/fields', {
-        method: 'PATCH',
-        body: JSON.stringify({ name: authID, ignore_quota_limit: turningOn }),
-      });
-      setStatus((turningOn ? 'forcing ' : 'stopped forcing ') + authID + ' into rotation');
-      await loadAccountQuota();
-    } catch (err) {
-      setStatus('force-usable toggle failed: ' + (err && err.message ? err.message : err), true);
-      if (btnEl && btnEl.isConnected) btnEl.disabled = false;
-    }
-  }
-
   async function deleteAccountOne(authID, btnEl) {
     if (!authID) return;
     if (!window.confirm(
@@ -3849,7 +3952,7 @@
   // server-side remaining invites once the status endpoint has loaded;
   // null means "status not yet fetched / fetch failed" and the Send
   // button stays enabled (we don't gate on absent data).
-  const ciState = { authID: null, accountLabel: '', triggerBtn: null, cap: null, eligible: null };
+  const ciState = { authID: null, accountLabel: '', triggerBtn: null, cap: null, eligible: null, programId: 'codex_referral_consumer', entrypoint: 'persistent' };
 
   // escapeHtml here is a tiny dedicated copy to keep the invite modal
   // self-contained — there is no shared escape helper in this file yet.
@@ -3944,6 +4047,9 @@
       ciState.eligible = null;
     }
     ciState.cap = data.rules ? data.rules.remaining : null;
+    ciState.programId = data.program_id || (data.eligibility && data.eligibility.program_id) || 'codex_referral_consumer';
+    ciState.entrypoint = data.entrypoint || (data.eligibility && data.eligibility.entrypoint) || 'persistent';
+    ciUpdateRulesWarn(data);
 
     const rows = [];
     rows.push('<div class="ci-status-row">' +
@@ -3951,6 +4057,9 @@
       '<span class="ci-status-val">' +
         '<span class="ci-pill ' + verdictPill + '">' + verdictText + '</span>' +
         '<span class="ci-pill ci-pill-info">' + ciEsc(plan) + '</span>' +
+        (data.eligibility && data.eligibility.offer_id
+          ? '<span class="ci-pill ci-pill-info">' + ciEsc(data.eligibility.offer_id) + '</span>'
+          : '') +
         (data.eligibility && data.eligibility.ineligible_reason
           ? '<span style="color:#ff8a8a">' + ciEsc(data.eligibility.ineligible_reason) +
             (data.eligibility.ineligible_reason_code ? ' (' + ciEsc(data.eligibility.ineligible_reason_code) + ')' : '') +
@@ -3958,12 +4067,38 @@
           : '') +
       '</span></div>');
 
+    if (data.eligibility && (data.eligibility.title || data.eligibility.description)) {
+      rows.push('<div class="ci-status-row">' +
+        '<span class="ci-status-key">Offer</span>' +
+        '<span class="ci-status-val">' +
+          (data.eligibility.title ? '<strong>' + ciEsc(data.eligibility.title) + '</strong> ' : '') +
+          (data.eligibility.description ? ciEsc(data.eligibility.description) : '') +
+        '</span></div>');
+    }
+
+    if (data.eligibility && Array.isArray(data.eligibility.grants) && data.eligibility.grants.length) {
+      const grantText = data.eligibility.grants.map(function (g) {
+        const who = g.recipient === 'referrer' ? 'you' : (g.recipient === 'recipient' ? 'invitee' : (g.recipient || '?'));
+        return who + ' +' + (g.amount == null ? '?' : g.amount) + ' ' + ciGrantTypeLabel(g.grant_type, false);
+      }).join(' · ');
+      rows.push('<div class="ci-status-row">' +
+        '<span class="ci-status-key">Reward</span>' +
+        '<span class="ci-status-val">' + ciEsc(grantText) + '</span></div>');
+    }
+
     if (data.rules) {
+      const sendPart = (data.rules.invites_total
+        ? (ciEsc(data.rules.invites_sent) + ' / ' + ciEsc(data.rules.invites_total) + ' sent')
+        : '');
+      const rewardPart = (data.rules.reward_total
+        ? (ciEsc(data.rules.reward_sent || 0) + ' / ' + ciEsc(data.rules.reward_total) + ' rewarded')
+        : (data.rules.reward_remaining != null ? (ciEsc(data.rules.reward_remaining) + ' reward left') : ''));
       rows.push('<div class="ci-status-row">' +
         '<span class="ci-status-key">Invites</span>' +
         '<span class="ci-status-val">' +
-          ciEsc(data.rules.invites_sent) + ' / ' + ciEsc(data.rules.invites_total) +
-          ' used · <strong>' + ciEsc(data.rules.remaining) + ' remaining</strong>' +
+          (sendPart ? sendPart + ' · ' : '') +
+          '<strong>' + ciEsc(data.rules.remaining) + ' remaining</strong>' +
+          (rewardPart ? ' · ' + rewardPart : '') +
           (data.rules.time_frame ? ' <span style="opacity:0.5">· window: ' + ciEsc(data.rules.time_frame) + '</span>' : '') +
         '</span></div>');
     }
@@ -4018,8 +4153,7 @@
           // for both sides.
           const grants = (r.grants || []).map(g => {
             const who = g.recipient === 'referrer' ? '邀请人' : '被邀请人';
-            const ty = g.grant_type === 'rate_limit_reset_credit' ? '重置卡' : (g.grant_type || '');
-            return who + ' +' + (g.amount == null ? 1 : g.amount) + ' ' + ty;
+            return who + ' +' + (g.amount == null ? 1 : g.amount) + ' ' + ciGrantTypeLabel(g.grant_type, true);
           }).join('；');
           html += '<tr>' +
             '<td>' + ciEsc(r.email) + '</td>' +
@@ -4059,12 +4193,61 @@
     }
   }
 
+  function ciGrantTypeLabel(ty, zh) {
+    if (ty === 'personal_credits' || ty === 'workspace_credits') return zh ? '额度' : 'credits';
+    if (ty === 'rate_limit_reset_credit') return zh ? '重置卡' : 'reset';
+    return ty || '';
+  }
+
+  // Build the warning/help box from live eligibility — never hardcode offer
+  // amounts (server may return credits_250 / credits_500 / credits_1000 / …).
+  function ciUpdateRulesWarn(data) {
+    const el = $('ciRulesWarn');
+    if (!el) return;
+    const e = data && data.eligibility;
+    const rules = data && data.rules;
+    if (!e || e.should_show !== true) {
+      el.innerHTML = '⚠ Offer is account-specific and loaded from OpenAI eligibility ' +
+        '(amount is not fixed: 250 / 500 / 1000 credits, etc.). ' +
+        (e && e.should_show === false
+          ? 'This account is currently <b>not eligible</b>.'
+          : 'Waiting for eligibility…');
+      return;
+    }
+    const parts = [];
+    parts.push('⚠ <b>' + ciEsc(e.offer_id || 'offer') + '</b>');
+    if (e.title) parts.push(ciEsc(e.title));
+    if (Array.isArray(e.grants) && e.grants.length) {
+      const gtxt = e.grants.map(function (g) {
+        const who = g.recipient === 'referrer' ? 'you' : (g.recipient === 'recipient' ? 'invitee' : (g.recipient || '?'));
+        return who + ' +' + (g.amount == null ? '?' : g.amount) + ' ' + ciGrantTypeLabel(g.grant_type, false);
+      }).join(' · ');
+      parts.push(ciEsc(gtxt));
+    } else if (e.description) {
+      parts.push(ciEsc(e.description));
+    }
+    if (rules) {
+      const bits = [];
+      if (rules.invites_total != null) bits.push(ciEsc(rules.invites_sent || 0) + '/' + ciEsc(rules.invites_total) + ' sent');
+      if (rules.reward_total != null) bits.push(ciEsc(rules.reward_sent || 0) + '/' + ciEsc(rules.reward_total) + ' rewarded');
+      else if (rules.reward_remaining != null) bits.push(ciEsc(rules.reward_remaining) + ' reward left');
+      if (rules.remaining != null) bits.push('<b>' + ciEsc(rules.remaining) + ' remaining</b>');
+      if (bits.length) parts.push(bits.join(' · '));
+    }
+    if (Array.isArray(e.rules) && e.rules.length) {
+      parts.push(e.rules.map(function (r) { return ciEsc(r); }).join(' · '));
+    }
+    parts.push('Failed / unaccepted sends still consume send capacity.');
+    el.innerHTML = parts.join(' — ');
+  }
+
   function ciSetStatusError(message) {
     const root = $('ciStatus');
     if (!root) return;
     root.innerHTML = '<div class="ci-status-error">' + ciEsc(message) + '</div>';
     ciState.cap = null;
     ciState.eligible = null;
+    ciUpdateRulesWarn(null);
   }
 
   async function ciLoadStatus(opts) {
@@ -4116,10 +4299,13 @@
     ciState.triggerBtn = btnEl || null;
     ciState.cap = null;
     ciState.eligible = null;
+    ciState.programId = 'codex_referral_consumer';
+    ciState.entrypoint = 'persistent';
     $('ciAccount').textContent = 'From: ' + ciState.accountLabel;
     $('ciEmails').value = '';
     ciSetMeta('');
     ciSetResult('');
+    ciUpdateRulesWarn(null);
     $('ciHistoryWrap').hidden = true;
     $('ciHistory').innerHTML = '';
     $('ciSendBtn').disabled = false;
@@ -4150,7 +4336,11 @@
       const res = await apiFetch('/v0/management/codex-invite/' + encodeURIComponent(ciState.authID), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ emails_text: raw }),
+        body: JSON.stringify({
+          emails_text: raw,
+          program_id: ciState.programId || 'codex_referral_consumer',
+          entrypoint: ciState.entrypoint || 'persistent',
+        }),
       });
       const data = await res.json();
       try { console.log('codex-invite', ciState.authID, data); } catch (_) {}
@@ -4367,6 +4557,12 @@
       refreshOneQuota(oneBtn.getAttribute('data-quota-refresh'), oneBtn);
       return;
     }
+    const planBtn = ev.target.closest('button[data-plan-refresh]');
+    if (planBtn) {
+      ev.preventDefault();
+      refreshPlanOne(planBtn.getAttribute('data-plan-refresh'), planBtn);
+      return;
+    }
     const forceBtn = ev.target.closest('button[data-cooldown-force]');
     if (forceBtn) {
       ev.preventDefault();
@@ -4397,16 +4593,21 @@
       releaseBindingsOne(releaseBtn.getAttribute('data-release-bindings'), releaseBtn);
       return;
     }
+    // Per-window release from the bindings popup: one conversation only.
+    const releaseOneBtn = ev.target.closest('button[data-release-binding]');
+    if (releaseOneBtn) {
+      ev.preventDefault();
+      releaseBindingOne(
+        releaseOneBtn.getAttribute('data-release-binding'),
+        releaseOneBtn.getAttribute('data-binding-uuid'),
+        releaseOneBtn
+      );
+      return;
+    }
     const bindingsBtn = ev.target.closest('button[data-bindings-popup]');
     if (bindingsBtn) {
       ev.preventDefault();
       openBindingsModal(bindingsBtn.getAttribute('data-bindings-popup'));
-      return;
-    }
-    const forceUsable = ev.target.closest('button[data-force-usable]');
-    if (forceUsable) {
-      ev.preventDefault();
-      toggleForceUsable(forceUsable.getAttribute('data-force-usable'), forceUsable);
       return;
     }
     const deleteBtn = ev.target.closest('button[data-delete-account]');

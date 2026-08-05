@@ -225,6 +225,73 @@ func (h *Handler) ReleaseAuthBindings(c *gin.Context) {
 	})
 }
 
+// ReleaseAuthBinding drops a SINGLE session-affinity binding (one
+// conversation/window) from an account, leaving the rest of the
+// account's bindings untouched. This is the per-window counterpart of
+// ReleaseAuthBindings: after a partial quota hit only some
+// conversations are stranded, and an operator may want to free just
+// those without disturbing the healthy ones still pinned to the
+// account. The uuid is matched against the account's CURRENT bindings
+// (guarded by auth), so a stale uuid — a conversation that has since
+// re-bound elsewhere or expired — releases nothing and reports 0:
+// idempotent and race-safe.
+func (h *Handler) ReleaseAuthBinding(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "auth manager not configured"})
+		return
+	}
+	identifier := strings.TrimSpace(c.Param("id"))
+	if identifier == "" {
+		identifier = strings.TrimSpace(c.Query("id"))
+	}
+	if identifier == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing auth id"})
+		return
+	}
+	if strings.ContainsAny(identifier, "/\\") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid auth id"})
+		return
+	}
+	uuid := strings.TrimSpace(c.Query("uuid"))
+	if uuid == "" {
+		var body struct {
+			UUID string `json:"uuid"`
+		}
+		if err := c.ShouldBindJSON(&body); err == nil {
+			uuid = strings.TrimSpace(body.UUID)
+		}
+	}
+	if uuid == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing uuid"})
+		return
+	}
+	resolvedID := identifier
+	for _, a := range h.authManager.List() {
+		if a == nil {
+			continue
+		}
+		if a.ID == identifier || a.FileName == identifier {
+			resolvedID = a.ID
+			break
+		}
+	}
+	selector, ok := h.authManager.Selector().(*coreauth.SessionAffinitySelector)
+	if !ok || selector == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "session affinity not enabled"})
+		return
+	}
+	released := selector.InvalidateWindowBinding(resolvedID, uuid)
+	c.JSON(http.StatusOK, gin.H{
+		"id":       resolvedID,
+		"uuid":     uuid,
+		"released": released,
+	})
+}
+
 // ForceAuthCooldown manually marks an auth as quota-exceeded until a
 // given deadline, used when upstream wham/usage returns wrong data
 // (e.g. claims 100% available on an auth that has actually exhausted

@@ -860,6 +860,12 @@ func (s *Server) registerManagementRoutes() {
 		// fresh wham/usage data without waiting for the periodic tick.
 		mgmt.POST("/quota-refresh/:id", s.mgmt.RefreshAuthQuota)
 		mgmt.POST("/quota-refresh", s.mgmt.RefreshAuthQuota)
+		// Sync ChatGPT subscription plan_type from live wham/usage and
+		// re-register the codex model catalog when it changes. Used after
+		// an agent-identity free→plus upgrade so the operator does not
+		// have to re-import the credential file.
+		mgmt.POST("/auth-files/:id/refresh-plan", s.mgmt.RefreshAuthPlan)
+		mgmt.POST("/auth-files/refresh-plan", s.mgmt.RefreshAuthPlan)
 		// Cooldown observability + manual reset. The cooldown state lives
 		// on the Auth record (auth.NextRetryAfter, auth.Quota, per-model
 		// states) and in the model registry (SuspendClientModel /
@@ -880,6 +886,12 @@ func (s *Server) registerManagementRoutes() {
 		// without the heavy client-side thread duplication. Used after an
 		// account hits its quota.
 		mgmt.POST("/auth-cooldowns/:id/release-bindings", s.mgmt.ReleaseAuthBindings)
+		// Release ONE session-affinity binding (a single conversation /
+		// window) from an account — the per-window counterpart of
+		// release-bindings above, used from the bindings popup when only
+		// one conversation is stranded rather than the whole account.
+		// Body/query: {"uuid": "<conversation uuid>"} or ?uuid=…
+		mgmt.POST("/auth-cooldowns/:id/release-binding", s.mgmt.ReleaseAuthBinding)
 		// Auto-release-on-429 toggle. When on, the conductor drops the
 		// 429'd account's session-affinity bindings immediately and
 		// converts the 429 into a 500 so the client retries onto a fresh
