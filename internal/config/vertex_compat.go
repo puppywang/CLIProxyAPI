@@ -1,10 +1,6 @@
 package config
 
-import (
-	"strings"
-
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-)
+import "strings"
 
 // VertexCompatKey represents the configuration for Vertex AI-compatible API keys.
 // This supports third-party services that use Vertex AI-style endpoint paths
@@ -54,15 +50,6 @@ type VertexCompatModel struct {
 
 	// Alias is the model name alias that clients will use to reference this model.
 	Alias string `yaml:"alias" json:"alias"`
-
-	// DisplayName is the optional human-readable name shown in model catalogs.
-	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
-
-	// ForceMapping rewrites upstream response model fields back to Alias.
-	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
-
-	// Thinking configures the thinking/reasoning capability for this model.
-	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
 
 func (m VertexCompatModel) GetName() string  { return m.Name }

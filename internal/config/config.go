@@ -599,18 +599,6 @@ type ClaudeModel struct {
 
 	// Alias is the client-facing model name that maps to Name.
 	Alias string `yaml:"alias" json:"alias"`
-
-	// DisplayName is the optional human-readable name shown in model catalogs.
-	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
-
-	// MaxContextLength overrides the context window advertised to Codex clients.
-	MaxContextLength int `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
-
-	// ForceMapping rewrites upstream response model fields back to Alias.
-	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
-
-	// Thinking configures the thinking/reasoning capability for this model.
-	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
 
 func (m ClaudeModel) GetName() string  { return m.Name }
@@ -662,18 +650,6 @@ type CodexModel struct {
 
 	// Alias is the client-facing model name that maps to Name.
 	Alias string `yaml:"alias" json:"alias"`
-
-	// DisplayName is the optional human-readable name shown in model catalogs.
-	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
-
-	// MaxContextLength overrides the context window advertised to Codex clients.
-	MaxContextLength int `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
-
-	// ForceMapping rewrites upstream response model fields back to Alias.
-	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
-
-	// Thinking configures the thinking/reasoning capability for this model.
-	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
 
 func (m CodexModel) GetName() string  { return m.Name }
@@ -721,18 +697,6 @@ type GeminiModel struct {
 
 	// Alias is the client-facing model name that maps to Name.
 	Alias string `yaml:"alias" json:"alias"`
-
-	// DisplayName is the optional human-readable name shown in model catalogs.
-	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
-
-	// MaxContextLength overrides the context window advertised to Codex clients.
-	MaxContextLength int `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
-
-	// ForceMapping rewrites upstream response model fields back to Alias.
-	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
-
-	// Thinking configures the thinking/reasoning capability for this model.
-	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
 
 func (m GeminiModel) GetName() string  { return m.Name }
@@ -788,24 +752,8 @@ type OpenAICompatibilityModel struct {
 	// Alias is the model name alias that clients will use to reference this model.
 	Alias string `yaml:"alias" json:"alias"`
 
-	// DisplayName is the optional human-readable name shown in model catalogs.
-	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
-
-	// MaxContextLength overrides the context window advertised to Codex clients.
-	MaxContextLength int `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
-
-	// ForceMapping rewrites upstream response model fields back to Alias.
-	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
-
 	// Image marks this model as callable through /v1/images/generations and /v1/images/edits.
 	Image bool `yaml:"image,omitempty" json:"image,omitempty"`
-
-	// InputModalities declares chat/responses input capabilities (e.g. text, image) for Codex and other clients.
-	// This is separate from Image, which only enables /v1/images/* endpoints.
-	InputModalities []string `yaml:"input-modalities,omitempty" json:"input-modalities,omitempty"`
-
-	// OutputModalities declares supported output modalities when known (e.g. text, image).
-	OutputModalities []string `yaml:"output-modalities,omitempty" json:"output-modalities,omitempty"`
 
 	// Thinking configures the thinking/reasoning capability for this model.
 	// If nil, the model defaults to level-based reasoning with levels ["low", "medium", "high"].
