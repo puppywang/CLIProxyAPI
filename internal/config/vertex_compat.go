@@ -112,3 +112,5 @@ func (cfg *Config) SanitizeVertexCompatKeys() {
 	}
 	cfg.VertexCompatAPIKey = out
 }
+
+func (m VertexCompatModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }

@@ -2295,3 +2295,11 @@ type CodexLiveICEServer struct {
 
 // XAIKey uses the Codex API key structure for native xAI execution.
 type XAIKey = CodexKey
+
+func (m ClaudeModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
+
+func (m CodexModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
+
+func (m GeminiModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
+
+func (m OpenAICompatibilityModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }

@@ -585,3 +585,25 @@ func (c *SessionCache) persistNow() {
 		return
 	}
 }
+
+func mergeSessionAliases(existing []string, candidates ...string) []string {
+	aliases := make([]string, 0, len(existing)+len(candidates))
+	seen := make(map[string]struct{}, cap(aliases))
+	add := func(alias string) {
+		if alias == "" {
+			return
+		}
+		if _, ok := seen[alias]; ok {
+			return
+		}
+		seen[alias] = struct{}{}
+		aliases = append(aliases, alias)
+	}
+	for _, alias := range existing {
+		add(alias)
+	}
+	for _, alias := range candidates {
+		add(alias)
+	}
+	return aliases
+}

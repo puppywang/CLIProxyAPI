@@ -225,6 +225,11 @@ type Manager struct {
 	refreshLoop   *authAutoRefreshLoop
 
 	requestPrepareLocks sync.Map
+
+	// homeInFlightPublisherConfig atomically publishes the Home in-flight observation config.
+	homeInFlightPublisherConfig atomic.Pointer[HomeInFlightPublisherConfig]
+	// apiKeyModelRouting atomically publishes per-auth aliases and configured capabilities.
+	apiKeyModelRouting atomic.Value
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
