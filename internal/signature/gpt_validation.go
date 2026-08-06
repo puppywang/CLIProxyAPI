@@ -81,3 +81,6 @@ func firstInvalidGPTReasoningSignatureChar(sig string) (int, rune, bool) {
 	}
 	return 0, 0, false
 }
+
+// gptReasoningSignatureCharSet is the base64url alphabet, padding included.
+var gptReasoningSignatureCharSet = base64AlphabetSet("-_=")

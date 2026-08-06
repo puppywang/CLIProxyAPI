@@ -428,6 +428,35 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 // that need to introspect the selector chain (e.g. the monitor's
 // bindings reverse-index handler probing for a SessionAffinitySelector
 // to pull a cache snapshot) can type-assert on the returned value.
+// SelectAuthByKind picks an auth of the given provider and kind via the
+// configured selector. Used by the Codex Live media relay when selecting an
+// OAuth credential outside the normal executor path.
+func (m *Manager) SelectAuthByKind(ctx context.Context, provider, model, requiredKind string, opts cliproxyexecutor.Options) (*Auth, error) {
+	if m == nil {
+		return nil, errors.New("manager is nil")
+	}
+	if m.Selector() == nil {
+		return nil, errors.New("selector not configured")
+	}
+	var candidates []*Auth
+	for _, a := range m.List() {
+		if a == nil || !strings.EqualFold(strings.TrimSpace(a.Provider), provider) {
+			continue
+		}
+		if requiredKind != "" && !strings.EqualFold(strings.TrimSpace(a.AuthKind()), requiredKind) {
+			continue
+		}
+		if a.Disabled {
+			continue
+		}
+		candidates = append(candidates, a)
+	}
+	if len(candidates) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available for provider " + provider}
+	}
+	return m.Selector().Pick(ctx, provider, model, opts, candidates)
+}
+
 func (m *Manager) Selector() Selector {
 	if m == nil {
 		return nil
@@ -4373,13 +4402,17 @@ type homeErrorEnvelope struct {
 }
 
 type homeErrorDetail struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
-	Code    string `json:"code,omitempty"`
+	Type         string `json:"type"`
+	Message      string `json:"message"`
+	Code         string `json:"code,omitempty"`
+	Retryable    bool   `json:"retryable,omitempty"`
+	RetryAfterMS int64  `json:"retry_after_ms,omitempty"`
 }
 
 const (
 	homeUpstreamModelAttributeKey     = "home_upstream_model"
+	homeForceMappingAttributeKey      = "home_force_mapping"
+	homeOriginalAliasAttributeKey     = "home_original_alias"
 	homeRequestRetryExceededErrorCode = "request_retry_exceeded"
 )
 

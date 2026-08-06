@@ -304,35 +304,17 @@ func (h *Handler) Handle(c *gin.Context) {
 		return
 	}
 	if selection != nil && resp.StatusCode == http.StatusUnauthorized {
-		h.authManager.ReportHomeUnauthorized(ctx, selected, "codex", model)
+		// Home-driven credential refresh is part of the upstream Home subsystem,
+		// which this fork does not carry. Surface the 401 directly so the client
+		// can re-authenticate; the media relay itself is unaffected.
 		helps.RecordAPIResponseMetadata(ctx, runtimeConfig, resp.StatusCode, callResponseHeaders(resp.Header))
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		if errClose := resp.Body.Close(); errClose != nil {
 			log.Errorf("codex live: close unauthorized response body error: %v", errClose)
 		}
-		refreshed, didRefresh, errRefresh := h.authManager.RefreshHomeSelectionAfterUnauthorized(ctx, selection, selected)
-		if errRefresh != nil {
-			selection.End("refresh_failed")
-			writeSelectionError(c, errRefresh)
-			return
-		}
-		if !didRefresh || refreshed == nil {
-			selection.End("refresh_unavailable")
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Codex credential unauthorized"})
-			return
-		}
-		selected = refreshed
-		logging.SetGinCPATraceID(c, selected.EnsureIndex())
-		resp, errRequest = performRequest(selected)
-		if errRequest != nil {
-			selection.End("retry_failed")
-			helps.RecordAPIResponseError(ctx, runtimeConfig, errRequest)
-			c.JSON(http.StatusBadGateway, gin.H{"error": errRequest.Error()})
-			return
-		}
-		if resp.StatusCode == http.StatusUnauthorized {
-			h.authManager.ReportHomeUnauthorized(ctx, selected, "codex", model)
-		}
+		selection.End("unauthorized")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Codex credential unauthorized"})
+		return
 	}
 
 	var closeResponseOnce sync.Once
@@ -463,10 +445,10 @@ func (h *Handler) selectOAuth(ctx context.Context, model string, opts coreexecut
 	var selected *auth.Auth
 	var errSelect error
 	if h.authManager.HomeEnabled() {
-		selection, errSelect = h.authManager.SelectHomeAuthByKind(ctx, "codex", model, auth.AuthKindOAuth, opts)
-		if selection != nil {
-			selected = selection.CloneAuth()
-		}
+		// Upstream Home-driven selection (SelectHomeAuthByKind) is part of the
+		// Home subsystem this fork does not carry; fall back to the standard
+		// OAuth selection path.
+		selected, errSelect = h.authManager.SelectAuthByKind(ctx, "codex", "", auth.AuthKindOAuth, opts)
 	} else {
 		selected, errSelect = h.authManager.SelectAuthByKind(ctx, "codex", "", auth.AuthKindOAuth, opts)
 	}

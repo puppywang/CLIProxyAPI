@@ -35,6 +35,10 @@ type Record struct {
 	Failed      bool
 	Fail        Failure
 	Detail      Detail
+	// AccessTokenSHA256 identifies the OAuth token version without exposing the token.
+	AccessTokenSHA256 string
+	// Generate reports whether the client requested actual generation.
+	Generate *bool
 	// ResponseHeaders stores a snapshot of upstream response headers for usage sinks.
 	ResponseHeaders http.Header
 }
@@ -329,3 +333,8 @@ func StartDefault(ctx context.Context) { DefaultManager().Start(ctx) }
 
 // StopDefault stops the default manager's dispatcher.
 func StopDefault() { DefaultManager().Stop() }
+
+// GenerateFlag converts a bool into a *bool for Record.Generate.
+func GenerateFlag(generate bool) *bool {
+	return &generate
+}

@@ -408,28 +408,16 @@ func (h *Handler) HandleSideband(c *gin.Context) {
 
 	upstream, handshakeResponse, errDial := dialUpstream(selected)
 	if errDial != nil && selection != nil && handshakeResponse != nil && handshakeResponse.StatusCode == http.StatusUnauthorized {
-		h.authManager.ReportHomeUnauthorized(ctx, selected, "codex", session.model)
+		// Home-driven credential refresh is part of the upstream Home subsystem,
+		// which this fork does not carry. Surface the 401 directly.
 		helps.RecordAPIWebsocketHandshake(ctx, runtimeConfig, handshakeResponse.StatusCode, callResponseHeaders(handshakeResponse.Header))
 		if handshakeResponse.Body != nil {
 			if errClose := handshakeResponse.Body.Close(); errClose != nil {
 				log.Errorf("codex live sideband: close unauthorized handshake body error: %v", errClose)
 			}
 		}
-		refreshed, didRefresh, errRefresh := h.authManager.RefreshHomeSelectionAfterUnauthorized(ctx, selection, selected)
-		if errRefresh != nil {
-			writeSelectionError(c, errRefresh)
-			return
-		}
-		if !didRefresh || refreshed == nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Codex credential unauthorized"})
-			return
-		}
-		selected = refreshed
-		logging.SetGinCPATraceID(c, selected.EnsureIndex())
-		upstream, handshakeResponse, errDial = dialUpstream(selected)
-		if errDial != nil && handshakeResponse != nil && handshakeResponse.StatusCode == http.StatusUnauthorized {
-			h.authManager.ReportHomeUnauthorized(ctx, selected, "codex", session.model)
-		}
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Codex credential unauthorized"})
+		return
 	}
 	if errDial != nil {
 		handleSidebandDialError(c, ctx, runtimeConfig, handshakeResponse, errDial)
