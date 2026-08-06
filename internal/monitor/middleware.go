@@ -276,14 +276,29 @@ func peekModelAndWorkspaceFromRequest(c *gin.Context) (model, workspace string) 
 		c.Request.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), c.Request.Body))
 		return modelFromPrefix(prefix), ""
 	}
-	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxPeek+1))
+	// A body sent with chunked transfer encoding has ContentLength -1, so it
+	// reaches this branch no matter how large it actually is (GitHub Copilot
+	// Chat posts /v1/chat/completions that way).
+	original := c.Request.Body
+	body, err := io.ReadAll(io.LimitReader(original, maxPeek+1))
 	if err != nil {
 		return "", ""
 	}
-	// Restore body so downstream handlers can still read it.
-	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	// Restore body so downstream handlers can still read it: the peeked prefix
+	// AND the still-unread remainder. Handing back only the bounded buffer
+	// truncated every chunked body over maxPeek at exactly that boundary — the
+	// handler then found no "model" in the cut-off JSON and answered
+	// 502 "unknown provider for model" (with an empty model name, the tell)
+	// instead of running the request.
+	c.Request.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), original))
 	if len(body) == 0 {
 		return "", ""
+	}
+	if len(body) > maxPeek {
+		// The peek stopped mid-body, so the JSON is incomplete and gjson cannot
+		// parse it. Recover the model from the prefix the same way the
+		// declared-oversize branch above does; both values are display-only.
+		return modelFromPrefix(body), extractWorkspaceFromBody(body)
 	}
 	model = strings.TrimSpace(gjson.GetBytes(body, "model").String())
 	workspace = extractWorkspaceFromBody(body)
