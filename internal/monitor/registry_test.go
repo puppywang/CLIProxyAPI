@@ -37,6 +37,54 @@ func TestRegistry_SetTurnMetadata(t *testing.T) {
 	}
 }
 
+// TestRegistry_RequestBytesFallback verifies that chunked requests (which
+// register with requestBytes=0 because Content-Length is -1) still surface a
+// measured request size once the body timer has counted actual bytes. Without
+// the fallback the operator UI shows "0 B" for multi-megabyte uploads (e.g.
+// GitHub Copilot Chat posting /v1/chat/completions chunked).
+func TestRegistry_RequestBytesFallback(t *testing.T) {
+	reg := NewRegistry()
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Chunked request: registered with 0 declared bytes.
+	entry := reg.Register("req-chunked-1", "POST", "", "/v1/chat/completions", "127.0.0.1", "copilot", 0, cancel)
+	timer := &bodyTimer{arrival: time.Now()}
+	timer.bytes.Store(1407542)
+	entry.mu.Lock()
+	entry.bodyTiming = timer
+	entry.mu.Unlock()
+
+	snap := reg.Snapshot()[0]
+	if snap.RequestBytes != 1407542 {
+		t.Fatalf("chunked request_bytes not filled from body timer: got %d want 1407542", snap.RequestBytes)
+	}
+
+	// Declared-size request: must keep the declared Content-Length.
+	_, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	entry2 := reg.Register("req-declared-1", "POST", "", "/v1/chat/completions", "127.0.0.1", "codex", 4096, cancel2)
+	timer2 := &bodyTimer{arrival: time.Now()}
+	timer2.bytes.Store(4000)
+	entry2.mu.Lock()
+	entry2.bodyTiming = timer2
+	entry2.mu.Unlock()
+
+	var snap2 Entry
+	for _, s := range reg.Snapshot() {
+		if s.ID == "req-declared-1" {
+			snap2 = s
+			break
+		}
+	}
+	if snap2.ID == "" {
+		t.Fatal("declared-size entry not found in snapshot")
+	}
+	if snap2.RequestBytes != 4096 {
+		t.Fatalf("declared request_bytes overwritten: got %d want 4096", snap2.RequestBytes)
+	}
+}
+
 // TestRegistry_RecentErrors_CapturesNon2xx is the contract test for the
 // recent-errors ring: a non-2xx terminal status must produce a record;
 // 200 must not. Older entries fall off when the ring's capacity is hit,

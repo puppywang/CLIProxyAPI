@@ -177,6 +177,14 @@ func (t *trackedRequest) snapshot() Entry {
 		receivingBody = !done
 		bodyReceivedBytes = t.bodyTiming.received()
 	}
+	// Chunked request bodies (Content-Length: -1 — e.g. GitHub Copilot Chat)
+	// never populate requestBytes at registration time. Fall back to the
+	// body timer's measured byte count so the UI doesn't show "0 B" for a
+	// 1.4 MB upload. Content-Length-known requests keep their declared size.
+	reqBytes := t.requestBytes.Load()
+	if reqBytes <= 0 && bodyReceivedBytes > 0 {
+		reqBytes = bodyReceivedBytes
+	}
 	return Entry{
 		ID:                t.id,
 		Method:            t.method,
@@ -191,7 +199,7 @@ func (t *trackedRequest) snapshot() Entry {
 		Provider:          t.provider,
 		AuthProxy:         t.authProxy,
 		Streaming:         t.streaming.Load(),
-		RequestBytes:      t.requestBytes.Load(),
+		RequestBytes:      reqBytes,
 		ResponseBytes:     t.responseBytes.Load(),
 		Status:            t.status,
 		StatusCode:        int(t.statusCode.Load()),
