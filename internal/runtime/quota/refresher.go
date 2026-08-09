@@ -376,6 +376,10 @@ func (r *Refresher) RefreshNow(ctx context.Context, authID string) (coreauth.Quo
 	// scheduling.
 	r.recordSuccessKeepingSchedule(authID)
 	r.maybeUpdatePlan(ctx, target, snap)
+	// Manual refreshes participate in floating-window detection too — the
+	// operator's "refresh now" button may be the only activity an account
+	// sees before its 7d window slides away.
+	r.maybeProbeFloatingWindow(ctx, target, snap)
 	return snap, true, nil
 }
 
