@@ -12,12 +12,12 @@ import (
 )
 
 // Quota history retention and sampling bounds. The codex refresher pushes a
-// snapshot roughly every 10 minutes per auth, so 7 days is ~1k samples per
+// snapshot roughly every 10 minutes per auth, so 30 days is ~4.3k samples per
 // account; the per-auth cap is a backstop against a pathological push rate
 // (e.g. an operator hammering the manual refresh button).
 const (
-	quotaHistoryRetention   = 7 * 24 * time.Hour
-	quotaHistoryPerAuthCap  = 3000
+	quotaHistoryRetention   = 30 * 24 * time.Hour
+	quotaHistoryPerAuthCap  = 6000
 	quotaHistoryMinInterval = 60 * time.Second
 	quotaHistorySaveEvery   = 60 * time.Second
 	// quotaResetFloor: a sample whose primary-window usage is at or below

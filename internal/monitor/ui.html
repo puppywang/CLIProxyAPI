@@ -649,8 +649,8 @@
   }
   .qc-tip[hidden] { display: none; }
   /* The quota chart needs far more horizontal room than the other modals
-     (a 7-day curve at 480px is unreadable). It is a popup, so a wide box is
-     fine; max-width still keeps it inside the viewport. */
+     (a 7-30 day curve at 480px is unreadable). It is a popup, so a wide box
+     is fine; max-width still keeps it inside the viewport. */
   #quotaChartModal .ci-modal { width: 940px; }
   .qc-tip .k { color: rgba(255,255,255,0.5); }
   .qc-tip .vp { color: #8fc6ff; font-weight: 600; }
@@ -1675,6 +1675,8 @@
         <button type="button" class="qc-range-btn" data-qc-range="24">24h</button>
         <button type="button" class="qc-range-btn active" data-qc-range="48">48h</button>
         <button type="button" class="qc-range-btn" data-qc-range="168">7d</button>
+        <button type="button" class="qc-range-btn" data-qc-range="336">14d</button>
+        <button type="button" class="qc-range-btn" data-qc-range="720">30d</button>
       </span>
     </div>
     <div class="qc-chart-wrap" id="qcChart"></div>
@@ -2668,12 +2670,13 @@
   let quotaHistoryLoadedAt = 0;
   let quotaHistoryInflight = null;
   const QUOTA_HISTORY_TTL_MS = 5 * 60 * 1000; // history only changes ~10 min
-  const QUOTA_HISTORY_HOURS = 168;
+  const QUOTA_HISTORY_HOURS = 720; // 30 days — backend retention is 30d
   const SPARKLINE_MAX_POINTS = 48;
 
   // Downsample a dense series to at most `maxPoints` samples while always
   // keeping the first and last points. Sparklines are 88px wide; feeding
-  // 300–600 raw samples per row is pure main-thread waste.
+  // thousands of raw samples (30 days ~4.3k) per row is pure main-thread
+  // waste.
   function downsampleSeries(series, maxPoints) {
     if (!series || series.length <= maxPoints) return series || [];
     const out = [];
