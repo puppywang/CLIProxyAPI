@@ -99,34 +99,47 @@ func TestQuotaHistoryResetMarking(t *testing.T) {
 }
 
 // TestQuotaHistoryResetMarking_LegacyNoResetAt verifies the legacy-sample
-// fallback: when the previous sample has no recorded API reset_at (ra=0),
-// a collapse from a saturated window (~100%) is a natural CD rollover
-// (passive), while a collapse from a low usage level is active (the window
-// wasn't near its cap, so the drop is not the declared rollover).
+// behaviour: when the previous sample has no recorded API reset_at (ra=0),
+// the reset type CANNOT be determined — the mark stays empty ("unknown")
+// rather than guessing passive from a saturated window. Only samples with
+// a known reset_at get a p/a classification.
 func TestQuotaHistoryResetMarking_LegacyNoResetAt(t *testing.T) {
 	s := newQuotaHistoryStore("")
 	base := time.Now()
 
-	// Saturated 100% -> 0% with no ra on the previous sample: passive.
+	// Saturated 100% -> 0% with no ra on the previous sample: detected as
+	// a reset but the type is unknown (no mark).
 	s.record("acct-1", 100, 40, false, time.Time{}, base)
 	s.record("acct-1", 0, 40, false, time.Time{}, base.Add(10*time.Minute))
 	series := s.data["acct-1"]
 	if len(series) != 2 {
 		t.Fatalf("expected 2 samples, got %d", len(series))
 	}
-	if series[1].R != "p" {
-		t.Fatalf("legacy 100%%->0%%: expected passive mark, got %q", series[1].R)
+	if series[1].R != "" {
+		t.Fatalf("legacy 100%%->0%%: expected unknown (empty) mark, got %q", series[1].R)
 	}
 
-	// Low 7% -> 0% with no ra: active (not a saturated-window rollover).
+	// Low 7% -> 0% with no ra: also unknown.
 	s.record("acct-2", 7, 10, false, time.Time{}, base)
 	s.record("acct-2", 0, 10, false, time.Time{}, base.Add(10*time.Minute))
 	series = s.data["acct-2"]
 	if len(series) != 2 {
 		t.Fatalf("expected 2 samples for acct-2, got %d", len(series))
 	}
-	if series[1].R != "a" {
-		t.Fatalf("legacy 7%%->0%%: expected active mark, got %q", series[1].R)
+	if series[1].R != "" {
+		t.Fatalf("legacy 7%%->0%%: expected unknown (empty) mark, got %q", series[1].R)
+	}
+
+	// With a known reset_at the classification works (passive at rollover).
+	resetAt := base.Add(10 * time.Minute)
+	s.record("acct-3", 100, 40, false, resetAt, base)
+	s.record("acct-3", 0, 40, false, resetAt.Add(5*time.Hour), resetAt)
+	series = s.data["acct-3"]
+	if len(series) != 2 {
+		t.Fatalf("expected 2 samples for acct-3, got %d", len(series))
+	}
+	if series[1].R != "p" {
+		t.Fatalf("known reset_at rollover: expected passive mark, got %q", series[1].R)
 	}
 }
 
@@ -184,13 +197,14 @@ func TestQuotaHistoryResetAtCaptured(t *testing.T) {
 		t.Fatalf("ResetAt() mismatch: got %d want %d", got, resetAt.Unix())
 	}
 
-	// Zero reset_at: stored as 0 and never classified passive.
+	// Zero reset_at: stored as 0 and never classified passive or active —
+	// the type is unknown.
 	s.record("acct-2", 42, 10, false, time.Time{}, base)
 	if s.data["acct-2"][0].RA != 0 {
 		t.Fatalf("zero reset_at should store 0, got %d", s.data["acct-2"][0].RA)
 	}
 	s.record("acct-2", 0, 10, false, time.Time{}, base.Add(10*time.Minute))
-	if s.data["acct-2"][1].R != "a" {
-		t.Fatalf("unknown reset_at drop: expected active mark, got %q", s.data["acct-2"][1].R)
+	if got := s.data["acct-2"][1].R; got != "" {
+		t.Fatalf("unknown reset_at drop: expected unknown (empty) mark, got %q", got)
 	}
 }

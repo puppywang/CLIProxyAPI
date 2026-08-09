@@ -3780,29 +3780,31 @@
       const marked = cur.r === 'p' || cur.r === 'a';
       const fallback = !marked && prev.p >= 5 && cur.p <= 5 && cur.p < prev.p;
       if (!marked && !fallback) continue;
-      // Kind: prefer the server mark. Legacy samples (no ra recorded) fall
-      // back to the same backend heuristic: a collapse from a saturated
-      // window (~100%) is a natural CD rollover (passive); anything else
-      // without a declared reset time is uncertain (active). Samples with
-      // ra compare the observation time against the API-declared rollover.
+      // Kind: prefer the server mark. Unmarked resets on samples with an
+      // API reset_at compare the observation time against the declared
+      // rollover; legacy samples without ra cannot be classified — the
+      // type stays unknown (blank kind).
       let kind = marked ? cur.r : '';
-      if (!kind) {
-        if (prev.ra && Math.abs(cur.t - prev.ra) <= 1800) kind = 'p';
-        else if (!prev.ra && prev.p >= 90) kind = 'p';
-        else kind = 'a';
-      }
+      if (!kind && prev.ra && Math.abs(cur.t - prev.ra) <= 1800) kind = 'p';
+      else if (!kind && prev.ra) kind = 'a';
       lastResetAt = i; peakBefore = prev.p; lastResetKind = kind;
       const rx = x(cur.t).toFixed(1);
+      // Kind may be '' (unknown) for legacy samples without a recorded
+      // reset_at — the type cannot be determined, draw a plain grey
+      // dashed line and label it unknown.
       const passive = kind === 'p';
+      const unknown = kind !== 'p' && kind !== 'a';
       markers += '<line x1="' + rx + '" y1="' + T + '" x2="' + rx + '" y2="' + (H - B) +
-        '" stroke="' + (passive ? '#ff8a8a' : '#ffb36b') + '" stroke-width="1"' +
+        '" stroke="' + (passive ? '#ff8a8a' : unknown ? '#8b949e' : '#ffb36b') + '" stroke-width="1"' +
         (passive ? '' : ' stroke-dasharray="3 3"') +
-        ' title="' + (passive ? 'passive reset (observed live)' : 'reset (uncertain time)') + '"/>';
+        ' title="' + (passive ? 'passive reset (observed live)'
+          : unknown ? 'reset (type unknown — legacy data)' : 'reset (uncertain time)') + '"/>';
     }
     let statLine = '';
     if (lastResetAt > 0) {
       const kindLabel = lastResetKind === 'p' ? ' · <span class="muted">passive</span>'
-        : lastResetKind === 'a' ? ' · <span class="muted">uncertain</span>' : '';
+        : lastResetKind === 'a' ? ' · <span class="muted">uncertain</span>'
+          : ' · <span class="muted">unknown</span>';
       statLine = 'Last reset ' + ciFmtTime(new Date(series[lastResetAt].t * 1000).toISOString()) +
         ' — peak before it <b>' + peakBefore + '%</b>' + kindLabel;
     } else {

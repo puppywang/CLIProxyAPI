@@ -166,16 +166,9 @@ func (s *quotaHistoryStore) record(authID string, primary, secondary int, limitR
 				} else {
 					resetMark = "a"
 				}
-			} else if last.P >= 90 {
-				// Legacy sample without a recorded reset_at: a collapse
-				// from a saturated window (~100%) is almost certainly the
-				// natural CD rollover — mark passive.
-				resetMark = "p"
-			} else {
-				// No declared reset time and the window wasn't saturated:
-				// cannot confirm a CD rollover — mark active.
-				resetMark = "a"
 			}
+			// Legacy sample without a recorded reset_at: the reset type
+			// cannot be determined — leave the mark empty ("unknown").
 		}
 	}
 	var ra int64
