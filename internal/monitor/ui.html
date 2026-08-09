@@ -3781,12 +3781,14 @@
       const fallback = !marked && prev.p >= 5 && cur.p <= 5 && cur.p < prev.p;
       if (!marked && !fallback) continue;
       // Kind: prefer the server mark. Legacy samples (no ra recorded) fall
-      // back to the sample gap as a best effort — a recent previous sample
-      // suggests the drop was observed near the rollover.
+      // back to the same backend heuristic: a collapse from a saturated
+      // window (~100%) is a natural CD rollover (passive); anything else
+      // without a declared reset time is uncertain (active). Samples with
+      // ra compare the observation time against the API-declared rollover.
       let kind = marked ? cur.r : '';
       if (!kind) {
         if (prev.ra && Math.abs(cur.t - prev.ra) <= 1800) kind = 'p';
-        else if (!prev.ra && (cur.t - prev.t) <= 1800) kind = 'p';
+        else if (!prev.ra && prev.p >= 90) kind = 'p';
         else kind = 'a';
       }
       lastResetAt = i; peakBefore = prev.p; lastResetKind = kind;

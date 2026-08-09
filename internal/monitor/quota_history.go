@@ -156,12 +156,24 @@ func (s *quotaHistoryStore) record(authID string, primary, secondary int, limitR
 		// real usage level and the new one collapsed to (near) zero. No
 		// fixed drop threshold — 7%→0% is a reset too.
 		if last.P >= quotaResetMinPrev && primary <= quotaResetFloor && primary < last.P {
-			// Passive iff the API had advertised a reset at (about) this
-			// time on the previous sample — a CD rollover observed live.
-			if !last.ResetAt().IsZero() && now.Sub(last.ResetAt()) <= quotaPassiveSlack &&
-				last.ResetAt().Sub(now) <= quotaPassiveSlack {
+			if last.RA > 0 {
+				// API-declared reset time known: passive iff this
+				// observation lands at (about) the declared rollover —
+				// a true CD-cooldown reset the API was advertising.
+				ra := time.Unix(last.RA, 0)
+				if !ra.IsZero() && now.Sub(ra) <= quotaPassiveSlack && ra.Sub(now) <= quotaPassiveSlack {
+					resetMark = "p"
+				} else {
+					resetMark = "a"
+				}
+			} else if last.P >= 90 {
+				// Legacy sample without a recorded reset_at: a collapse
+				// from a saturated window (~100%) is almost certainly the
+				// natural CD rollover — mark passive.
 				resetMark = "p"
 			} else {
+				// No declared reset time and the window wasn't saturated:
+				// cannot confirm a CD rollover — mark active.
 				resetMark = "a"
 			}
 		}

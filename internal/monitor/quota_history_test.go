@@ -98,6 +98,38 @@ func TestQuotaHistoryResetMarking(t *testing.T) {
 	}
 }
 
+// TestQuotaHistoryResetMarking_LegacyNoResetAt verifies the legacy-sample
+// fallback: when the previous sample has no recorded API reset_at (ra=0),
+// a collapse from a saturated window (~100%) is a natural CD rollover
+// (passive), while a collapse from a low usage level is active (the window
+// wasn't near its cap, so the drop is not the declared rollover).
+func TestQuotaHistoryResetMarking_LegacyNoResetAt(t *testing.T) {
+	s := newQuotaHistoryStore("")
+	base := time.Now()
+
+	// Saturated 100% -> 0% with no ra on the previous sample: passive.
+	s.record("acct-1", 100, 40, false, time.Time{}, base)
+	s.record("acct-1", 0, 40, false, time.Time{}, base.Add(10*time.Minute))
+	series := s.data["acct-1"]
+	if len(series) != 2 {
+		t.Fatalf("expected 2 samples, got %d", len(series))
+	}
+	if series[1].R != "p" {
+		t.Fatalf("legacy 100%%->0%%: expected passive mark, got %q", series[1].R)
+	}
+
+	// Low 7% -> 0% with no ra: active (not a saturated-window rollover).
+	s.record("acct-2", 7, 10, false, time.Time{}, base)
+	s.record("acct-2", 0, 10, false, time.Time{}, base.Add(10*time.Minute))
+	series = s.data["acct-2"]
+	if len(series) != 2 {
+		t.Fatalf("expected 2 samples for acct-2, got %d", len(series))
+	}
+	if series[1].R != "a" {
+		t.Fatalf("legacy 7%%->0%%: expected active mark, got %q", series[1].R)
+	}
+}
+
 // TestQuotaHistoryResetMarking_PartialReset verifies that a collapse that
 // still leaves the window above the floor (e.g. 60% -> 15%) is NOT marked —
 // only collapses to (near) zero are resets.
