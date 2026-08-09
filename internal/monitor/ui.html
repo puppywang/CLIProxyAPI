@@ -3768,17 +3768,22 @@
     // Resets: prefer the server-side marker on each sample ("p" = passive
     // CD-cooldown reset observed through a continuous refresh cadence,
     // "a" = active reset across an observation gap). Old series recorded
-    // before the marker existed fall back to a >=25-point drop. Passive
-    // resets draw a solid red line, active ones a dashed amber line so the
-    // operator can tell a true cooldown reset from an uncertain one.
+    // before the marker existed fall back to the same backend rule: a
+    // collapse from a real usage level (>=5%) to near zero (<=5%) — so a
+    // 7%->0% reset is detected, not just 100%->0%. Passive resets draw a
+    // solid red line, uncertain ones a dashed amber line so the operator
+    // can tell a true cooldown reset from an uncertain one.
     let lastResetAt = -1, peakBefore = 0, lastResetKind = '';
     let markers = '';
     for (let i = 1; i < series.length; i++) {
       const prev = series[i - 1], cur = series[i];
       const marked = cur.r === 'p' || cur.r === 'a';
-      const isReset = marked || (prev.p - cur.p >= 25);
-      if (!isReset) continue;
-      const kind = cur.r === 'p' ? 'p' : (cur.r === 'a' ? 'a' : (prev.p - cur.p >= 25 ? '' : ''));
+      const fallback = !marked && prev.p >= 5 && cur.p <= 5 && cur.p < prev.p;
+      if (!marked && !fallback) continue;
+      // Old series have no server mark; infer passive/uncertain the same
+      // way the backend does: previous sample within ~30min means the
+      // reset was observed live through a continuous cadence.
+      const kind = marked ? cur.r : ((cur.t - prev.t) <= 1800 ? 'p' : 'a');
       lastResetAt = i; peakBefore = prev.p; lastResetKind = kind;
       const rx = x(cur.t).toFixed(1);
       const passive = kind === 'p';
