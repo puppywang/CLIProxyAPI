@@ -11,50 +11,56 @@ import (
 //   - a collapse from a real usage level to near zero counts as a reset even
 //     when the drop is small (7% -> 0% is a reset, the old >=25-point drop
 //     threshold would have missed it);
-//   - a recent previous sample (within quotaPassiveGap) marks the reset
-//     "passive" (observed live through a continuous refresh cadence);
-//   - a gap before the drop marks it "active" (exact reset time uncertain);
+//   - the reset is "passive" when the quota API's declared reset time
+//     (reset_at captured on the previous sample) falls within
+//     quotaPassiveSlack of the observation — a true CD-cooldown rollover;
+//   - the reset is "active" when it happens well before the declared reset
+//     time (manual reset / account switch / anomaly);
 //   - noise around zero (3% -> 0%) is not a reset.
 func TestQuotaHistoryResetMarking(t *testing.T) {
 	s := newQuotaHistoryStore("")
 	base := time.Now()
 
-	// 1. 100% -> 0% with a normal 10-min cadence: passive reset.
-	s.record("acct-1", 100, 30, false, base)
-	s.record("acct-1", 0, 30, false, base.Add(10*time.Minute))
+	// 1. 100% -> 0% and the API had declared the reset at this very moment:
+	// passive (true CD cooldown).
+	resetAt := base.Add(10 * time.Minute)
+	s.record("acct-1", 100, 30, false, resetAt, base)
+	s.record("acct-1", 0, 30, false, resetAt.Add(5*time.Hour), resetAt)
 	series := s.data["acct-1"]
 	if len(series) != 2 {
 		t.Fatalf("expected 2 samples, got %d", len(series))
 	}
 	if series[1].R != "p" {
-		t.Fatalf("100%%->0%% at 10min gap: expected passive mark, got %q", series[1].R)
+		t.Fatalf("100%%->0%% at declared reset time: expected passive mark, got %q", series[1].R)
 	}
 
-	// 2. 7% -> 0% with a normal cadence: passive reset (small drop still a reset).
-	s.record("acct-2", 7, 20, false, base)
-	s.record("acct-2", 0, 20, false, base.Add(12*time.Minute))
+	// 2. 7% -> 0% with the API declaring the reset at the same moment:
+	// passive (small drop still a reset, and it IS the declared rollover).
+	resetAt2 := base.Add(12 * time.Minute)
+	s.record("acct-2", 7, 20, false, resetAt2, base)
+	s.record("acct-2", 0, 20, false, resetAt2.Add(5*time.Hour), resetAt2)
 	series = s.data["acct-2"]
 	if len(series) != 2 {
 		t.Fatalf("expected 2 samples for acct-2, got %d", len(series))
 	}
 	if series[1].R != "p" {
-		t.Fatalf("7%%->0%% at 12min gap: expected passive mark, got %q", series[1].R)
+		t.Fatalf("7%%->0%% at declared reset time: expected passive mark, got %q", series[1].R)
 	}
 
-	// 3. 100% -> 0% across a long gap: active reset (refresher was down).
-	s.record("acct-3", 100, 30, false, base)
-	s.record("acct-3", 0, 30, false, base.Add(4*time.Hour))
+	// 3. 100% -> 0% but the API says the reset is hours away: active.
+	s.record("acct-3", 100, 30, false, base.Add(4*time.Hour), base)
+	s.record("acct-3", 0, 30, false, base.Add(4*time.Hour+30*time.Minute), base.Add(10*time.Minute))
 	series = s.data["acct-3"]
 	if len(series) != 2 {
 		t.Fatalf("expected 2 samples for acct-3, got %d", len(series))
 	}
 	if series[1].R != "a" {
-		t.Fatalf("100%%->0%% after 4h gap: expected active mark, got %q", series[1].R)
+		t.Fatalf("100%%->0%% before declared reset time: expected active mark, got %q", series[1].R)
 	}
 
 	// 4. 3% -> 0%: noise near zero, not a reset.
-	s.record("acct-4", 3, 10, false, base)
-	s.record("acct-4", 0, 10, false, base.Add(10*time.Minute))
+	s.record("acct-4", 3, 10, false, base.Add(10*time.Minute), base)
+	s.record("acct-4", 0, 10, false, base.Add(20*time.Minute), base.Add(10*time.Minute))
 	series = s.data["acct-4"]
 	if len(series) != 2 {
 		t.Fatalf("expected 2 samples for acct-4, got %d", len(series))
@@ -64,8 +70,8 @@ func TestQuotaHistoryResetMarking(t *testing.T) {
 	}
 
 	// 5. 100% -> 90%: gradual change, not a reset.
-	s.record("acct-5", 100, 30, false, base)
-	s.record("acct-5", 90, 30, false, base.Add(10*time.Minute))
+	s.record("acct-5", 100, 30, false, base.Add(10*time.Minute), base)
+	s.record("acct-5", 90, 30, false, base.Add(10*time.Minute), base.Add(10*time.Minute))
 	series = s.data["acct-5"]
 	if len(series) != 2 {
 		t.Fatalf("expected 2 samples for acct-5, got %d", len(series))
@@ -77,7 +83,7 @@ func TestQuotaHistoryResetMarking(t *testing.T) {
 	// 6. Steady state after a reset (0% -> 0%): no duplicate RESET MARK.
 	// (Unchanged samples still append for curve continuity when >1min apart,
 	// but a burst within 1min is deduped and 0%->0% never re-marks.)
-	s.record("acct-1", 0, 30, false, base.Add(20*time.Minute))
+	s.record("acct-1", 0, 30, false, resetAt.Add(10*time.Hour), resetAt.Add(20*time.Minute))
 	series = s.data["acct-1"]
 	if len(series) != 3 {
 		t.Fatalf("unchanged 0%% after 10min: expected curve sample appended, got %d samples", len(series))
@@ -86,7 +92,7 @@ func TestQuotaHistoryResetMarking(t *testing.T) {
 		t.Fatalf("0%%->0%%: expected no reset mark on steady sample, got %q", series[2].R)
 	}
 	n := len(series)
-	s.record("acct-1", 0, 30, false, base.Add(20*time.Minute+30*time.Second))
+	s.record("acct-1", 0, 30, false, resetAt.Add(10*time.Hour), resetAt.Add(20*time.Minute+30*time.Second))
 	if got := len(s.data["acct-1"]); got != n {
 		t.Fatalf("unchanged 0%% within 1min: expected dedupe (%d), got %d", n, got)
 	}
@@ -99,8 +105,8 @@ func TestQuotaHistoryResetMarking_PartialReset(t *testing.T) {
 	s := newQuotaHistoryStore("")
 	base := time.Now()
 
-	s.record("acct-1", 60, 40, false, base)
-	s.record("acct-1", 15, 40, false, base.Add(10*time.Minute))
+	s.record("acct-1", 60, 40, false, base.Add(10*time.Minute), base)
+	s.record("acct-1", 15, 40, false, base.Add(20*time.Minute), base.Add(10*time.Minute))
 	series := s.data["acct-1"]
 	if len(series) != 2 {
 		t.Fatalf("expected 2 samples, got %d", len(series))
@@ -116,13 +122,43 @@ func TestQuotaHistoryResetMarking_SecondaryOnly(t *testing.T) {
 	s := newQuotaHistoryStore("")
 	base := time.Now()
 
-	s.record("acct-1", 50, 100, false, base)
-	s.record("acct-1", 50, 0, false, base.Add(10*time.Minute))
+	s.record("acct-1", 50, 100, false, base.Add(10*time.Minute), base)
+	s.record("acct-1", 50, 0, false, base.Add(20*time.Minute), base.Add(10*time.Minute))
 	series := s.data["acct-1"]
 	if len(series) != 2 {
 		t.Fatalf("expected 2 samples, got %d", len(series))
 	}
 	if series[1].R != "" {
 		t.Fatalf("secondary-only collapse: expected no primary reset mark, got %q", series[1].R)
+	}
+}
+
+// TestQuotaHistoryResetAtCaptured verifies that the API-declared reset time
+// is stored on each sample and used for the passive/active classification.
+func TestQuotaHistoryResetAtCaptured(t *testing.T) {
+	s := newQuotaHistoryStore("")
+	base := time.Now()
+	resetAt := base.Add(10 * time.Minute)
+
+	s.record("acct-1", 42, 10, false, resetAt, base)
+	series := s.data["acct-1"]
+	if len(series) != 1 {
+		t.Fatalf("expected 1 sample, got %d", len(series))
+	}
+	if series[0].RA != resetAt.Unix() {
+		t.Fatalf("reset_at not captured: got %d want %d", series[0].RA, resetAt.Unix())
+	}
+	if got := series[0].ResetAt().Unix(); got != resetAt.Unix() {
+		t.Fatalf("ResetAt() mismatch: got %d want %d", got, resetAt.Unix())
+	}
+
+	// Zero reset_at: stored as 0 and never classified passive.
+	s.record("acct-2", 42, 10, false, time.Time{}, base)
+	if s.data["acct-2"][0].RA != 0 {
+		t.Fatalf("zero reset_at should store 0, got %d", s.data["acct-2"][0].RA)
+	}
+	s.record("acct-2", 0, 10, false, time.Time{}, base.Add(10*time.Minute))
+	if s.data["acct-2"][1].R != "a" {
+		t.Fatalf("unknown reset_at drop: expected active mark, got %q", s.data["acct-2"][1].R)
 	}
 }

@@ -834,7 +834,7 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 	pushSnapshot := func(authID string, snap coreauth.QuotaSnapshot) {
 		selector.PushSnapshot(authID, snap)
 		if s.server != nil {
-			s.server.RecordQuotaSample(authID, snap.UsedPercentPrimary, snap.UsedPercentSecondary, snap.LimitReached)
+			s.server.RecordQuotaSample(authID, snap.UsedPercentPrimary, snap.UsedPercentSecondary, snap.LimitReached, snap.ResetAtPrimary)
 		}
 	}
 	refresher := quota.NewRefresher(
@@ -926,7 +926,7 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 	// Same history mirroring as the codex refresher, so grok rows get a curve too.
 	if s.server != nil {
 		xaiPoller.SetObserver(func(authID string, snap coreauth.QuotaSnapshot) {
-			s.server.RecordQuotaSample(authID, snap.UsedPercentPrimary, snap.UsedPercentSecondary, snap.LimitReached)
+			s.server.RecordQuotaSample(authID, snap.UsedPercentPrimary, snap.UsedPercentSecondary, snap.LimitReached, snap.ResetAtPrimary)
 		})
 	}
 	xaiPoller.Start(ctx)

@@ -29,11 +29,13 @@ const (
 	// this percent for the drop to count as a reset. Guards against
 	// refresh-interface jitter (3% -> 0% is noise, 7% -> 0% is a reset).
 	quotaResetMinPrev = 5
-	// quotaPassiveGap: when the previous sample is older than this, the
-	// drop happened inside an observation gap (refresher down, proxy
-	// restart, …) and the exact reset time is unknown — the reset is
-	// marked "active" instead of "passive".
-	quotaPassiveGap = 30 * time.Minute
+	// quotaPassiveSlack: when a reset is observed, it is "passive" if the
+	// quota API's declared reset time (reset_at) for the collapsed window
+	// falls within this margin of the observation time. That means the
+	// drop is a true CD-cooldown rollover the API was advertising. A
+	// collapse that happens well before the declared reset time is
+	// "active" (manual reset / account switch / interface anomaly).
+	quotaPassiveSlack = 30 * time.Minute
 )
 
 // QuotaSample is one observation of an auth's quota windows. Field names are
@@ -44,11 +46,16 @@ type QuotaSample struct {
 	P int   `json:"p"`           // primary window used percent (codex 5h / grok weekly)
 	S int   `json:"s"`           // secondary window used percent (codex 7d / grok monthly)
 	L bool  `json:"l,omitempty"` // limit_reached at this sample
+	// RA is the primary-window reset time the quota API declared at this
+	// sample (unix seconds; 0 when unknown). Used to classify a later
+	// reset as passive (observed near the declared rollover) or active.
+	RA int64 `json:"ra,omitempty"`
 	// R marks a primary-window reset observed at this sample:
-	//   "p" = passive — the previous sample was recent (within
-	//         quotaPassiveGap), so this is a true CD-cooldown reset;
-	//   "a" = active — there was an observation gap before the drop, so
-	//         the reset time is uncertain (e.g. refresher was down).
+	//   "p" = passive — the API-declared reset time (previous sample's RA)
+	//         fell within quotaPassiveSlack of this observation, so this is
+	//         a true CD-cooldown rollover;
+	//   "a" = active — the drop happened well before the declared reset
+	//         time (manual reset / account switch / anomaly).
 	R string `json:"r,omitempty"`
 }
 
@@ -125,11 +132,12 @@ func (s *quotaHistoryStore) load() {
 //
 // A primary-window reset (usage collapsing from a real value to near zero —
 // 100%→0%, 7%→0%, …) is marked on the new sample: "p" (passive) when the
-// previous sample is recent enough that the reset was observed live through a
-// continuous refresh cadence — a true CD-cooldown reset — and "a" (active)
-// when the drop happened across an observation gap (refresher down, proxy
-// restart) so the exact reset time is uncertain.
-func (s *quotaHistoryStore) record(authID string, primary, secondary int, limitReached bool, now time.Time) {
+// quota API's declared reset time for the collapsed window (resetAtPrimary,
+// captured on the previous sample) falls within quotaPassiveSlack of this
+// observation — a true CD-cooldown rollover the API was advertising. Any
+// collapse well before the declared reset time is "a" (active): manual reset,
+// account switch, or an interface anomaly.
+func (s *quotaHistoryStore) record(authID string, primary, secondary int, limitReached bool, resetAtPrimary time.Time, now time.Time) {
 	if s == nil || authID == "" {
 		return
 	}
@@ -148,14 +156,21 @@ func (s *quotaHistoryStore) record(authID string, primary, secondary int, limitR
 		// real usage level and the new one collapsed to (near) zero. No
 		// fixed drop threshold — 7%→0% is a reset too.
 		if last.P >= quotaResetMinPrev && primary <= quotaResetFloor && primary < last.P {
-			if now.Sub(time.Unix(last.T, 0)) <= quotaPassiveGap {
+			// Passive iff the API had advertised a reset at (about) this
+			// time on the previous sample — a CD rollover observed live.
+			if !last.ResetAt().IsZero() && now.Sub(last.ResetAt()) <= quotaPassiveSlack &&
+				last.ResetAt().Sub(now) <= quotaPassiveSlack {
 				resetMark = "p"
 			} else {
 				resetMark = "a"
 			}
 		}
 	}
-	series = append(series, QuotaSample{T: now.Unix(), P: primary, S: secondary, L: limitReached, R: resetMark})
+	var ra int64
+	if !resetAtPrimary.IsZero() {
+		ra = resetAtPrimary.Unix()
+	}
+	series = append(series, QuotaSample{T: now.Unix(), P: primary, S: secondary, L: limitReached, RA: ra, R: resetMark})
 
 	cutoff := now.Add(-quotaHistoryRetention).Unix()
 	trimmed := 0
@@ -171,6 +186,15 @@ func (s *quotaHistoryStore) record(authID string, primary, secondary int, limitR
 	s.data[authID] = series
 	s.dirty = true
 	s.saveLocked(now)
+}
+
+// ResetAt returns the primary-window reset time the API declared at this
+// sample as a time.Time; zero when unknown (pre-marker history or API gap).
+func (q QuotaSample) ResetAt() time.Time {
+	if q.RA == 0 {
+		return time.Time{}
+	}
+	return time.Unix(q.RA, 0)
 }
 
 // snapshot returns a copy of every series, optionally limited to samples newer
@@ -241,15 +265,17 @@ func (r *Registry) AttachQuotaHistory(path string) {
 }
 
 // RecordQuotaSample records one quota observation for authID. No-op until
-// AttachQuotaHistory has been called.
-func (r *Registry) RecordQuotaSample(authID string, primary, secondary int, limitReached bool) {
+// AttachQuotaHistory has been called. resetAtPrimary is the primary-window
+// reset time the quota API declared for this snapshot (used to classify a
+// later reset as passive vs active); pass the zero time when unknown.
+func (r *Registry) RecordQuotaSample(authID string, primary, secondary int, limitReached bool, resetAtPrimary time.Time) {
 	if r == nil {
 		return
 	}
 	r.mu.RLock()
 	store := r.quotaHistory
 	r.mu.RUnlock()
-	store.record(authID, primary, secondary, limitReached, time.Now())
+	store.record(authID, primary, secondary, limitReached, resetAtPrimary, time.Now())
 }
 
 // QuotaHistorySnapshot returns the retained series, limited to the last `hours`

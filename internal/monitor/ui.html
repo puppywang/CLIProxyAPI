@@ -3780,10 +3780,15 @@
       const marked = cur.r === 'p' || cur.r === 'a';
       const fallback = !marked && prev.p >= 5 && cur.p <= 5 && cur.p < prev.p;
       if (!marked && !fallback) continue;
-      // Old series have no server mark; infer passive/uncertain the same
-      // way the backend does: previous sample within ~30min means the
-      // reset was observed live through a continuous cadence.
-      const kind = marked ? cur.r : ((cur.t - prev.t) <= 1800 ? 'p' : 'a');
+      // Kind: prefer the server mark. Legacy samples (no ra recorded) fall
+      // back to the sample gap as a best effort — a recent previous sample
+      // suggests the drop was observed near the rollover.
+      let kind = marked ? cur.r : '';
+      if (!kind) {
+        if (prev.ra && Math.abs(cur.t - prev.ra) <= 1800) kind = 'p';
+        else if (!prev.ra && (cur.t - prev.t) <= 1800) kind = 'p';
+        else kind = 'a';
+      }
       lastResetAt = i; peakBefore = prev.p; lastResetKind = kind;
       const rx = x(cur.t).toFixed(1);
       const passive = kind === 'p';
@@ -3848,7 +3853,9 @@
           '<span class="k">5h/weekly</span> <span class="vp">' + s.p + '%</span> · ' +
           '<span class="k">7d/monthly</span> <span class="vs">' + s.s + '%</span>' +
           (s.r === 'p' ? '<br><span class="lim">⬇ passive reset (CD cooldown)</span>'
-            : s.r === 'a' ? '<br><span class="lim">⬇ reset (uncertain time)</span>' : '') +
+            : s.r === 'a' ? '<br><span class="lim">⬇ active reset (before CD end)</span>' : '') +
+          (s.ra ? '<br><span class="k">api reset_at</span> <span class="vs">' +
+            ciFmtTime(new Date(s.ra * 1000).toISOString()) + '</span>' : '') +
           (s.l ? '<br><span class="lim">limit reached</span>' : '');
         const wrapRect = host.getBoundingClientRect();
         // Unhide before measuring — a display:none element reports zero size.

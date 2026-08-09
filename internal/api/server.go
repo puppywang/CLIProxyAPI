@@ -753,11 +753,11 @@ func (s *Server) SetMonitorBytesRecorder(rec monitor.AuthBytesRecorder) {
 // RecordQuotaSample forwards one quota observation into the monitor's history
 // store so the quota panel can draw a usage curve. Called by the quota
 // subsystem whenever a fresh snapshot is fetched.
-func (s *Server) RecordQuotaSample(authID string, primary, secondary int, limitReached bool) {
+func (s *Server) RecordQuotaSample(authID string, primary, secondary int, limitReached bool, resetAtPrimary time.Time) {
 	if s == nil || s.monitorRegistry == nil {
 		return
 	}
-	s.monitorRegistry.RecordQuotaSample(authID, primary, secondary, limitReached)
+	s.monitorRegistry.RecordQuotaSample(authID, primary, secondary, limitReached, resetAtPrimary)
 }
 
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.
