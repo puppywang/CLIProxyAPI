@@ -11,6 +11,140 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
+// TestFloatingWindowDetector verifies the fresh-account floating-window
+// detection and the probe trigger:
+//
+//   - an account whose reset_at sits at fetched_at + 7d (window never
+//     started counting) with zero usage is "floating";
+//   - two consecutive floating observations fire exactly one probe;
+//   - once the window is anchored (reset_at no longer sliding), no more
+//     probes fire;
+//   - the probe is throttled: a failed probe is not retried within
+//     quotaProbeMinInterval.
+func TestFloatingWindowDetector(t *testing.T) {
+	now := time.Now()
+	fetcher := newFakeFetcher()
+	// First fetch: floating (reset_at = fetched + 7d, unused).
+	fetcher.fixtures["floating-1"] = fakeFixture{snap: coreauth.QuotaSnapshot{
+		UsedPercentPrimary:   0,
+		UsedPercentSecondary: 0,
+		FetchedAt:            now,
+		ResetAtPrimary:       now.Add(7 * 24 * time.Hour),
+	}}
+
+	var probeCalls atomic.Int64
+	pusher := func(authID string, snap coreauth.QuotaSnapshot) {}
+	refresher := NewRefresher(fetcher, func() []*coreauth.Auth {
+		return []*coreauth.Auth{{ID: "floating-1", Provider: "codex"}}
+	}, pusher, WithProbePin(func(ctx context.Context, a *coreauth.Auth) error {
+		probeCalls.Add(1)
+		return nil
+	}))
+
+	auth := &coreauth.Auth{ID: "floating-1", Provider: "codex"}
+
+	// Cycle 1: first floating observation — remember, do not probe yet.
+	snap1, _, _ := fetcher.Fetch(context.Background(), auth)
+	refresher.maybeProbeFloatingWindow(context.Background(), auth, snap1)
+	if probeCalls.Load() != 0 {
+		t.Fatalf("cycle 1: expected no probe, got %d", probeCalls.Load())
+	}
+
+	// Cycle 2: second floating observation — fire one probe.
+	fetcher.fixtures["floating-1"] = fakeFixture{snap: coreauth.QuotaSnapshot{
+		UsedPercentPrimary:   0,
+		UsedPercentSecondary: 0,
+		FetchedAt:            now.Add(10 * time.Minute),
+		ResetAtPrimary:       now.Add(10*time.Minute + 7*24*time.Hour),
+	}}
+	snap2, _, _ := fetcher.Fetch(context.Background(), auth)
+	refresher.maybeProbeFloatingWindow(context.Background(), auth, snap2)
+	if probeCalls.Load() != 1 {
+		t.Fatalf("cycle 2: expected 1 probe, got %d", probeCalls.Load())
+	}
+
+	// Cycle 3: anchored now (reset_at no longer sliding) — no probe.
+	fetcher.fixtures["floating-1"] = fakeFixture{snap: coreauth.QuotaSnapshot{
+		UsedPercentPrimary:   1,
+		UsedPercentSecondary: 0,
+		FetchedAt:            now.Add(20 * time.Minute),
+		ResetAtPrimary:       now.Add(10*time.Minute + 7*24*time.Hour),
+	}}
+	snap3, _, _ := fetcher.Fetch(context.Background(), auth)
+	refresher.maybeProbeFloatingWindow(context.Background(), auth, snap3)
+	if probeCalls.Load() != 1 {
+		t.Fatalf("cycle 3 (anchored): expected no new probe, got %d", probeCalls.Load())
+	}
+}
+
+// TestFloatingWindowThrottle verifies that a probe attempt is throttled:
+// consecutive floating observations within quotaProbeMinInterval do not
+// re-fire the probe (e.g. after a failure).
+func TestFloatingWindowThrottle(t *testing.T) {
+	now := time.Now()
+	fetcher := newFakeFetcher()
+	var probeCalls atomic.Int64
+	refresher := NewRefresher(fetcher, func() []*coreauth.Auth { return nil }, func(authID string, snap coreauth.QuotaSnapshot) {},
+		WithProbePin(func(ctx context.Context, a *coreauth.Auth) error {
+			probeCalls.Add(1)
+			return errors.New("probe failed")
+		}))
+
+	auth := &coreauth.Auth{ID: "floating-2", Provider: "codex"}
+	fixture := fakeFixture{snap: coreauth.QuotaSnapshot{
+		UsedPercentPrimary: 0,
+		FetchedAt:          now,
+		ResetAtPrimary:     now.Add(7 * 24 * time.Hour),
+	}}
+	fetcher.fixtures["floating-2"] = fixture
+
+	// Two cycles fire the first probe (which fails).
+	snap1, _, _ := fetcher.Fetch(context.Background(), auth)
+	refresher.maybeProbeFloatingWindow(context.Background(), auth, snap1)
+	snap2, _, _ := fetcher.Fetch(context.Background(), auth)
+	refresher.maybeProbeFloatingWindow(context.Background(), auth, snap2)
+	if probeCalls.Load() != 1 {
+		t.Fatalf("expected 1 probe after 2 cycles, got %d", probeCalls.Load())
+	}
+
+	// Third cycle within the throttle window: no new probe.
+	fetcher.fixtures["floating-2"] = fakeFixture{snap: coreauth.QuotaSnapshot{
+		UsedPercentPrimary: 0,
+		FetchedAt:          now.Add(10 * time.Minute),
+		ResetAtPrimary:     now.Add(10*time.Minute + 7*24*time.Hour),
+	}}
+	snap3, _, _ := fetcher.Fetch(context.Background(), auth)
+	refresher.maybeProbeFloatingWindow(context.Background(), auth, snap3)
+	if probeCalls.Load() != 1 {
+		t.Fatalf("expected throttled probe (still 1), got %d", probeCalls.Load())
+	}
+}
+
+// TestFloatingWindowNotTriggeredForInUseOrLimited verifies that accounts
+// with usage or limit_reached never look floating.
+func TestFloatingWindowNotTriggeredForInUseOrLimited(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name string
+		snap coreauth.QuotaSnapshot
+	}{
+		{"in-use", coreauth.QuotaSnapshot{UsedPercentPrimary: 40, FetchedAt: now, ResetAtPrimary: now.Add(7 * 24 * time.Hour)}},
+		{"limit-reached", coreauth.QuotaSnapshot{UsedPercentPrimary: 100, LimitReached: true, FetchedAt: now, ResetAtPrimary: now.Add(7 * 24 * time.Hour)}},
+		{"no-reset-at", coreauth.QuotaSnapshot{UsedPercentPrimary: 0, FetchedAt: now}},
+	}
+	for _, tc := range cases {
+		if floatingWindow(tc.snap) {
+			t.Fatalf("%s: expected not floating, got floating", tc.name)
+		}
+	}
+
+	// A genuinely floating fresh window must be detected.
+	floating := coreauth.QuotaSnapshot{UsedPercentPrimary: 0, FetchedAt: now, ResetAtPrimary: now.Add(7 * 24 * time.Hour)}
+	if !floatingWindow(floating) {
+		t.Fatal("fresh unused window: expected floating, got not floating")
+	}
+}
+
 // fakeFetcher implements coreauth.QuotaFetcher with deterministic
 // behaviour driven by per-auth fixtures. Each Fetch call increments a
 // counter so tests can assert how many times each auth was refreshed.

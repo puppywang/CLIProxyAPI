@@ -911,6 +911,15 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 		quota.WithPlanUpdater(func(ctx context.Context, auth *coreauth.Auth, planType string) error {
 			return s.applyCodexPlanTypeFromUpstream(ctx, auth, planType)
 		}),
+		// Anchor floating quota windows: a fresh account that has never
+		// made a real request reports reset_at ≈ fetched_at + 7d on every
+		// wham/usage fetch (the window never starts counting, so its daily
+		// allowance is wasted). Fire one minimal probe request to pin the
+		// window and stop reset_at from sliding. The probe shares the
+		// fetcher's transport/token plumbing (per-auth proxy honoured).
+		quota.WithProbePin(func(ctx context.Context, auth *coreauth.Auth) error {
+			return s.quotaFetcher.ProbePin(ctx, auth)
+		}),
 	)
 	refresher.Start(ctx)
 	s.quotaRefresher = refresher

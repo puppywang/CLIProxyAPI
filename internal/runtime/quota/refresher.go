@@ -63,6 +63,7 @@ type Refresher struct {
 	staleCleaner   StaleCooldownClearer
 	limitReachedFn LimitReachedSetter
 	planUpdater    PlanUpdater
+	probeFn        ProbePinFunc
 	interval       time.Duration
 	concurrency    int
 
@@ -72,6 +73,17 @@ type Refresher struct {
 	done     chan struct{}
 	triggers chan string
 	started  bool
+
+	// snapshots remembers the last successful snapshot per auth so the
+	// refresher can detect a *floating* quota window: an account that has
+	// never made a real request reports reset_at ≈ fetched_at + 7d on
+	// every fetch (the window never starts counting). Two consecutive
+	// observations of a near-full window + zero usage trigger a probe so
+	// the window gets anchored. Guarded by mu.
+	snapshots map[string]coreauth.QuotaSnapshot
+	// probedAt records the last probe attempt per auth so a failed or
+	// ineffective probe is not retried more often than quotaProbeMinInterval.
+	probedAt map[string]time.Time
 
 	// deadMu guards dead. dead records auths whose most recent fetch
 	// returned a terminal "account unusable" upstream signal (see
@@ -136,6 +148,31 @@ type LimitReachedSetter func(ctx context.Context, authID string, snap coreauth.Q
 // is a no-op.
 type PlanUpdater func(ctx context.Context, auth *coreauth.Auth, planType string) error
 
+// ProbePinFunc is the optional hook the refresher invokes when it detects
+// a *floating* quota window — an account that has never made a real
+// request, so wham/usage keeps reporting reset_at ≈ fetched_at + 7d and
+// the daily allowance is wasted. Firing one minimal generation request
+// anchors the window (see CodexWhamFetcher.ProbePin). Implementations
+// must be safe for concurrent calls and should return quickly (the
+// refresher invokes it synchronously inside the refresh cycle).
+type ProbePinFunc func(ctx context.Context, auth *coreauth.Auth) error
+
+// Quota window drift detection parameters. A fresh account's wham/usage
+// reports a full 7d window on every fetch; an account that has made at
+// least one request reports a window that started counting at that
+// moment, so reset_at stays fixed. quotaWindowDriftFloor is how close
+// reset_at must be to fetched_at + 7d to count as "window not started".
+const (
+	// quotaWindowFull is the codex primary window length.
+	quotaWindowFull = 7 * 24 * time.Hour
+	// quotaWindowDriftFloor: reset_at within this margin of fetched_at +
+	// 7d means the window has not started counting yet (floating).
+	quotaWindowDriftFloor = 7*24*time.Hour - 30*time.Minute
+	// quotaProbeMinInterval: minimum gap between probe attempts for the
+	// same auth, so a failing probe is retried at most once per hour.
+	quotaProbeMinInterval = 1 * time.Hour
+)
+
 // RefresherOption tunes a Refresher at construction. Use the WithX helpers
 // rather than poking the struct directly.
 type RefresherOption func(*Refresher)
@@ -168,6 +205,16 @@ func WithLimitReachedSetter(fn LimitReachedSetter) RefresherOption {
 func WithPlanUpdater(fn PlanUpdater) RefresherOption {
 	return func(r *Refresher) {
 		r.planUpdater = fn
+	}
+}
+
+// WithProbePin registers the hook that anchors a floating quota window by
+// firing one minimal generation request when the refresher detects an
+// account whose wham/usage reset_at keeps sliding (never made a request).
+// Pass nil or omit to disable window anchoring (the legacy behaviour).
+func WithProbePin(fn ProbePinFunc) RefresherOption {
+	return func(r *Refresher) {
+		r.probeFn = fn
 	}
 }
 
@@ -214,6 +261,8 @@ func NewRefresher(fetcher coreauth.QuotaFetcher, lister AuthLister, pusher Snaps
 		backoffs:    map[string]*backoffState{},
 		triggers:    make(chan string, 32),
 		dead:        map[string]deadMarker{},
+		snapshots:   map[string]coreauth.QuotaSnapshot{},
+		probedAt:    map[string]time.Time{},
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -506,6 +555,15 @@ func (r *Refresher) refresh(ctx context.Context, a *coreauth.Auth, scheduleNext 
 	log.Debugf("quota-refresher: fetch ok | auth=%s primary_used=%d%% secondary_used=%d%% limit_reached=%t",
 		a.ID, snap.UsedPercentPrimary, snap.UsedPercentSecondary, snap.LimitReached)
 
+	// Floating-window anchor: an account that has never made a real
+	// request reports reset_at ≈ fetched_at + 7d on EVERY wham/usage
+	// fetch — the window never starts counting, so reset_at keeps
+	// sliding forward and the account permanently wastes its daily
+	// allowance (100/7 ≈ 15 points/day on a fresh plus account). Two
+	// consecutive near-full-window observations with zero usage means
+	// the window is floating; fire one minimal probe request to pin it.
+	r.maybeProbeFloatingWindow(ctx, a, snap)
+
 	// Auto-recovery: when wham reports the auth is healthy
 	// (limit_reached=false) AND the in-memory state still carries an
 	// error marker, drop the stale cooldown so the next pick can use
@@ -555,6 +613,76 @@ func (r *Refresher) maybeUpdatePlan(ctx context.Context, a *coreauth.Auth, snap 
 	if err := r.planUpdater(ctx, a, plan); err != nil {
 		log.WithError(err).Warnf("quota-refresher: plan_type update failed | auth=%s plan=%s", a.ID, plan)
 	}
+}
+
+// floatingWindow reports whether a snapshot looks like a quota window that
+// has never started counting: the API-declared reset_at sits at (or beyond)
+// fetched_at + 7d - quotaWindowDriftFloor, and the window is unused. Fresh
+// accounts behave this way — every fetch slides reset_at forward by 7d.
+func floatingWindow(snap coreauth.QuotaSnapshot) bool {
+	if snap.ResetAtPrimary.IsZero() || snap.FetchedAt.IsZero() {
+		return false
+	}
+	if snap.LimitReached || snap.UsedPercentPrimary > 5 {
+		// The window is either exhausted or in use — not a floating fresh one.
+		return false
+	}
+	remaining := snap.ResetAtPrimary.Sub(snap.FetchedAt)
+	return remaining >= quotaWindowDriftFloor
+}
+
+// maybeProbeFloatingWindow detects a fresh account whose wham/usage window
+// keeps floating (reset_at ≈ fetched_at + 7d on consecutive fetches) and
+// fires one minimal probe request to anchor the window, so the full 7-day
+// budget becomes usable instead of sliding away day by day. Requires:
+//
+//   - the previous snapshot also looked floating (two consecutive
+//     observations — one could be a stale cache artifact), and
+//   - the account is not over limit / in use, and
+//   - at least quotaProbeMinInterval has passed since the last attempt.
+//
+// The probe runs synchronously inside the refresh cycle; its cost is a
+// single tiny generation request (max_output_tokens=1 on the cheapest
+// model). Failures are logged and throttled, never fatal.
+func (r *Refresher) maybeProbeFloatingWindow(ctx context.Context, a *coreauth.Auth, snap coreauth.QuotaSnapshot) {
+	if r == nil || a == nil || r.probeFn == nil {
+		return
+	}
+	if !floatingWindow(snap) {
+		r.mu.Lock()
+		delete(r.snapshots, a.ID)
+		r.mu.Unlock()
+		return
+	}
+
+	r.mu.Lock()
+	prev, sawPrev := r.snapshots[a.ID]
+	lastProbe, sawProbe := r.probedAt[a.ID]
+	r.snapshots[a.ID] = snap
+	r.mu.Unlock()
+
+	if !sawPrev || !floatingWindow(prev) {
+		// First observation (or the previous one was not floating):
+		// remember and wait for the next cycle to confirm.
+		return
+	}
+	if sawProbe && time.Since(lastProbe) < quotaProbeMinInterval {
+		// Already attempted recently — the next cycle will re-check
+		// whether reset_at finally stopped sliding.
+		return
+	}
+
+	r.mu.Lock()
+	r.probedAt[a.ID] = time.Now()
+	r.mu.Unlock()
+
+	log.Infof("quota-refresher: floating window detected | auth=%s reset_at=%s fetched_at=%s used=%d%% — firing probe to anchor the 7d window",
+		a.ID, snap.ResetAtPrimary.Format(time.RFC3339), snap.FetchedAt.Format(time.RFC3339), snap.UsedPercentPrimary)
+	if err := r.probeFn(ctx, a); err != nil {
+		log.WithError(err).Warnf("quota-refresher: window anchor probe failed | auth=%s", a.ID)
+		return
+	}
+	log.Infof("quota-refresher: window anchor probe ok | auth=%s — reset_at should now be fixed", a.ID)
 }
 
 // hasErrorMarker reports whether the auth (or any of its per-model
