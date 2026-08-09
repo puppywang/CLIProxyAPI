@@ -3765,26 +3765,41 @@
       const lbl = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
       axis += '<text x="' + x(t).toFixed(1) + '" y="' + (H - 6) + '" text-anchor="middle" fill="rgba(255,255,255,0.4)" font-size="10">' + lbl + '</text>';
     }
-    // Peak before the most recent reset (a drop of >=25 points between samples).
-    let resetAt = -1, peakBefore = 0;
+    // Resets: prefer the server-side marker on each sample ("p" = passive
+    // CD-cooldown reset observed through a continuous refresh cadence,
+    // "a" = active reset across an observation gap). Old series recorded
+    // before the marker existed fall back to a >=25-point drop. Passive
+    // resets draw a solid red line, active ones a dashed amber line so the
+    // operator can tell a true cooldown reset from an uncertain one.
+    let lastResetAt = -1, peakBefore = 0, lastResetKind = '';
+    let markers = '';
     for (let i = 1; i < series.length; i++) {
-      if (series[i - 1].p - series[i].p >= 25) { resetAt = i; peakBefore = series[i - 1].p; }
+      const prev = series[i - 1], cur = series[i];
+      const marked = cur.r === 'p' || cur.r === 'a';
+      const isReset = marked || (prev.p - cur.p >= 25);
+      if (!isReset) continue;
+      const kind = cur.r === 'p' ? 'p' : (cur.r === 'a' ? 'a' : (prev.p - cur.p >= 25 ? '' : ''));
+      lastResetAt = i; peakBefore = prev.p; lastResetKind = kind;
+      const rx = x(cur.t).toFixed(1);
+      const passive = kind === 'p';
+      markers += '<line x1="' + rx + '" y1="' + T + '" x2="' + rx + '" y2="' + (H - B) +
+        '" stroke="' + (passive ? '#ff8a8a' : '#ffb36b') + '" stroke-width="1"' +
+        (passive ? '' : ' stroke-dasharray="3 3"') +
+        ' title="' + (passive ? 'passive reset (observed live)' : 'reset (uncertain time)') + '"/>';
     }
-    let marker = '';
     let statLine = '';
-    if (resetAt > 0) {
-      const rx = x(series[resetAt].t).toFixed(1);
-      marker = '<line x1="' + rx + '" y1="' + T + '" x2="' + rx + '" y2="' + (H - B) +
-        '" stroke="#ff8a8a" stroke-width="1" stroke-dasharray="3 3"/>';
-      statLine = 'Last reset ' + ciFmtTime(new Date(series[resetAt].t * 1000).toISOString()) +
-        ' — peak before it <b>' + peakBefore + '%</b>';
+    if (lastResetAt > 0) {
+      const kindLabel = lastResetKind === 'p' ? ' · <span class="muted">passive</span>'
+        : lastResetKind === 'a' ? ' · <span class="muted">uncertain</span>' : '';
+      statLine = 'Last reset ' + ciFmtTime(new Date(series[lastResetAt].t * 1000).toISOString()) +
+        ' — peak before it <b>' + peakBefore + '%</b>' + kindLabel;
     } else {
       statLine = 'No reset in this range — peak <b>' + series.reduce((m, s) => Math.max(m, s.p), 0) + '%</b>';
     }
 
     host.innerHTML =
       '<svg id="qcSvg" viewBox="0 0 ' + W + ' ' + H + '">' +
-      grid + axis + marker +
+      grid + axis + markers +
       '<path d="' + path('s') + '" fill="none" stroke="#c58fff" stroke-width="1.5" opacity="0.85"/>' +
       '<path d="' + path('p') + '" fill="none" stroke="#8fc6ff" stroke-width="1.8"/>' +
       '<g id="qcCross" style="display:none">' +
@@ -3827,6 +3842,8 @@
         tip.innerHTML = '<span class="k">' + stamp + '</span><br>' +
           '<span class="k">5h/weekly</span> <span class="vp">' + s.p + '%</span> · ' +
           '<span class="k">7d/monthly</span> <span class="vs">' + s.s + '%</span>' +
+          (s.r === 'p' ? '<br><span class="lim">⬇ passive reset (CD cooldown)</span>'
+            : s.r === 'a' ? '<br><span class="lim">⬇ reset (uncertain time)</span>' : '') +
           (s.l ? '<br><span class="lim">limit reached</span>' : '');
         const wrapRect = host.getBoundingClientRect();
         // Unhide before measuring — a display:none element reports zero size.
