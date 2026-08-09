@@ -52,7 +52,7 @@ func (f *CodexWhamFetcher) ProbePin(ctx context.Context, auth *coreauth.Auth) er
 	}
 	client := &http.Client{Transport: rt}
 
-	payload := []byte(`{"model":"gpt-5.4-mini","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":1,"stream":false}`)
+	payload := []byte(`{"model":"gpt-5.4-mini","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":1,"stream":false,"store":false}`)
 	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, codexProbeURL, bytes.NewReader(payload))
