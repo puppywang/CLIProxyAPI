@@ -554,8 +554,9 @@ func TestRefresher_AlignCooldownEndPullsNextAtForward(t *testing.T) {
 
 	// Conductor reports a cooldown ending in 2 minutes — earlier than
 	// the next scheduled refresh.
-	cooldownEnd := time.Now().Add(2 * time.Minute)
-	r.alignCooldownEnd(authID, cooldownEnd)
+	now := time.Now()
+	cooldownEnd := now.Add(2 * time.Minute)
+	r.alignCooldownEnd(authID, cooldownEnd, now)
 	r.mu.Lock()
 	aligned := r.backoffs[authID].nextAt
 	r.mu.Unlock()
@@ -563,14 +564,45 @@ func TestRefresher_AlignCooldownEndPullsNextAtForward(t *testing.T) {
 		t.Fatalf("alignCooldownEnd should pull nextAt back to cooldownEnd; got %v, want %v", aligned, cooldownEnd)
 	}
 
+	// A cooldown ending far in the future must NOT park the auth until
+	// then: the refresher keeps a slow probe cadence so an early window
+	// rollover is still noticed (wham can reset before the advertised
+	// deadline). The probe deadline is now + quotaCooldownProbeInterval.
+	// Reset backoff state first so the earlier short-cooldown alignment
+	// does not leak into this scenario.
+	r.mu.Lock()
+	delete(r.backoffs, authID)
+	r.mu.Unlock()
+	longNow := time.Now()
+	longEnd := longNow.Add(48 * time.Hour)
+	r.alignCooldownEnd(authID, longEnd, longNow)
+	r.mu.Lock()
+	probeAt := r.backoffs[authID].nextAt
+	r.mu.Unlock()
+	wantProbe := longNow.Add(quotaCooldownProbeInterval)
+	if probeAt.Unix() != wantProbe.Unix() {
+		t.Fatalf("long cooldown should probe at interval; got %v, want %v", probeAt, wantProbe)
+	}
+
+	// A nearer cooldown end (2 min) still pulls the deadline earlier.
+	earlierNow := time.Now()
+	earlierEnd := earlierNow.Add(2 * time.Minute)
+	r.alignCooldownEnd(authID, earlierEnd, earlierNow)
+	r.mu.Lock()
+	pulled := r.backoffs[authID].nextAt
+	r.mu.Unlock()
+	if !pulled.Equal(earlierEnd) {
+		t.Fatalf("near cooldown end should pull nextAt to cooldownEnd; got %v, want %v", pulled, earlierEnd)
+	}
+
 	// And a later "cooldown end" must NOT push the refresh further out
 	// — the regular cadence still bounds nextAt from above.
-	r.alignCooldownEnd(authID, time.Now().Add(1*time.Hour))
+	r.alignCooldownEnd(authID, time.Now().Add(1*time.Hour), time.Now())
 	r.mu.Lock()
 	stillAligned := r.backoffs[authID].nextAt
 	r.mu.Unlock()
-	if !stillAligned.Equal(cooldownEnd) {
-		t.Fatalf("alignCooldownEnd must not move nextAt later; got %v, want %v", stillAligned, cooldownEnd)
+	if stillAligned.After(pulled) {
+		t.Fatalf("alignCooldownEnd must not move nextAt later; got %v, want <= %v", stillAligned, pulled)
 	}
 }
 

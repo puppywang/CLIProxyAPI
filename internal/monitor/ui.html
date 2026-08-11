@@ -3783,8 +3783,8 @@
       const marked = cur.r === 'p' || cur.r === 'a';
       const fallback = !marked && prev.p >= 5 && cur.p <= 5 && cur.p < prev.p;
       if (!marked && !fallback) continue;
-      // Kind: prefer the server mark. Unmarked resets on samples with an
-      // API reset_at compare the observation time against the declared
+      // Kind: prefer the server mark. Unmarked resets with an API
+      // reset_at compare the observation time against the declared
       // rollover; legacy samples without ra cannot be classified — the
       // type stays unknown (blank kind).
       let kind = marked ? cur.r : '';
@@ -3800,13 +3800,13 @@
       markers += '<line x1="' + rx + '" y1="' + T + '" x2="' + rx + '" y2="' + (H - B) +
         '" stroke="' + (passive ? '#ff8a8a' : unknown ? '#8b949e' : '#ffb36b') + '" stroke-width="1"' +
         (passive ? '' : ' stroke-dasharray="3 3"') +
-        ' title="' + (passive ? 'passive reset (observed live)'
-          : unknown ? 'reset (type unknown — legacy data)' : 'reset (uncertain time)') + '"/>';
+        ' title="' + (passive ? 'passive reset (CD cooldown)'
+          : unknown ? 'reset (type unknown — legacy data)' : 'active reset (before CD end)') + '"/>';
     }
     let statLine = '';
     if (lastResetAt > 0) {
       const kindLabel = lastResetKind === 'p' ? ' · <span class="muted">passive</span>'
-        : lastResetKind === 'a' ? ' · <span class="muted">uncertain</span>'
+        : lastResetKind === 'a' ? ' · <span class="muted">active</span>'
           : ' · <span class="muted">unknown</span>';
       statLine = 'Last reset ' + ciFmtTime(new Date(series[lastResetAt].t * 1000).toISOString()) +
         ' — peak before it <b>' + peakBefore + '%</b>' + kindLabel;

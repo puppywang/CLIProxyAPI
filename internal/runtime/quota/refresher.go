@@ -50,6 +50,13 @@ const (
 	DefaultRefreshInterval = 10 * time.Minute
 	DefaultConcurrency     = 2
 	MaxBackoff             = 10 * time.Minute
+	// quotaCooldownProbeInterval is how often the refresher re-checks an
+	// auth sitting in a cooldown. Normally a cooldown parks the auth until
+	// its advertised reset_at; but wham can roll the window over EARLIER
+	// (the account recovers before the cooldown deadline), so we keep a
+	// slow probe to catch the early reset promptly instead of discovering
+	// it hours later.
+	quotaCooldownProbeInterval = 30 * time.Minute
 )
 
 // Refresher periodically refreshes per-auth quota snapshots in the
@@ -464,7 +471,7 @@ func (r *Refresher) runOnce(ctx context.Context) {
 			continue
 		}
 		if cd := knownCooldownEnd(a, now); !cd.IsZero() {
-			r.alignCooldownEnd(a.ID, cd)
+			r.alignCooldownEnd(a.ID, cd, now)
 		}
 		if !r.allowed(a.ID, now) {
 			continue
@@ -755,7 +762,7 @@ func knownCooldownEnd(a *coreauth.Auth, now time.Time) time.Time {
 	return latest
 }
 
-// alignCooldownEnd pulls the auth's next refresh deadline back to
+// alignCooldownEnd pulls the auth's next refresh deadline to
 // cooldownEnd if that is sooner than the currently scheduled nextAt.
 // This implements the resets_at side of the "next_refresh = min(interval,
 // resets_at)" rule: when upstream told us the cooldown ends earlier than
@@ -763,7 +770,15 @@ func knownCooldownEnd(a *coreauth.Auth, now time.Time) time.Time {
 // the quota cache reflects the recovery moment. nextAt never moves
 // later from this call — backoff and the regular cadence still bound it
 // from above.
-func (r *Refresher) alignCooldownEnd(authID string, cooldownEnd time.Time) {
+//
+// Additionally, while a cooldown is active the refresher keeps probing at
+// quotaCooldownProbeInterval instead of going dark until the cooldown
+// end: the window can roll over EARLIER than the advertised reset_at
+// (observed: wham swapped a cooldown account's reset_at from 08-16 to
+// 08-18 after a real rollover at 08:02, hours before the cooldown was
+// due). Without the probe the reset would go undetected for the whole
+// cooldown duration.
+func (r *Refresher) alignCooldownEnd(authID string, cooldownEnd time.Time, now time.Time) {
 	if cooldownEnd.IsZero() {
 		return
 	}
@@ -774,8 +789,14 @@ func (r *Refresher) alignCooldownEnd(authID string, cooldownEnd time.Time) {
 		state = &backoffState{}
 		r.backoffs[authID] = state
 	}
-	if state.nextAt.IsZero() || cooldownEnd.Before(state.nextAt) {
-		state.nextAt = cooldownEnd
+	// During the cooldown keep a slow probe cadence; when the cooldown end
+	// arrives, refresh exactly then.
+	next := cooldownEnd
+	if probeAt := now.Add(quotaCooldownProbeInterval); probeAt.Before(next) {
+		next = probeAt
+	}
+	if state.nextAt.IsZero() || next.Before(state.nextAt) {
+		state.nextAt = next
 	}
 }
 
