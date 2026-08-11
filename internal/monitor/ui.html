@@ -3783,19 +3783,15 @@
       const marked = cur.r === 'p' || cur.r === 'a';
       const fallback = !marked && prev.p >= 5 && cur.p <= 5 && cur.p < prev.p;
       if (!marked && !fallback) continue;
-      // Kind: prefer the server mark, but re-verify samples whose stored
-      // mark predates the current classifier — a sample marked 'a' whose
-      // own reset_at is a full window (7d/30d ± 6h) from its timestamp is
-      // actually a passive rollover (the server restarted the window).
-      let kind = marked ? cur.r : '';
-      if (kind === 'a' && cur.ra) {
-        const w = cur.ra - cur.t;
-        const full7 = Math.abs(w - 7 * 86400) <= 6 * 3600;
-        const full30 = Math.abs(w - 30 * 86400) <= 6 * 3600;
-        if (full7 || full30) kind = 'p';
-      }
-      if (!kind && prev.ra && Math.abs(cur.t - prev.ra) <= 1800) kind = 'p';
-      else if (!kind && prev.ra) kind = 'a';
+      // Kind: re-verify against the same rule the backend uses — passive
+      // iff the reset is observed at (about) the reset time the API was
+      // advertising on the PREVIOUS sample (prev.ra). This keeps stored
+      // marks from older classifiers consistent (a stored 'a' whose reset
+      // matches the advertised rollover renders passive, and vice versa).
+      // No prev.ra (legacy) → fall back to the stored mark; none → unknown.
+      let kind = '';
+      if (prev.ra) kind = (Math.abs(cur.t - prev.ra) <= 1800) ? 'p' : 'a';
+      else if (marked) kind = cur.r;
       lastResetAt = i; peakBefore = prev.p; lastResetKind = kind;
       const rx = x(cur.t).toFixed(1);
       // Kind may be '' (unknown) for legacy samples without a recorded
@@ -3854,6 +3850,14 @@
           if (delta < bestDelta) { bestDelta = delta; best = i; }
         }
         const s = series[best];
+        // Same classification as the chart stat line: passive iff this
+        // sample's reset was observed at (about) the API-advertised
+        // reset time on the previous sample; fall back to the stored
+        // mark for legacy series without prev.ra.
+        let hoverKind = '';
+        const prevS = best > 0 ? series[best - 1] : null;
+        if (prevS && prevS.ra) hoverKind = (Math.abs(s.t - prevS.ra) <= 1800) ? 'p' : 'a';
+        else if (s.r === 'p' || s.r === 'a') hoverKind = s.r;
         const px = x(s.t), pyP = y(s.p), pyS = y(s.s);
         crossLine.setAttribute('x1', px); crossLine.setAttribute('x2', px);
         dotP.setAttribute('cx', px); dotP.setAttribute('cy', pyP);
@@ -3865,8 +3869,8 @@
         tip.innerHTML = '<span class="k">' + stamp + '</span><br>' +
           '<span class="k">5h/weekly</span> <span class="vp">' + s.p + '%</span> · ' +
           '<span class="k">7d/monthly</span> <span class="vs">' + s.s + '%</span>' +
-          (s.r === 'p' ? '<br><span class="lim">⬇ passive reset (CD cooldown)</span>'
-            : s.r === 'a' ? '<br><span class="lim">⬇ active reset (before CD end)</span>' : '') +
+          (hoverKind === 'p' ? '<br><span class="lim">⬇ passive reset (CD cooldown)</span>'
+            : hoverKind === 'a' ? '<br><span class="lim">⬇ active reset (before CD end)</span>' : '') +
           (s.ra ? '<br><span class="k">api reset_at</span> <span class="vs">' +
             ciFmtTime(new Date(s.ra * 1000).toISOString()) + '</span>' : '') +
           (s.l ? '<br><span class="lim">limit reached</span>' : '');

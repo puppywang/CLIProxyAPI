@@ -29,20 +29,15 @@ const (
 	// this percent for the drop to count as a reset. Guards against
 	// refresh-interface jitter (3% -> 0% is noise, 7% -> 0% is a reset).
 	quotaResetMinPrev = 5
-	// quotaPassiveSlack: when a reset is observed and the quota API hands
-	// back a NEW reset_at (the collapsed window's replacement), the reset
-	// is "passive" if that new reset_at sits a full window length away
-	// from the observation — i.e. the server just started a fresh window
-	// at the reset moment (a true CD-cooldown rollover). The margin
-	// absorbs the gap between the actual rollover and the next sample
-	// (10-min cadence plus fetch latency).
-	quotaPassiveSlack = 6 * time.Hour
-	// quotaWindow7d / quotaWindow30d are the codex primary window lengths
-	// (7d for plus/team, 30d for free accounts). A reset whose new
-	// reset_at - now lands within [window - slack, window + slack] of
-	// either is passive.
-	quotaWindow7d  = 7 * 24 * time.Hour
-	quotaWindow30d = 30 * 24 * time.Hour
+	// quotaPassiveSlack: a reset is "passive" when it is observed at
+	// (about) the reset time the quota API had been continuously
+	// advertising on previous samples — a true CD-cooldown rollover.
+	// Refreshes run every 10 minutes, so the observation can lag the
+	// actual rollover by up to a cadence; 30 minutes absorbs that plus
+	// fetch latency without blurring genuinely early resets (observed:
+	// accounts resetting days before their advertised reset_at are
+	// active).
+	quotaPassiveSlack = 30 * time.Minute
 )
 
 // QuotaSample is one observation of an auth's quota windows. Field names are
@@ -140,16 +135,16 @@ func (s *quotaHistoryStore) load() {
 // A primary-window reset (usage collapsing from a real value to near zero —
 // 100%→0%, 7%→0%, …) is marked on the new sample:
 //
-//   - "p" (passive) when the quota API hands back a NEW reset_at that sits a
-//     full window length (7d / 30d) away from this observation — the server
-//     just started a fresh window at the reset moment, i.e. a true
-//     CD-cooldown rollover. Also passive when no new reset_at is returned
-//     but the OLD window's declared reset time has already passed.
-//   - "a" (active) when a new reset_at is returned but it is not a full
-//     window away (the rollover happened early, or the window semantics
-//     changed) — manual reset / account switch / anomaly.
-//   - "" (unknown) when neither a new nor an old reset_at is available
-//     (legacy samples predating reset_at capture).
+//   - "p" (passive) when the reset is observed at (about) the reset time
+//     the quota API had been continuously advertising on the previous
+//     sample (last.RA) — a true CD-cooldown rollover.
+//   - "a" (active) when the reset happens well before (or after) the
+//     advertised reset time — an early rollover, manual reset, or account
+//     switch. wham hands back a fresh reset_at on rollover regardless; a
+//     new reset_at that sits a full window (7d/30d) away is the normal
+//     aftermath of ANY reset and is NOT by itself a passive signal.
+//   - "" (unknown) when no reset time was ever captured (legacy samples
+//     predating reset_at capture).
 func (s *quotaHistoryStore) record(authID string, primary, secondary int, limitReached bool, resetAtPrimary time.Time, now time.Time) {
 	if s == nil || authID == "" {
 		return
@@ -169,26 +164,20 @@ func (s *quotaHistoryStore) record(authID string, primary, secondary int, limitR
 		// real usage level and the new one collapsed to (near) zero. No
 		// fixed drop threshold — 7%→0% is a reset too.
 		if last.P >= quotaResetMinPrev && primary <= quotaResetFloor && primary < last.P {
-			switch {
-			case !resetAtPrimary.IsZero():
-				// The API just handed back a replacement window. Passive iff
-				// the new reset_at is a full window away from now — the
-				// server restarted the window at the rollover moment.
-				window := resetAtPrimary.Sub(now)
-				if window >= quotaWindow7d-quotaPassiveSlack && window <= quotaWindow7d+quotaPassiveSlack {
-					resetMark = "p"
-				} else if window >= quotaWindow30d-quotaPassiveSlack && window <= quotaWindow30d+quotaPassiveSlack {
+			if last.RA > 0 {
+				// Passive iff this observation lands at (about) the reset
+				// time the API was advertising on the previous sample —
+				// the CD cooldown genuinely rolled over. Anything else
+				// (early / late) is an active reset.
+				ra := time.Unix(last.RA, 0)
+				diff := now.Sub(ra)
+				if diff >= -quotaPassiveSlack && diff <= quotaPassiveSlack {
 					resetMark = "p"
 				} else {
 					resetMark = "a"
 				}
-			case last.RA > 0 && !time.Unix(last.RA, 0).After(now.Add(quotaPassiveSlack)):
-				// No new reset_at, but the old window's declared rollover
-				// has already passed — this drop IS that rollover.
-				resetMark = "p"
-			default:
-				// Legacy sample without any reset_at: type unknown.
 			}
+			// Legacy sample without a recorded reset_at: type unknown.
 		}
 	}
 	var ra int64
