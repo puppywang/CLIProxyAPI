@@ -565,9 +565,9 @@ func TestRefresher_AlignCooldownEndPullsNextAtForward(t *testing.T) {
 	}
 
 	// A cooldown ending far in the future must NOT park the auth until
-	// then: the refresher keeps a slow probe cadence so an early window
-	// rollover is still noticed (wham can reset before the advertised
-	// deadline). The probe deadline is now + quotaCooldownProbeInterval.
+	// then: the refresher keeps polling at the regular interval so an early
+	// window rollover is still noticed (wham can reset before the
+	// advertised deadline). The probe deadline is now + interval.
 	// Reset backoff state first so the earlier short-cooldown alignment
 	// does not leak into this scenario.
 	r.mu.Lock()
@@ -579,7 +579,7 @@ func TestRefresher_AlignCooldownEndPullsNextAtForward(t *testing.T) {
 	r.mu.Lock()
 	probeAt := r.backoffs[authID].nextAt
 	r.mu.Unlock()
-	wantProbe := longNow.Add(quotaCooldownProbeInterval)
+	wantProbe := longNow.Add(r.interval)
 	if probeAt.Unix() != wantProbe.Unix() {
 		t.Fatalf("long cooldown should probe at interval; got %v, want %v", probeAt, wantProbe)
 	}
