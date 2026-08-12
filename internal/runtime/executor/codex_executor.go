@@ -1275,6 +1275,31 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					return
 				}
+				// Non-terminal upstream error events (rate_limit_exceeded,
+				// server_is_overloaded, internal_server_error, ...) are NOT
+				// intercepted — the client decides whether to retry them
+				// (codex CLI retries most unknown stream errors up to 5x and
+				// reports 'high demand' style failures). But they must still
+				// be visible in the operator monitor: without a mark the
+				// request is recorded as a clean 200 while the client
+				// actually failed. Mark stream failure and report, then keep
+				// forwarding the event so client behaviour is unchanged.
+				eventType := gjson.GetBytes(data, "type").String()
+				if eventType == "error" || eventType == "response.failed" {
+					errorBody := codexTerminalErrorBody(data, "error")
+					if len(errorBody) == 0 {
+						errorBody = codexTerminalErrorBody(data, "response.error")
+					}
+					if len(errorBody) == 0 {
+						errorBody = codexTerminalTopLevelErrorBody(data)
+					}
+					reason := helps.SummarizeErrorBody("application/json", errorBody)
+					helps.LogWithRequestID(ctx).Warnf("codex stream: upstream error event (passthrough) | auth=%s body=%s",
+						authID, reason)
+					helps.MarkStreamFailure(ctx, "codex upstream stream error: "+reason)
+					helps.RecordAPIResponseError(ctx, e.cfg, statusErr{code: http.StatusBadGateway, msg: reason})
+					reporter.PublishFailure(ctx, statusErr{code: http.StatusBadGateway, msg: reason})
+				}
 				switch gjson.GetBytes(data, "type").String() {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
