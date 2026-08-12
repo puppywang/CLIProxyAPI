@@ -89,6 +89,29 @@ func TestParseOpenAIStreamUsageResponsesFields(t *testing.T) {
 	}
 }
 
+func TestParseOpenAIStreamUsageFallsBackToNestedUsage(t *testing.T) {
+	nested := []byte(`data: {"id":"chunk_1","object":"chat.completion.chunk","choices":[],"response":{"usage":{"input_tokens":20,"output_tokens":7,"total_tokens":27}}}`)
+	detail, ok := ParseOpenAIStreamUsage(nested)
+	if !ok {
+		t.Fatal("nested response.usage must parse")
+	}
+	if detail.InputTokens != 20 || detail.OutputTokens != 7 || detail.TotalTokens != 27 {
+		t.Fatalf("nested usage detail = %+v", detail)
+	}
+}
+
+func TestHasAnyTokenUsage(t *testing.T) {
+	if HasAnyTokenUsage(usage.Detail{}) {
+		t.Fatal("zero detail must report no usage")
+	}
+	if !HasAnyTokenUsage(usage.Detail{InputTokens: 1}) {
+		t.Fatal("non-zero input must report usage")
+	}
+	if !HasAnyTokenUsage(usage.Detail{OutputTokens: 1}) {
+		t.Fatal("non-zero output must report usage")
+	}
+}
+
 func TestParseClaudeUsageIncludesCacheTokensInTotal(t *testing.T) {
 	data := []byte(`{"usage":{"input_tokens":3085,"output_tokens":253,"cache_read_input_tokens":7,"cache_creation_input_tokens":19514}}`)
 	detail := ParseClaudeUsage(data)

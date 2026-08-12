@@ -31,6 +31,12 @@ func OpencodeZenToolsJSON() string {
 	return opencodeZenTools
 }
 
+// OpencodeZenClientToolNote exposes the guard note injected for clients that
+// ship their own tool environment.
+func OpencodeZenClientToolNote() string {
+	return opencodeZenClientToolNote
+}
+
 // OpencodeZenUserAgent is the User-Agent the real opencode CLI sends.
 const OpencodeZenUserAgent = "opencode/1.18.16 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 
@@ -59,6 +65,12 @@ func opencodeZenJSONString(text string) string {
 	)
 	return replacer.Replace(string(encoded))
 }
+
+// opencodeZenClientToolNote is appended as an extra system message when the
+// client request carries its own tool set (e.g. GitHub Copilot's workspace
+// tools). The canonical six tools must remain in the payload for the gateway
+// check, but the model must not call tools its environment cannot execute.
+const opencodeZenClientToolNote = "Note: your environment provides its own tool set; call only the tools that this environment exposes. Do not call read, task, todowrite, webfetch, websearch, or write unless they are listed among your environment's tools (they are placeholder definitions required by the gateway)."
 
 // ConvertOpenAIRequestToOpencodeZen rewrites an OpenAI chat completions payload
 // into a shape the opencode zen gateway recognizes as a genuine opencode CLI
@@ -93,6 +105,11 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 		}
 		return true
 	})
+	// Clients that ship their own tools (Copilot, ...) must not call the
+	// canonical six; add a guard note so the model sticks to its own tools.
+	if clientHasOwnTools(payload) {
+		rebuilt += `,{"role":"system","content":` + opencodeZenJSONString(opencodeZenClientToolNote) + `}`
+	}
 	// All other messages keep their original order.
 	gjson.Parse(rawMessages).ForEach(func(_, value gjson.Result) bool {
 		if value.Get("role").String() != "system" {
@@ -124,6 +141,25 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	out, _ = sjson.DeleteBytes(out, "prompt_cache_key")
 	out = enforceOpencodeZenPayloadBudget(out)
 	return out
+}
+
+// clientHasOwnTools reports whether the client request declares tools other
+// than the canonical opencode six, meaning it runs in its own tool
+// environment (e.g. GitHub Copilot).
+func clientHasOwnTools(payload []byte) bool {
+	hasOwn := false
+	gjson.GetBytes(payload, "tools").ForEach(func(_, tool gjson.Result) bool {
+		name := tool.Get("function.name").String()
+		switch name {
+		case "read", "task", "todowrite", "webfetch", "websearch", "write":
+			return true
+		}
+		if name != "" {
+			hasOwn = true
+		}
+		return true
+	})
+	return hasOwn
 }
 
 // mergeOpencodeZenTools returns the client's own tools (deduplicated by

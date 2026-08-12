@@ -50,8 +50,8 @@ func TestConvertOpenAIRequestToOpencodeZen(t *testing.T) {
 		t.Fatal("converted payload is not valid JSON")
 	}
 	messages := gjson.GetBytes(out, "messages").Array()
-	if len(messages) != 5 {
-		t.Fatalf("messages count = %d, want 5", len(messages))
+	if len(messages) != 6 {
+		t.Fatalf("messages count = %d, want 6", len(messages))
 	}
 	if messages[0].Get("role").String() != "system" {
 		t.Fatalf("messages[0] role = %q, want system", messages[0].Get("role").String())
@@ -62,7 +62,10 @@ func TestConvertOpenAIRequestToOpencodeZen(t *testing.T) {
 	if messages[1].Get("content").String() != "client system instruction" {
 		t.Fatalf("client system message must be preserved, got %q", messages[1].Get("content").String())
 	}
-	if messages[2].Get("content").String() != "hello" || messages[3].Get("content").String() != "hi" || messages[4].Get("content").String() != "world" {
+	if messages[2].Get("content").String() != OpencodeZenClientToolNote() {
+		t.Fatalf("messages[2] = %q, want the client tool guard note", messages[2].Get("content").String())
+	}
+	if messages[3].Get("content").String() != "hello" || messages[4].Get("content").String() != "hi" || messages[5].Get("content").String() != "world" {
 		t.Fatal("non-system messages were not preserved in order")
 	}
 
@@ -161,6 +164,30 @@ func TestConvertOpenAIRequestToOpencodeZenEscapingRoundTrip(t *testing.T) {
 	userContent := doc["messages"].([]any)[1].(map[string]any)["content"].(string)
 	if userContent != `D:\HomeProject\cli-request-monitor and <env> & quotes "x"` {
 		t.Fatalf("user content mangled by escaping: %q", userContent)
+	}
+}
+
+func TestOpencodeZenClientToolNoteOnlyForOwnTools(t *testing.T) {
+	withOwn := `{"model":"m","messages":[{"role":"user","content":"q"}],"tools":[{"type":"function","function":{"name":"bash","parameters":{}}}],"stream":true}`
+	out := ConvertOpenAIRequestToOpencodeZen([]byte(withOwn))
+	messages := gjson.GetBytes(out, "messages").Array()
+	found := false
+	for _, m := range messages {
+		if m.Get("content").String() == OpencodeZenClientToolNote() {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("client tool note must be injected when client ships its own tools")
+	}
+
+	canonicalOnly := `{"model":"m","messages":[{"role":"user","content":"q"}],"tools":[{"type":"function","function":{"name":"read","parameters":{}}}],"stream":true}`
+	out = ConvertOpenAIRequestToOpencodeZen([]byte(canonicalOnly))
+	messages = gjson.GetBytes(out, "messages").Array()
+	for _, m := range messages {
+		if m.Get("content").String() == OpencodeZenClientToolNote() {
+			t.Fatal("client tool note must NOT be injected when only canonical tools are present")
+		}
 	}
 }
 

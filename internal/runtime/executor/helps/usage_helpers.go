@@ -239,6 +239,25 @@ func (r *UsageReporter) EnsurePublished(ctx context.Context) {
 	})
 }
 
+// HasAnyTokenUsage reports whether any token field is non-zero.
+func HasAnyTokenUsage(detail usage.Detail) bool {
+	return hasNonZeroTokenUsage(detail)
+}
+
+// PublishStreamUsageOnce publishes the last observed stream usage value (the
+// zero value is ignored). Upstreams such as the zen gateway emit intermediate
+// usage snapshots between tool calls, so publishing only the final non-zero
+// value keeps the recorded totals accurate.
+func PublishStreamUsageOnce(ctx context.Context, reporter *UsageReporter, detail usage.Detail) {
+	if reporter == nil {
+		return
+	}
+	if !hasNonZeroTokenUsage(detail) {
+		return
+	}
+	reporter.Publish(ctx, detail)
+}
+
 func (r *UsageReporter) publishRecord(ctx context.Context, record usage.Record) {
 	record.ResponseHeaders = internallogging.GetResponseHeaders(ctx)
 	usage.PublishRecord(ctx, record)
@@ -532,7 +551,13 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
+	// Some gateways (e.g. Responses-style) nest usage under response.usage
+	// even in chat-completions streams; prefer the plain top-level usage but
+	// fall back to the nested variant.
 	usageNode := gjson.GetBytes(payload, "usage")
+	if !hasOpenAIStyleUsageTokenFields(usageNode) {
+		usageNode = gjson.GetBytes(payload, "response.usage")
+	}
 	if !hasOpenAIStyleUsageTokenFields(usageNode) {
 		return usage.Detail{}, false
 	}
