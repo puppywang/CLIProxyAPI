@@ -200,6 +200,49 @@ func TestOpencodeZenClientToolNoteOnlyForOwnTools(t *testing.T) {
 	}
 }
 
+func TestOpencodeZenRepeatNoteDetection(t *testing.T) {
+	// 3 identical grep calls -> note must be produced.
+	three := `[
+		{"role":"user","content":"check it"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"a1","type":"function","function":{"name":"grep_search","arguments":"{\"query\":\"Flush|Hijack\"}"}}]},
+		{"role":"tool","tool_call_id":"a1","content":"Found 1 match"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"a2","type":"function","function":{"name":"grep_search","arguments":"{\"query\":\"Flush|Hijack\"}"}}]},
+		{"role":"tool","tool_call_id":"a2","content":"Found 1 match"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"a3","type":"function","function":{"name":"grep_search","arguments":"{\"query\":\"Flush|Hijack\"}"}}]},
+		{"role":"tool","tool_call_id":"a3","content":"Found 1 match"}
+	]`
+	if note := OpencodeZenRepeatNote(three); note == "" {
+		t.Fatal("repeat note expected for 3 identical tool calls, got empty")
+	} else if !strings.Contains(note, "grep_search") {
+		t.Fatalf("note should name the repeated tool, got %q", note)
+	}
+
+	// Different arguments must NOT trigger.
+	diff := `[
+		{"role":"user","content":"check it"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"a1","type":"function","function":{"name":"grep_search","arguments":"{\"query\":\"A\"}"}}]},
+		{"role":"tool","tool_call_id":"a1","content":"Found 1 match"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"a2","type":"function","function":{"name":"grep_search","arguments":"{\"query\":\"B\"}"}}]},
+		{"role":"tool","tool_call_id":"a2","content":"Found 1 match"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"a3","type":"function","function":{"name":"grep_search","arguments":"{\"query\":\"C\"}"}}]},
+		{"role":"tool","tool_call_id":"a3","content":"Found 1 match"}
+	]`
+	if note := OpencodeZenRepeatNote(diff); note != "" {
+		t.Fatalf("no note expected for different calls, got %q", note)
+	}
+
+	// 2 occurrences (below threshold) must NOT trigger.
+	twice := `[
+		{"role":"assistant","content":"","tool_calls":[{"id":"a1","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"x\"}"}}]},
+		{"role":"tool","tool_call_id":"a1","content":"content"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"a2","type":"function","function":{"name":"read","arguments":"{\"filePath\":\"x\"}"}}]},
+		{"role":"tool","tool_call_id":"a2","content":"content"}
+	]`
+	if note := OpencodeZenRepeatNote(twice); note != "" {
+		t.Fatalf("no note expected below threshold, got %q", note)
+	}
+}
+
 func TestConvertOpenAIRequestToOpencodeZenNoOps(t *testing.T) {
 	if out := ConvertOpenAIRequestToOpencodeZen(nil); out != nil {
 		t.Fatal("nil payload must pass through")

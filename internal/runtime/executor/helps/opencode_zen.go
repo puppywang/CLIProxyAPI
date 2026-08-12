@@ -226,6 +226,12 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	if hasOwnTools {
 		rebuilt += `,{"role":"system","content":` + opencodeZenJSONString(opencodeZenClientToolNote) + `}`
 	}
+	// Break cognitive loops: when the history already contains the same tool
+	// call (same name + same arguments) repeated several times, tell the model
+	// the result never changes, so it stops re-running it hoping for new info.
+	if note := opencodeZenRepeatNote(rawMessages); note != "" {
+		rebuilt += `,{"role":"system","content":` + opencodeZenJSONString(note) + `}`
+	}
 	// All other messages keep their original order.
 	gjson.Parse(rawMessages).ForEach(func(_, value gjson.Result) bool {
 		if value.Get("role").String() != "system" {
@@ -257,6 +263,80 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	out, _ = sjson.DeleteBytes(out, "prompt_cache_key")
 	out = enforceOpencodeZenPayloadBudget(out)
 	return out
+}
+
+// opencodeZenRepeatThreshold is the number of identical tool calls tolerated
+// before the proxy injects a convergence hint.
+const opencodeZenRepeatThreshold = 3
+
+// opencodeZenRepeatNote scans the message history for assistant tool_calls
+// that occur repeatedly with identical function name and arguments, and
+// returns a system-level hint when any of them repeats at least
+// opencodeZenRepeatThreshold times. The hint tells the model the call's
+// result is already known and unchanged, suppressing the "re-run the same
+// query hoping for new information" loop. Returns "" when nothing repeats.
+func opencodeZenRepeatNote(rawMessages string) string {
+	if rawMessages == "" || !gjson.Valid(rawMessages) {
+		return ""
+	}
+	type callKey struct {
+		name string
+		args string
+	}
+	counts := make(map[callKey]int)
+	firstIndex := make(map[callKey]int)
+	index := 0
+	gjson.Parse(rawMessages).ForEach(func(_, m gjson.Result) bool {
+		call := m.Get("role").String() == "assistant"
+		if !call {
+			index++
+			return true
+		}
+		for _, tc := range m.Get("tool_calls").Array() {
+			name := tc.Get("function.name").String()
+			args := tc.Get("function.arguments").String()
+			if name == "" {
+				continue
+			}
+			key := callKey{name: name, args: args}
+			counts[key]++
+			if _, ok := firstIndex[key]; !ok {
+				firstIndex[key] = index
+			}
+		}
+		index++
+		return true
+	})
+
+	// Pick the most repeated call (first occurrence order breaks ties), skip
+	// direct text-only responses.
+	type cand struct {
+		key   callKey
+		count int
+		order int
+	}
+	var best cand
+	for key, count := range counts {
+		if count < opencodeZenRepeatThreshold {
+			continue
+		}
+		if count > best.count || (count == best.count && firstIndex[key] < best.order) {
+			best = cand{key: key, count: count, order: firstIndex[key]}
+		}
+	}
+	if best.count == 0 {
+		return ""
+	}
+	args := best.key.args
+	if len(args) > 400 {
+		args = args[:400] + "..."
+	}
+	return fmt.Sprintf("Note: you have already called %s with the same arguments %d times in this conversation, and each result was identical. The result is not going to change on another call. If it did not answer your question, re-read the existing results above instead of calling %s again.", best.key.name, best.count, best.key.name)
+}
+
+// OpencodeZenRepeatNote exposes the convergence hint for tests.
+func OpencodeZenRepeatNote(rawMessages string) string {
+	return opencodeZenRepeatNote(rawMessages)
 }
 
 // clientHasOwnTools reports whether the client request declares tools other
