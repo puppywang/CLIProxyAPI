@@ -56,8 +56,17 @@ func TestConvertOpenAIRequestToOpencodeZen(t *testing.T) {
 	if messages[0].Get("role").String() != "system" {
 		t.Fatalf("messages[0] role = %q, want system", messages[0].Get("role").String())
 	}
-	if got := messages[0].Get("content").String(); got != OpencodeZenSystemPrompt() {
-		t.Fatalf("messages[0].content does not match the canonical opencode prompt (len %d)", len(got))
+	// A client shipping its own tools gets the trimmed canonical prompt so
+	// the opencode env/skills tail cannot steer it; the gateway-verified
+	// prefix must still be present.
+	if got := messages[0].Get("content").String(); got != OpencodeZenSystemPromptTrimmed() {
+		t.Fatalf("messages[0].content does not match the trimmed opencode prompt (len %d, want %d)", len(got), len(OpencodeZenSystemPromptTrimmed()))
+	}
+	if !strings.Contains(messages[0].Get("content").String(), "<system-reminder>") {
+		t.Fatal("trimmed prompt must keep the full <system-reminder> marker")
+	}
+	if strings.Contains(messages[0].Get("content").String(), "<available_skills>") {
+		t.Fatal("trimmed prompt must not contain the skills tail")
 	}
 	if messages[1].Get("content").String() != "client system instruction" {
 		t.Fatalf("client system message must be preserved, got %q", messages[1].Get("content").String())

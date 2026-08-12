@@ -348,6 +348,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		if len(translated) < before {
 			log.Debugf("opencode zen: request trimmed from %d to %d bytes", before, len(translated))
 		}
+		helps.DebugZenRequestShape(translated)
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"

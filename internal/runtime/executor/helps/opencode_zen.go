@@ -3,8 +3,10 @@ package helps
 import (
 	_ "embed"
 	"encoding/json"
+	"fmt"
 	"strings"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -35,6 +37,87 @@ func OpencodeZenToolsJSON() string {
 // ship their own tool environment.
 func OpencodeZenClientToolNote() string {
 	return opencodeZenClientToolNote
+}
+
+// DebugZenRequestShape logs a compact shape summary of the converted zen
+// request so looping histories (repeated identical tool calls) can be
+// diagnosed from the server logs: message roles with counts, how many tool
+// results exist, and the last few message roles with their sizes.
+func DebugZenRequestShape(payload []byte) {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return
+	}
+	msgs := gjson.GetBytes(payload, "messages")
+	if !msgs.Exists() {
+		return
+	}
+	var roleSeq []string
+	roleCount := make(map[string]int)
+	// Track tool_calls ↔ tool result pairing consistency:
+	// pendingToolCallIDs remembers ids announced by assistant messages so we
+	// can spot tool results that reference *unknown* call ids (orphan results)
+	// or assistant messages whose calls never got a result.
+	pending := make(map[string]bool)
+	var toolCalls, toolResults, orphanResults, unmatchedCalls int
+	msgs.ForEach(func(_, m gjson.Result) bool {
+		role := m.Get("role").String()
+		if role == "" {
+			role = "?"
+		}
+		roleSeq = append(roleSeq, role)
+		roleCount[role]++
+		switch role {
+		case "assistant":
+			calls := m.Get("tool_calls").Array()
+			if len(calls) > 0 {
+				toolCalls += len(calls)
+			}
+			for _, c := range calls {
+				id := c.Get("id").String()
+				if id != "" {
+					pending[id] = true
+				}
+			}
+		case "tool", "function":
+			if m.Get("content").String() != "" {
+				toolResults++
+			}
+			id := m.Get("tool_call_id").String()
+			if id != "" && pending[id] {
+				pending[id] = false
+			} else if id != "" {
+				orphanResults++
+			}
+		}
+		return true
+	})
+	for _, answered := range pending {
+		if answered {
+			unmatchedCalls++
+		}
+	}
+	// Summarise long sequences so the log stays readable (e.g. "u,a,t ×5").
+	compact := make([]string, 0, len(roleSeq))
+	for start := 0; start < len(roleSeq); {
+		end := start + 1
+		for end < len(roleSeq) && roleSeq[end] == roleSeq[start] {
+			end++
+		}
+		if end-start >= 3 {
+			compact = append(compact, roleSeq[start]+"×"+fmt.Sprint(end-start))
+		} else {
+			for i := start; i < end; i++ {
+				compact = append(compact, roleSeq[i])
+			}
+		}
+		start = end
+	}
+	tail := roleSeq
+	if len(tail) > 8 {
+		tail = roleSeq[len(roleSeq)-8:]
+	}
+	log.Debugf("opencode zen: shape roles=%s counts=%v toolCalls=%d toolResults=%d orphanResults=%d unmatchedCalls=%d tail=%v",
+		strings.Join(compact, ","), roleCount, toolCalls, toolResults, orphanResults, unmatchedCalls, tail)
 }
 
 // OpencodeZenUserAgent is the User-Agent the real opencode CLI sends.
@@ -72,6 +155,30 @@ func opencodeZenJSONString(text string) string {
 // check, but the model must not call tools its environment cannot execute.
 const opencodeZenClientToolNote = "Note: your environment provides its own tool set; call only the tools that this environment exposes. Do not call read, task, todowrite, webfetch, websearch, or write unless they are listed among your environment's tools (they are placeholder definitions required by the gateway)."
 
+// opencodeZenSystemPromptTrimmed returns the canonical opencode system prompt
+// trimmed at a verified-accepted boundary for clients that ship their own
+// tool environment (e.g. GitHub Copilot): everything from the "# Tool usage
+// policy" heading onward (the <env> block, skills list and the model-ID
+// footer) is dropped so the client's own system message stays dominant,
+// while the probe-verified prefix (including the full <system-reminder>
+// marker, which must survive verbatim) is retained to pass the gateway.
+//
+// Probe results (fresh window, same request, no rate-limit noise):
+//
+//	cut after "# Tool usage policy" heading (7341): 200 x2
+//	cut inside "<system-reminder>" marker (7190):   429
+//	cut at starting "<system-reminder>" tag (7212):  200
+//	full canonical prompt (control):                200
+//
+// The boundary is therefore anchored at the "# Tool usage policy" heading,
+// which sits well after the mandatory <system-reminder> marker.
+func OpencodeZenSystemPromptTrimmed() string {
+	if idx := strings.Index(opencodeZenSystemPrompt, "# Tool usage policy"); idx >= 0 {
+		return strings.TrimRight(opencodeZenSystemPrompt[:idx], " \t\n")
+	}
+	return OpencodeZenSystemPrompt()
+}
+
 // ConvertOpenAIRequestToOpencodeZen rewrites an OpenAI chat completions payload
 // into a shape the opencode zen gateway recognizes as a genuine opencode CLI
 // request while preserving the client's own instructions and tools:
@@ -95,7 +202,16 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	}
 
 	rawMessages := gjson.GetBytes(payload, "messages").Raw
-	sysRaw := `{"role":"system","content":` + opencodeZenJSONString(opencodeZenSystemPrompt) + `}`
+	// Clients that ship their own tools (Copilot, ...) get a trimmed canonical
+	// prompt: the probe-verified prefix up to "# Tool usage policy" satisfies
+	// the gateway check while dropping the opencode <env>/skills/model-ID tail
+	// that would otherwise steer the model away from its own environment.
+	hasOwnTools := clientHasOwnTools(payload)
+	canonicalText := opencodeZenSystemPrompt
+	if hasOwnTools {
+		canonicalText = OpencodeZenSystemPromptTrimmed()
+	}
+	sysRaw := `{"role":"system","content":` + opencodeZenJSONString(canonicalText) + `}`
 	rebuilt := "[" + sysRaw
 
 	// Client system messages come right after the canonical one, verbatim.
@@ -107,7 +223,7 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	})
 	// Clients that ship their own tools (Copilot, ...) must not call the
 	// canonical six; add a guard note so the model sticks to its own tools.
-	if clientHasOwnTools(payload) {
+	if hasOwnTools {
 		rebuilt += `,{"role":"system","content":` + opencodeZenJSONString(opencodeZenClientToolNote) + `}`
 	}
 	// All other messages keep their original order.
