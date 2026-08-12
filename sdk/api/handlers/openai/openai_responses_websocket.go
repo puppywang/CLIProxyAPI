@@ -17,6 +17,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	requestlogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/monitor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -404,6 +405,17 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
+		// Surface every logical WS request in the operator monitor. The
+		// monitor middleware deliberately skips the WS upgrade itself and
+		// leaves per-frame registration to the handler; without it, an
+		// upstream failure inside a WS turn (EOF, upstream error frame,
+		// read error) is invisible in the in-flight / recent-errors panels
+		// even though codex_websockets_executor calls MarkStreamFailure —
+		// the call finds no handle on the context and silently no-ops.
+		wsMonHandle := h.monitorHandleForWebsocketRequest(c, modelName, requestJSON)
+		if wsMonHandle != nil {
+			cliCtx = monitor.WithHandle(cliCtx, wsMonHandle)
+		}
 		if pinnedAuthID != "" {
 			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
 		} else {
@@ -416,6 +428,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				if !ok || selectedAuth == nil {
 					return
 				}
+				if wsMonHandle != nil {
+					wsMonHandle.SetAuth(authID)
+				}
 				if websocketUpstreamSupportsIncrementalInput(selectedAuth.Attributes, selectedAuth.Metadata) {
 					pinnedAuthID = authID
 				}
@@ -424,6 +439,15 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 
 		completedOutput, completedResponseID, completedPendingToolCallIDs, forwardErrMsg, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, wsTimelineLog, passthroughSessionID)
+		if wsMonHandle != nil {
+			if errForward != nil || forwardErrMsg != nil {
+				wsMonHandle.MarkStreamFailure("responses websocket: " + websocketForwardErrorText(errForward, forwardErrMsg))
+				wsMonHandle.SetStatusCode(http.StatusInternalServerError)
+			} else {
+				wsMonHandle.SetStatusCode(http.StatusOK)
+			}
+			wsMonHandle.Finish()
+		}
 		if errForward != nil {
 			wsTerminateErr = errForward
 			log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
@@ -449,6 +473,58 @@ func websocketClientAddress(c *gin.Context) string {
 		return ""
 	}
 	return strings.TrimSpace(c.ClientIP())
+}
+
+// monitorHandleForWebsocketRequest registers one in-flight monitor entry for
+// a logical WebSocket turn and returns its handle (nil when the monitor is
+// not wired, e.g. tests or non-HTTP callers). The monitor middleware skips
+// WS upgrades, so without this an upstream failure inside a WS turn — EOF,
+// upstream error frame, read error — never appears in the in-flight or
+// recent-errors panels: codex_websockets_executor's MarkStreamFailure calls
+// find no handle on the context and silently no-op.
+func (h *OpenAIResponsesAPIHandler) monitorHandleForWebsocketRequest(c *gin.Context, modelName string, requestJSON []byte) *monitor.Handle {
+	if h == nil || c == nil || c.Request == nil {
+		return nil
+	}
+	reg := monitor.RegistryFromContext(c.Request.Context())
+	if reg == nil {
+		return nil
+	}
+	reqID := requestlogging.GetGinRequestID(c)
+	if reqID == "" {
+		reqID = "ws-" + uuid.NewString()
+	}
+	_, cancel := context.WithCancel(c.Request.Context())
+	handle := reg.RegisterHandle(
+		reqID,
+		"POST",
+		monitor.TransportWS,
+		"/v1/responses",
+		strings.TrimSpace(c.ClientIP()),
+		c.Request.Header.Get("User-Agent"),
+		int64(len(requestJSON)),
+		cancel,
+	)
+	if handle == nil {
+		return nil
+	}
+	if modelName != "" {
+		handle.SetModel(modelName)
+	}
+	handle.MarkStreaming()
+	return handle
+}
+
+// websocketForwardErrorText renders a compact failure reason for the monitor's
+// stream_failure field, preferring the forward error, then the per-frame error.
+func websocketForwardErrorText(errForward error, errMsg *interfaces.ErrorMessage) string {
+	if errForward != nil {
+		return errForward.Error()
+	}
+	if errMsg != nil && errMsg.Error != nil {
+		return errMsg.Error.Error()
+	}
+	return "upstream stream failed"
 }
 
 func websocketUpgradeHeaders(req *http.Request) http.Header {

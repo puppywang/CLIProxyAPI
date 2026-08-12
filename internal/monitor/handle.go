@@ -101,6 +101,16 @@ func (h *Handle) MarkStreamFailure(reason string) {
 	h.r.SetStreamFailure(h.t, reason)
 }
 
+// SetStatusCode records the terminal HTTP status. Used by hijacked
+// transports (WebSocket) that have no real status line: callers set 200 for
+// a completed turn so the entry is not misclassified as a status-less error.
+func (h *Handle) SetStatusCode(code int) {
+	if !h.Active() {
+		return
+	}
+	h.t.statusCode.Store(int32(code))
+}
+
 // Finish completes the underlying entry, broadcasting the terminal status
 // and scheduling removal after the linger window. Safe to call on a nil
 // handle.

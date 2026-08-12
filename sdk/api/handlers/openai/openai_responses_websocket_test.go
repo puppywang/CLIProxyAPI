@@ -16,6 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	requestlogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/monitor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -2486,5 +2487,49 @@ func TestNormalizeSubsequentRequestAssistantInputTriggersTranscriptReplacement(t
 	}
 	if input[0].Get("id").String() != "msg-3" {
 		t.Fatalf("input[0].id = %q, want %q", input[0].Get("id").String(), "msg-3")
+	}
+}
+
+// TestMonitorHandleForWebsocketRequest verifies that a WS turn registers an
+// in-flight monitor entry with the right transport/model and that the handle
+// stays usable (status code settable). This is the fix for WS errors being
+// invisible to the monitor (the middleware skips WS upgrades, so the handler
+// must register per-frame entries itself).
+func TestMonitorHandleForWebsocketRequest(t *testing.T) {
+	reg := monitor.NewRegistry()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Request = c.Request.WithContext(monitor.WithRegistry(c.Request.Context(), reg))
+		c.Next()
+	})
+	r.POST("/v1/responses", func(c *gin.Context) {
+		h := &OpenAIResponsesAPIHandler{}
+		handle := h.monitorHandleForWebsocketRequest(c, "gpt-5.6-sol", []byte(`{"model":"gpt-5.6-sol"}`))
+		if handle == nil {
+			t.Fatal("expected a monitor handle")
+		}
+		handle.SetStatusCode(http.StatusOK)
+		handle.Finish()
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader([]byte(`{}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	snaps := reg.Snapshot()
+	if len(snaps) != 1 {
+		t.Fatalf("expected 1 in-flight entry after Finish (linger), got %d", len(snaps))
+	}
+	e := snaps[0]
+	if e.Transport != monitor.TransportWS {
+		t.Fatalf("transport = %q, want %q", e.Transport, monitor.TransportWS)
+	}
+	if e.Model != "gpt-5.6-sol" {
+		t.Fatalf("model = %q, want gpt-5.6-sol", e.Model)
+	}
+	if e.StatusCode != http.StatusOK {
+		t.Fatalf("status_code = %d, want 200", e.StatusCode)
 	}
 }
