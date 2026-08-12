@@ -482,6 +482,11 @@ nonstream-keepalive-interval: 0
 #     base-url: "https://openrouter.ai/api/v1" # The base URL of the provider.
 #     support-prompt-cache-key: false # optional: derive prompt_cache_key for requests from all input protocols
 #     disable-cooling: false # optional: per-provider override for auth/model cooldown scheduling
+#     opencode-zen: false # optional: adapt requests for the opencode zen gateway (https://opencode.ai/zen).
+#                         # When true, every request is rewritten into the canonical opencode CLI shape
+#                         # (real opencode system prompt + read/task/todowrite/webfetch/websearch/write tools),
+#                         # and requests use the opencode User-Agent. Use with base-url "https://opencode.ai/zen/v1".
+#                         # An empty api-key falls back to the anonymous "public" key accepted by the gateway.
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     api-key-entries:

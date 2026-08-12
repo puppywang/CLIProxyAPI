@@ -732,6 +732,12 @@ type OpenAICompatibility struct {
 
 	// DisableCooling disables auth/model cooldown scheduling for this provider when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// OpencodeZen adapts requests for the opencode zen gateway
+	// (https://opencode.ai/zen). The canonical opencode system prompt and tool
+	// definitions are injected into every request so the gateway accepts the
+	// call as a genuine opencode CLI request.
+	OpencodeZen bool `yaml:"opencode-zen,omitempty" json:"opencode-zen,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.

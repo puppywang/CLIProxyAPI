@@ -1,0 +1,4 @@
+# Byte-exact assets: the opencode zen gateway validates request content, so
+# these files must never be subject to line-ending conversion on checkout.
+internal/runtime/executor/helps/opencode_zen_system_prompt.txt -text
+internal/runtime/executor/helps/opencode_zen_tools.json -text

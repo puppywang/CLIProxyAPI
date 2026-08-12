@@ -129,6 +129,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", translated)
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
+	if e.zenEnabled(auth) && opts.Alt != "responses/compact" {
+		translated = helps.ConvertOpenAIRequestToOpencodeZen(translated)
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -140,11 +143,17 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	if e.zenEnabled(auth) && apiKey == "" {
+		httpReq.Header.Set("Authorization", "Bearer "+helps.OpencodeZenAPIKey)
+	}
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
+	if e.zenEnabled(auth) {
+		httpReq.Header.Set("User-Agent", helps.OpencodeZenUserAgent)
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -328,6 +337,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
+	if e.zenEnabled(auth) {
+		translated = helps.ConvertOpenAIRequestToOpencodeZen(translated)
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -339,11 +351,17 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	httpReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	if e.zenEnabled(auth) && apiKey == "" {
+		httpReq.Header.Set("Authorization", "Bearer "+helps.OpencodeZenAPIKey)
+	}
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
+	if e.zenEnabled(auth) {
+		httpReq.Header.Set("User-Agent", helps.OpencodeZenUserAgent)
+	}
 	httpReq.Header.Set("Accept", "text/event-stream")
 	httpReq.Header.Set("Cache-Control", "no-cache")
 	var authID, authLabel, authType, authValue string
@@ -771,6 +789,13 @@ func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth) *con
 		}
 	}
 	return nil
+}
+
+// zenEnabled reports whether the resolved compatibility provider targets the
+// opencode zen gateway and needs the canonical opencode request shape.
+func (e *OpenAICompatExecutor) zenEnabled(auth *cliproxyauth.Auth) bool {
+	compat := e.resolveCompatConfig(auth)
+	return compat != nil && compat.OpencodeZen
 }
 
 func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byte {
