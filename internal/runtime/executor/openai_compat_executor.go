@@ -130,7 +130,11 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 	if e.zenEnabled(auth) && opts.Alt != "responses/compact" {
+		before := len(translated)
 		translated = helps.ConvertOpenAIRequestToOpencodeZen(translated)
+		if len(translated) < before {
+			log.Debugf("opencode zen: request trimmed from %d to %d bytes", before, len(translated))
+		}
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
@@ -338,7 +342,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 	if e.zenEnabled(auth) {
+		before := len(translated)
 		translated = helps.ConvertOpenAIRequestToOpencodeZen(translated)
+		if len(translated) < before {
+			log.Debugf("opencode zen: request trimmed from %d to %d bytes", before, len(translated))
+		}
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
