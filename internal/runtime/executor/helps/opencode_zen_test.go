@@ -50,8 +50,8 @@ func TestConvertOpenAIRequestToOpencodeZen(t *testing.T) {
 		t.Fatal("converted payload is not valid JSON")
 	}
 	messages := gjson.GetBytes(out, "messages").Array()
-	if len(messages) != 4 {
-		t.Fatalf("messages count = %d, want 4", len(messages))
+	if len(messages) != 5 {
+		t.Fatalf("messages count = %d, want 5", len(messages))
 	}
 	if messages[0].Get("role").String() != "system" {
 		t.Fatalf("messages[0] role = %q, want system", messages[0].Get("role").String())
@@ -59,16 +59,22 @@ func TestConvertOpenAIRequestToOpencodeZen(t *testing.T) {
 	if got := messages[0].Get("content").String(); got != OpencodeZenSystemPrompt() {
 		t.Fatalf("messages[0].content does not match the canonical opencode prompt (len %d)", len(got))
 	}
-	if messages[1].Get("content").String() != "hello" || messages[2].Get("content").String() != "hi" || messages[3].Get("content").String() != "world" {
+	if messages[1].Get("content").String() != "client system instruction" {
+		t.Fatalf("client system message must be preserved, got %q", messages[1].Get("content").String())
+	}
+	if messages[2].Get("content").String() != "hello" || messages[3].Get("content").String() != "hi" || messages[4].Get("content").String() != "world" {
 		t.Fatal("non-system messages were not preserved in order")
 	}
 
 	tools := gjson.GetBytes(out, "tools").Array()
-	if len(tools) != 6 {
-		t.Fatalf("tools count = %d, want 6", len(tools))
+	if len(tools) != 7 {
+		t.Fatalf("tools count = %d, want 7", len(tools))
 	}
-	if tools[0].Get("function.name").String() != "read" {
-		t.Fatalf("tools[0] = %q, want read", tools[0].Get("function.name").String())
+	if tools[0].Get("function.name").String() != "bash" {
+		t.Fatalf("tools[0] = %q, want client bash tool first", tools[0].Get("function.name").String())
+	}
+	if tools[1].Get("function.name").String() != "read" {
+		t.Fatalf("tools[1] = %q, want canonical read tool second", tools[1].Get("function.name").String())
 	}
 	if got := gjson.GetBytes(out, "tool_choice").String(); got != "auto" {
 		t.Fatalf("tool_choice = %q, want auto", got)
@@ -87,6 +93,35 @@ func TestConvertOpenAIRequestToOpencodeZen(t *testing.T) {
 	}
 }
 
+func TestConvertOpenAIRequestToOpencodeZenDeduplicatesCanonicalTools(t *testing.T) {
+	input := `{
+		"model": "m",
+		"messages": [{"role": "user", "content": "q"}],
+		"tools": [
+			{"type": "function", "function": {"name": "read", "parameters": {}}},
+			{"type": "function", "function": {"name": "special_tool", "parameters": {}}}
+		],
+		"stream": true
+	}`
+	out := ConvertOpenAIRequestToOpencodeZen([]byte(input))
+	tools := gjson.GetBytes(out, "tools").Array()
+	if len(tools) != 7 {
+		t.Fatalf("tools count = %d, want 7 (canonical 6 + special_tool)", len(tools))
+	}
+	if tools[0].Get("function.name").String() != "special_tool" {
+		t.Fatalf("tools[0] = %q, want special_tool", tools[0].Get("function.name").String())
+	}
+	readCount := 0
+	for _, tool := range tools {
+		if tool.Get("function.name").String() == "read" {
+			readCount++
+		}
+	}
+	if readCount != 1 {
+		t.Fatalf("canonical read tool must appear exactly once, got %d", readCount)
+	}
+}
+
 func TestConvertOpenAIRequestToOpencodeZenNonStream(t *testing.T) {
 	input := `{
 		"model": "m",
@@ -100,8 +135,11 @@ func TestConvertOpenAIRequestToOpencodeZenNonStream(t *testing.T) {
 	if gjson.GetBytes(out, "stream_options").Exists() {
 		t.Fatal("non-streaming request must not gain stream_options")
 	}
-	if gjson.GetBytes(out, "messages.1.content").String() != "q" {
+	if gjson.GetBytes(out, "messages.2.content").String() != "q" {
 		t.Fatal("user message must be preserved")
+	}
+	if gjson.GetBytes(out, "messages.1.content").String() != "x" {
+		t.Fatal("client system message must be preserved")
 	}
 }
 

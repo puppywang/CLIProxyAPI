@@ -61,17 +61,20 @@ func opencodeZenJSONString(text string) string {
 }
 
 // ConvertOpenAIRequestToOpencodeZen rewrites an OpenAI chat completions payload
-// into the exact shape the opencode zen gateway recognizes as a genuine
-// opencode CLI request:
+// into a shape the opencode zen gateway recognizes as a genuine opencode CLI
+// request while preserving the client's own instructions and tools:
 //
 //  1. messages[0] becomes a single system message carrying the real opencode
-//     system prompt; client-provided system messages are dropped and other
-//     messages are preserved in order.
-//  2. tools is replaced by the canonical opencode tool set
-//     (read/task/todowrite/webfetch/websearch/write) and tool_choice is "auto".
+//     system prompt; client-provided system messages are preserved verbatim as
+//     additional system messages and other messages keep their order.
+//  2. tools is the canonical opencode tool set
+//     (read/task/todowrite/webfetch/websearch/write) followed by any client
+//     tools not already present; tool_choice is "auto".
 //  3. stream_options.include_usage is forced to true for streaming requests so
 //     usage accounting survives the gateway.
 //
+// The zen gateway requires the canonical system prompt and the canonical six
+// tools to be fully present; everything else in the payload is mergeable.
 // All other fields (model, max_tokens, reasoning_effort, stream, ...) pass
 // through unchanged.
 func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
@@ -80,13 +83,21 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	}
 
 	rawMessages := gjson.GetBytes(payload, "messages").Raw
-	rebuilt := `[{"role":"system","content":` + opencodeZenJSONString(opencodeZenSystemPrompt) + `}`
+	sysRaw := `{"role":"system","content":` + opencodeZenJSONString(opencodeZenSystemPrompt) + `}`
+	rebuilt := "[" + sysRaw
+
+	// Client system messages come right after the canonical one, verbatim.
 	gjson.Parse(rawMessages).ForEach(func(_, value gjson.Result) bool {
-		role := value.Get("role").String()
-		if role == "system" {
-			return true
+		if value.Get("role").String() == "system" {
+			rebuilt += "," + value.Raw
 		}
-		rebuilt += "," + value.Raw
+		return true
+	})
+	// All other messages keep their original order.
+	gjson.Parse(rawMessages).ForEach(func(_, value gjson.Result) bool {
+		if value.Get("role").String() != "system" {
+			rebuilt += "," + value.Raw
+		}
 		return true
 	})
 	rebuilt += "]"
@@ -95,7 +106,7 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	if err != nil {
 		return payload
 	}
-	out, err = sjson.SetRawBytes(out, "tools", []byte(opencodeZenTools))
+	out, err = sjson.SetRawBytes(out, "tools", []byte(mergeOpencodeZenTools(payload)))
 	if err != nil {
 		return payload
 	}
@@ -115,10 +126,59 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	return out
 }
 
+// mergeOpencodeZenTools returns the client's own tools (deduplicated by
+// function name, listed first so the model prefers its environment's tools)
+// followed by the canonical opencode tool set. A tool whose name collides with
+// one of the canonical six is always emitted in its canonical form so the
+// gateway validation still passes.
+func mergeOpencodeZenTools(payload []byte) string {
+	canonicalNames := map[string]struct{}{
+		"read": {}, "task": {}, "todowrite": {},
+		"webfetch": {}, "websearch": {}, "write": {},
+	}
+	var clientTools []string
+	seen := make(map[string]struct{}, 8)
+	gjson.GetBytes(payload, "tools").ForEach(func(_, tool gjson.Result) bool {
+		name := tool.Get("function.name").String()
+		if name == "" {
+			return true
+		}
+		if _, isCanonical := canonicalNames[name]; isCanonical {
+			return true
+		}
+		if _, dup := seen[name]; dup {
+			return true
+		}
+		seen[name] = struct{}{}
+		clientTools = append(clientTools, tool.Raw)
+		return true
+	})
+
+	var b strings.Builder
+	b.WriteByte('[')
+	first := true
+	for _, raw := range clientTools {
+		if !first {
+			b.WriteByte(',')
+		}
+		b.WriteString(raw)
+		first = false
+	}
+	for _, tool := range gjson.Parse(opencodeZenTools).Array() {
+		if !first {
+			b.WriteByte(',')
+		}
+		b.WriteString(tool.Raw)
+		first = false
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
 // enforceOpencodeZenPayloadBudget shrinks an over-budget payload by dropping
-// the oldest messages (keeping the newest ones) and, when a single message
-// exceeds the budget, truncating its content tail. The canonical system
-// message is always retained.
+// the oldest non-system messages (keeping the newest ones) and, when a single
+// message exceeds the budget, truncating its content tail. Canonical and
+// client system messages are always retained.
 func enforceOpencodeZenPayloadBudget(payload []byte) []byte {
 	budget := OpencodeZenMaxPayloadBytes
 	if len(payload) <= budget {
@@ -134,18 +194,13 @@ func enforceOpencodeZenPayloadBudget(payload []byte) []byte {
 	}
 	sysRaw := `{"role":"system","content":` + opencodeZenJSONString(opencodeZenSystemPrompt) + `}`
 	kept := make([]string, 0, len(parsed)+1)
-	kept = append(kept, sysRaw)
+	// Convert already injects the canonical system prompt as messages[0];
+	// only prepend another one when it is missing (direct callers).
+	if len(parsed) == 0 || gjson.Parse(parsed[0].Raw).Get("role").String() != "system" {
+		kept = append(kept, sysRaw)
+	}
 	for i := range parsed {
 		kept = append(kept, parsed[i].Raw)
-	}
-	// Drop orphaned tool/function messages at the old edge after trimming;
-	// their matching assistant tool_calls message has been dropped too.
-	for len(kept) > 1 {
-		role := gjson.Parse(kept[len(kept)-1]).Get("role").String()
-		if role != "tool" && role != "function" {
-			break
-		}
-		kept = kept[:len(kept)-1]
 	}
 
 	rebuild := func() ([]byte, int) {
@@ -166,17 +221,32 @@ func enforceOpencodeZenPayloadBudget(payload []byte) []byte {
 		return out, len(arr)
 	}
 
-	// dropOrphanedRemoves tool/function messages that became the oldest kept
-	// message after trimming (their matching assistant tool_calls message was
-	// dropped). Runs before every rebuild because each trim can expose a new
-	// orphan at the old edge.
-	dropOrphans := func() {
-		for len(kept) > 1 {
-			role := gjson.Parse(kept[1]).Get("role").String()
-			if role != "tool" && role != "function" {
-				break
+	isSystem := func(raw string) bool {
+		return gjson.Parse(raw).Get("role").String() == "system"
+	}
+	// firstMessage returns the index of the oldest non-system message, or -1.
+	firstMessage := func() int {
+		for i := 1; i < len(kept); i++ {
+			if !isSystem(kept[i]) {
+				return i
 			}
-			kept = append(kept[:1], kept[2:]...)
+		}
+		return -1
+	}
+
+	// dropOrphans removes tool/function messages at the old edge (their
+	// matching assistant tool_calls message was dropped by trimming).
+	dropOrphans := func() {
+		for {
+			i := firstMessage()
+			if i < 0 {
+				return
+			}
+			role := gjson.Parse(kept[i]).Get("role").String()
+			if role != "tool" && role != "function" {
+				return
+			}
+			kept = append(kept[:i], kept[i+1:]...)
 		}
 	}
 
@@ -187,22 +257,25 @@ func enforceOpencodeZenPayloadBudget(payload []byte) []byte {
 			return out
 		}
 		overhead := len(out) - arrLen
-		if len(kept) <= 1 {
-			// The system message alone cannot exhaust the budget; give up.
+		i := firstMessage()
+		if i < 0 {
+			// Only system messages remain; nothing else can be trimmed.
 			return out
 		}
-		if len(kept) == 2 {
-			avail := budget - overhead - len(sysRaw) - 3
-			fitted, ok := fitOpencodeZenMessageToBudget(kept[1], avail)
+		if i == len(kept)-1 {
+			// The single remaining non-system message: truncate instead of
+			// dropping so the newest turn is always preserved.
+			avail := budget - overhead - (arrLen - len(kept[i]) - 1)
+			fitted, ok := fitOpencodeZenMessageToBudget(kept[i], avail)
 			if !ok {
-				kept = kept[:1]
+				kept = append(kept[:i], kept[i+1:]...)
 				continue
 			}
-			kept[1] = fitted
+			kept[i] = fitted
 			continue
 		}
 		// Keep trimming the oldest non-system message.
-		kept = append(kept[:1], kept[2:]...)
+		kept = append(kept[:i], kept[i+1:]...)
 		dropOrphans()
 	}
 }
