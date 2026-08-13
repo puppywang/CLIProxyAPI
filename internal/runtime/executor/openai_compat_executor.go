@@ -343,11 +343,17 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 	if e.zenEnabled(auth) {
+		// Before conversion, snapshot the client-side reasoning shape so we
+		// can attribute "reasoning_content must be passed back" rejections to
+		// the client payload vs our trimming.
+		preConvert := translated
 		before := len(translated)
 		translated = helps.ConvertOpenAIRequestToOpencodeZen(translated)
 		if len(translated) < before {
 			log.Debugf("opencode zen: request trimmed from %d to %d bytes", before, len(translated))
 		}
+		helps.DebugZenReasoningShape(preConvert, "pre-convert")
+		helps.DebugZenReasoningShape(translated, "post-convert")
 		helps.DebugZenRequestShape(translated)
 	}
 
@@ -403,6 +409,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		if e.zenEnabled(auth) && strings.Contains(string(b), "reasoning_content") && strings.Contains(string(b), "must be passed back") {
+			// Diagnose the DeepSeek thinking-mode rejection: which assistant
+			// messages carry reasoning_content vs tool_calls after conversion.
+			helps.DebugZenReasoningShape(translated, "rejected-post-convert")
+		}
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)

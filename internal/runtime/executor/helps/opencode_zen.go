@@ -149,6 +149,36 @@ func opencodeZenJSONString(text string) string {
 	return replacer.Replace(string(encoded))
 }
 
+// opencodeZenEnsureReasoningContent returns the message raw JSON, adding an
+// empty reasoning_content field to assistant messages that carry tool_calls
+// but no reasoning_content. The DeepSeek thinking-mode gateway rejects
+// requests where a tool-calling assistant turn is resent without its
+// reasoning_content ("reasoning_content in the thinking mode must be passed
+// back to the API"); Copilot session histories are not guaranteed to retain
+// the field (e.g. across compaction or model switches), so the empty field
+// satisfies the gateway without inventing content the model never produced.
+func opencodeZenEnsureReasoningContent(m gjson.Result) string {
+	if m.Get("role").String() != "assistant" {
+		return m.Raw
+	}
+	if len(m.Get("tool_calls").Array()) == 0 {
+		return m.Raw
+	}
+	if m.Get("reasoning_content").Exists() {
+		return m.Raw
+	}
+	out, err := sjson.SetRawBytes([]byte(m.Raw), "reasoning_content", []byte(`""`))
+	if err != nil {
+		return m.Raw
+	}
+	return string(out)
+}
+
+// OpencodeZenEnsureReasoningContent exposes the helper for tests.
+func OpencodeZenEnsureReasoningContent(raw string) string {
+	return opencodeZenEnsureReasoningContent(gjson.Parse(raw))
+}
+
 // opencodeZenClientToolNote is appended as an extra system message when the
 // client request carries its own tool set (e.g. GitHub Copilot's workspace
 // tools). The canonical six tools must remain in the payload for the gateway
@@ -234,9 +264,10 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	}
 	// All other messages keep their original order.
 	gjson.Parse(rawMessages).ForEach(func(_, value gjson.Result) bool {
-		if value.Get("role").String() != "system" {
-			rebuilt += "," + value.Raw
+		if value.Get("role").String() == "system" {
+			return true
 		}
+		rebuilt += "," + opencodeZenEnsureReasoningContent(value)
 		return true
 	})
 	rebuilt += "]"
@@ -332,6 +363,61 @@ func opencodeZenRepeatNote(rawMessages string) string {
 		args = args[:400] + "..."
 	}
 	return fmt.Sprintf("Note: you have already called %s with the same arguments %d times in this conversation, and each result was identical. The result is not going to change on another call. If it did not answer your question, re-read the existing results above instead of calling %s again.", best.key.name, best.count, best.key.name)
+}
+
+// DebugZenReasoningShape dumps per-message reasoning/tool-call presence for
+// the converted payload, to diagnose upstream "reasoning_content must be
+// passed back" rejections. For each assistant message it logs whether
+// reasoning_content exists and whether tool_calls exist; tool messages are
+// counted. The last few messages are printed in full (truncated) so the
+// failing boundary is visible.
+func DebugZenReasoningShape(payload []byte, stage string) {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "opencode zen: reasoning shape (%s, len=%d): ", stage, len(payload))
+	asstWithReasoning, asstNoReasoning, asstWithTools, toolMsgs, toolNoId := 0, 0, 0, 0, 0
+	msgs := gjson.GetBytes(payload, "messages")
+	msgs.ForEach(func(_, m gjson.Result) bool {
+		role := m.Get("role").String()
+		switch role {
+		case "assistant":
+			hasRc := m.Get("reasoning_content").Exists()
+			hasTc := len(m.Get("tool_calls").Array()) > 0
+			if hasRc {
+				asstWithReasoning++
+			} else {
+				asstNoReasoning++
+			}
+			if hasTc {
+				asstWithTools++
+			}
+		case "tool", "function":
+			toolMsgs++
+			if m.Get("tool_call_id").String() == "" {
+				toolNoId++
+			}
+		}
+		return true
+	})
+	fmt.Fprintf(&b, "assistant(reasoning)=%d assistant(no-reasoning)=%d assistant(tool_calls)=%d tool=%d toolNoId=%d",
+		asstWithReasoning, asstNoReasoning, asstWithTools, toolMsgs, toolNoId)
+	// Show the tail boundary verbatim: the newest messages decide whether a
+	// pending tool call / reasoning field survives.
+	tailStart := 0
+	total := len(msgs.Array())
+	if total > 6 {
+		tailStart = total - 6
+	}
+	for i := tailStart; i < total; i++ {
+		raw := msgs.Array()[i].Raw
+		if len(raw) > 300 {
+			raw = raw[:300] + "..."
+		}
+		fmt.Fprintf(&b, "\n  [%d] %s", i, raw)
+	}
+	log.Debugf("%s", b.String())
 }
 
 // OpencodeZenRepeatNote exposes the convergence hint for tests.

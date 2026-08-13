@@ -200,6 +200,33 @@ func TestOpencodeZenClientToolNoteOnlyForOwnTools(t *testing.T) {
 	}
 }
 
+func TestOpencodeZenEnsureReasoningContent(t *testing.T) {
+	// assistant with tool_calls but no reasoning_content -> field added empty
+	raw := `{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{}"}}]}`
+	out := OpencodeZenEnsureReasoningContent(raw)
+	if !gjson.Get(out, "reasoning_content").Exists() {
+		t.Fatal("reasoning_content must be added")
+	}
+	if got := gjson.Get(out, "reasoning_content").String(); got != "" {
+		t.Fatalf("reasoning_content = %q, want empty", got)
+	}
+	// existing reasoning_content untouched
+	withRC := `{"role":"assistant","content":"","reasoning_content":"think","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{}"}}]}`
+	if out2 := OpencodeZenEnsureReasoningContent(withRC); out2 != withRC {
+		t.Fatal("existing reasoning_content must be preserved verbatim")
+	}
+	// plain assistant without tool_calls -> untouched
+	plain := `{"role":"assistant","content":"hello"}`
+	if out3 := OpencodeZenEnsureReasoningContent(plain); out3 != plain {
+		t.Fatal("plain assistant must be untouched")
+	}
+	// user message untouched
+	user := `{"role":"user","content":"hi"}`
+	if out4 := OpencodeZenEnsureReasoningContent(user); out4 != user {
+		t.Fatal("user message must be untouched")
+	}
+}
+
 func TestOpencodeZenRepeatNoteDetection(t *testing.T) {
 	// 3 identical grep calls -> note must be produced.
 	three := `[
