@@ -88,6 +88,11 @@ func settingsPutHandler(reg *Registry) gin.HandlerFunc {
 
 func recentErrorsHandler(reg *Registry) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if c.Request.Method == http.MethodPost && c.Query("reset") == "1" {
+			reg.ZenReasoningAlertReset()
+			c.JSON(http.StatusOK, gin.H{"status": "ok", "zen_reasoning_rejections": 0})
+			return
+		}
 		limit := 50
 		if v := strings.TrimSpace(c.Query("limit")); v != "" {
 			if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -96,7 +101,12 @@ func recentErrorsHandler(reg *Registry) gin.HandlerFunc {
 		}
 		c.JSON(http.StatusOK, gin.H{
 			"records": reg.RecentErrors(limit),
-			"now":     time.Now(),
+			// Live alert counter for the DeepSeek thinking-mode gate
+			// ("reasoning_content must be passed back" 400s). Panel shows it
+			// when non-zero so a client-history regression is visible without
+			// digging into per-request records.
+			"zen_reasoning_rejections": reg.ZenReasoningRejections(),
+			"now":                      time.Now(),
 		})
 	}
 }

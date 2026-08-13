@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // Status enumerates the lifecycle states of a tracked request.
@@ -263,6 +265,11 @@ type Registry struct {
 	errors    *errorsRing
 	errorsLog *errorsLog
 
+	// zenReasoningRejections counts 400 "reasoning_content must be passed
+	// back" rejections (classified reason zen_reasoning_400). Surface as a
+	// live alert counter on the monitor panel; reset by ZenReasoningAlertReset.
+	zenReasoningRejections atomic.Int64
+
 	// quotaHistory retains per-auth quota samples so the quota panel can draw
 	// a usage curve (and show what an account peaked at before a reset).
 	quotaHistory *quotaHistoryStore
@@ -415,6 +422,26 @@ func (r *Registry) RecentErrors(limit int) []ErrorRecord {
 		return nil
 	}
 	return er.recent(limit)
+}
+
+// ZenReasoningRejections returns the live counter of DeepSeek thinking-mode
+// "reasoning_content must be passed back" 400 rejections (reason tag
+// zen_reasoning_400) since the last reset. A non-zero value on a healthy
+// session means client histories are still dropping reasoning_content.
+func (r *Registry) ZenReasoningRejections() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.zenReasoningRejections.Load()
+}
+
+// ZenReasoningAlertReset zeroes the zen reasoning rejection counter, e.g.
+// after the root cause is addressed or a fix is deployed.
+func (r *Registry) ZenReasoningAlertReset() {
+	if r == nil {
+		return
+	}
+	r.zenReasoningRejections.Store(0)
 }
 
 // SetAuthLookup installs (or replaces) the auth enrichment callback.
@@ -574,6 +601,15 @@ func (r *Registry) maybeRecordError(snap Entry) {
 		Reason:     reason,
 		RecordedAt: time.Now(),
 	}
+	if reason == "zen_reasoning_400" {
+		total := r.zenReasoningRejections.Add(1)
+		log.WithFields(log.Fields{
+			"request_id": snap.ID,
+			"model":      snap.Model,
+			"auth_id":    snap.AuthID,
+			"provider":   snap.Provider,
+		}).Warnf("zen reasoning_content rejection #%d: DeepSeek thinking-mode gate refuses assistant tool_calls resent without reasoning_content (see monitor reason zen_reasoning_400)", total)
+	}
 	er.add(rec)
 	// Persist after the ring update so an append failure cannot keep
 	// the record out of the live panel — operator visibility wins
@@ -595,6 +631,12 @@ func classifyErrorReason(snap Entry) string {
 			return "auth"
 		case code == 429:
 			return "quota"
+		case code == 400 && isZenReasoningRejection(snap.ErrorSnippet):
+			// DeepSeek thinking-mode gate: a tool-calling assistant turn was
+			// resent without its reasoning_content. Surface it as its own
+			// reason so the operator can correlate these with Copilot
+			// sessions that fail repeatedly on the same history shape.
+			return "zen_reasoning_400"
 		case code >= 500:
 			return "upstream_5xx"
 		default:
@@ -613,6 +655,16 @@ func classifyErrorReason(snap Entry) string {
 		return "no_status"
 	}
 	return ""
+}
+
+// isZenReasoningRejection reports whether the error snippet is the
+// DeepSeek thinking-mode "reasoning_content must be passed back" 400.
+func isZenReasoningRejection(snippet string) bool {
+	if snippet == "" {
+		return false
+	}
+	lower := strings.ToLower(snippet)
+	return strings.Contains(lower, "reasoning_content") && strings.Contains(lower, "must be passed back")
 }
 
 func (r *Registry) recordCancel(snap Entry, reason, by string) {
