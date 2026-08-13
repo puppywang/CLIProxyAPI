@@ -79,7 +79,10 @@ type Refresher struct {
 	// never made a real request reports reset_at ≈ fetched_at + 7d on
 	// every fetch (the window never starts counting). Two consecutive
 	// observations of a near-full window + zero usage trigger a probe so
-	// the window gets anchored. Guarded by mu.
+	// the window gets anchored. The same last-snapshot is also used to
+	// detect a window *reset* (a saturated previous observation followed
+	// by a near-zero one) so the probe can re-anchor the fresh window
+	// immediately instead of waiting for the next cycle. Guarded by mu.
 	snapshots map[string]coreauth.QuotaSnapshot
 	// probedAt records the last probe attempt per auth so a failed or
 	// ineffective probe is not retried more often than quotaProbeMinInterval.
@@ -171,6 +174,12 @@ const (
 	// quotaProbeMinInterval: minimum gap between probe attempts for the
 	// same auth, so a failing probe is retried at most once per hour.
 	quotaProbeMinInterval = 1 * time.Hour
+	// quotaResetMinPrev: the previous sample must have been at or above
+	// this percent for a collapse to near-zero to count as a window
+	// reset worth re-anchoring. Mirrors the monitor's quotaResetMinPrev
+	// so the refresher's reset probe agrees with the chart's reset
+	// markers (7% -> 0% is a reset, 3% -> 0% is refresh jitter).
+	quotaResetMinPrev = 5
 )
 
 // RefresherOption tunes a Refresher at construction. Use the WithX helpers
@@ -492,7 +501,7 @@ func (r *Refresher) runOnce(ctx context.Context) {
 		go func(a *coreauth.Auth) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			r.refresh(ctx, a, true)
+			r.refresh(ctx, a, true, now)
 		}(target)
 	}
 	wg.Wait()
@@ -515,7 +524,7 @@ func (r *Refresher) refreshByID(ctx context.Context, authID string) {
 		if !strings.EqualFold(strings.TrimSpace(a.Provider), "codex") {
 			return
 		}
-		r.refresh(ctx, a, false)
+		r.refresh(ctx, a, false, time.Now())
 		return
 	}
 }
@@ -535,8 +544,13 @@ func (r *Refresher) refreshByID(ctx context.Context, authID string) {
 // means this is the regular cycle path and the per-auth nextAt should
 // advance by one interval on success; scheduleNext=false is the
 // out-of-cycle path (Trigger / manual refresh) where the cadence is
-// owned by the cycle and should not be perturbed.
-func (r *Refresher) refresh(ctx context.Context, a *coreauth.Auth, scheduleNext bool) {
+// owned by the cycle and should not be perturbed. cycleStart is the
+// moment the current refresh cycle began (the tick time) — used to
+// anchor the next scheduled refresh so a slow fetch cannot push the
+// per-auth cadence out of phase with the loop ticker (the observed
+// 20-min-cadence bug: fetch completion + interval landed past the next
+// tick, which then got skipped).
+func (r *Refresher) refresh(ctx context.Context, a *coreauth.Auth, scheduleNext bool, cycleStart time.Time) {
 	snap, ok, err := r.fetcher.Fetch(ctx, a)
 	r.noteFetchOutcome(a.ID, ok, err)
 	if err != nil {
@@ -552,7 +566,7 @@ func (r *Refresher) refresh(ctx context.Context, a *coreauth.Auth, scheduleNext 
 	}
 	r.pusher(a.ID, snap)
 	if scheduleNext {
-		r.recordSuccess(a.ID)
+		r.recordSuccess(a.ID, cycleStart)
 	} else {
 		r.recordSuccessKeepingSchedule(a.ID)
 	}
@@ -567,6 +581,18 @@ func (r *Refresher) refresh(ctx context.Context, a *coreauth.Auth, scheduleNext 
 	// consecutive near-full-window observations with zero usage means
 	// the window is floating; fire one minimal probe request to pin it.
 	r.maybeProbeFloatingWindow(ctx, a, snap)
+
+	// Reset re-anchor: the previous observation showed the window
+	// saturated (limit reached / >=quotaResetMinPrev used) and this one
+	// collapsed to near zero — the window just rolled over. A fresh
+	// window with no real requests reports a *floating* reset_at on the
+	// next fetch (≈ fetched_at + 7d), so anchoring it now with one probe
+	// request stops the reset time from sliding away and records the
+	// true window start. This catches the CD-cooldown rollover case the
+	// floating detector alone misses (the cooldown observation was
+	// saturated, never "floating", so two-observation detection would
+	// defer the probe until the next cycle).
+	r.maybeProbeAfterReset(ctx, a, snap)
 
 	// Auto-recovery: when wham reports the auth is healthy
 	// (limit_reached=false) AND the in-memory state still carries an
@@ -687,6 +713,56 @@ func (r *Refresher) maybeProbeFloatingWindow(ctx context.Context, a *coreauth.Au
 		return
 	}
 	log.Infof("quota-refresher: window anchor probe ok | auth=%s — reset_at should now be fixed", a.ID)
+}
+
+// maybeProbeAfterReset detects a primary-window reset — the previous
+// observation was saturated (>= quotaResetMinPrev used) and the new one
+// collapsed to (near) zero — and fires one probe request to anchor the
+// fresh window immediately. Without this, a CD-cooldown rollover leaves
+// the account with a *floating* reset_at (wham reports ≈ fetched_at + 7d
+// until a real request starts the window), and the floating detector
+// would only catch it on the NEXT cycle (its previous observation was
+// saturated, so the two-observation rule defers the probe). Anchoring
+// now records the true window start so the monitor's reset_at is fixed
+// at the rollover moment instead of sliding for another cycle.
+//
+// The probe is throttled by the same quotaProbeMinInterval as the
+// floating detector, so a reset followed by a floating observation
+// cannot double-fire.
+func (r *Refresher) maybeProbeAfterReset(ctx context.Context, a *coreauth.Auth, snap coreauth.QuotaSnapshot) {
+	if r == nil || a == nil || r.probeFn == nil {
+		return
+	}
+	if snap.UsedPercentPrimary > quotaResetMinPrev || snap.LimitReached {
+		// Not a reset — the window is still saturated or in use.
+		return
+	}
+	r.mu.Lock()
+	prev, sawPrev := r.snapshots[a.ID]
+	lastProbe, sawProbe := r.probedAt[a.ID]
+	r.mu.Unlock()
+	if !sawPrev || prev.UsedPercentPrimary < quotaResetMinPrev {
+		// No previous observation, or the previous one was already low —
+		// nothing collapsed.
+		return
+	}
+	if sawProbe && time.Since(lastProbe) < quotaProbeMinInterval {
+		// Already probed recently (e.g. the floating detector fired on
+		// the previous cycle) — the next cycle will re-check.
+		return
+	}
+
+	r.mu.Lock()
+	r.probedAt[a.ID] = time.Now()
+	r.mu.Unlock()
+
+	log.Infof("quota-refresher: window reset detected | auth=%s prev_used=%d%% now_used=%d%% — firing probe to anchor the fresh 7d window",
+		a.ID, prev.UsedPercentPrimary, snap.UsedPercentPrimary)
+	if err := r.probeFn(ctx, a); err != nil {
+		log.WithError(err).Warnf("quota-refresher: reset anchor probe failed | auth=%s", a.ID)
+		return
+	}
+	log.Infof("quota-refresher: reset anchor probe ok | auth=%s — reset_at should now be fixed", a.ID)
 }
 
 // hasErrorMarker reports whether the auth (or any of its per-model
@@ -892,7 +968,15 @@ func (r *Refresher) recordFailure(authID string) {
 // enforced here rather than implicitly via the loop ticker, the loop
 // ticker can fire more often (and pick up cooldown-end alignments
 // promptly) without producing extra fetches against healthy auths.
-func (r *Refresher) recordSuccess(authID string) {
+//
+// The next deadline is anchored to cycleStart (the tick that launched
+// this fetch) rather than to fetch completion: with the concurrency cap
+// and many auths, a fetch can finish well after its tick, and anchoring
+// to completion pushed nextAt past the following tick — silently halving
+// the cadence (observed 2026-08-13: every auth refreshed every 20min
+// instead of 10min because each fetch landed 30-60s after its tick and
+// the next tick was skipped by allowed()).
+func (r *Refresher) recordSuccess(authID string, cycleStart time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state := r.backoffs[authID]
@@ -901,7 +985,7 @@ func (r *Refresher) recordSuccess(authID string) {
 		r.backoffs[authID] = state
 	}
 	state.failures = 0
-	state.nextAt = time.Now().Add(r.interval)
+	state.nextAt = cycleStart.Add(r.interval)
 }
 
 // recordSuccessKeepingSchedule clears backoff failures without touching

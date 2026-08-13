@@ -145,6 +145,140 @@ func TestFloatingWindowNotTriggeredForInUseOrLimited(t *testing.T) {
 	}
 }
 
+// TestResetProbe_AnchorsSaturatedToZeroTransition verifies the
+// reset-detection probe: when the previous observation was saturated
+// (>= quotaResetMinPrev used) and the new one collapses to near zero,
+// the refresher fires one probe immediately — no need to wait for the
+// two-consecutive-floating rule (the pre-reset observation was
+// saturated, so the floating detector would defer the anchor).
+func TestResetProbe_AnchorsSaturatedToZeroTransition(t *testing.T) {
+	now := time.Now()
+	fetcher := newFakeFetcher()
+	auth := &coreauth.Auth{ID: "reset-1", Provider: "codex"}
+
+	var probeCalls atomic.Int64
+	refresher := NewRefresher(fetcher, func() []*coreauth.Auth { return nil }, func(authID string, snap coreauth.QuotaSnapshot) {},
+		WithProbePin(func(ctx context.Context, a *coreauth.Auth) error {
+			probeCalls.Add(1)
+			return nil
+		}))
+
+	// Seed the refresher with a saturated previous observation.
+	prev := coreauth.QuotaSnapshot{
+		UsedPercentPrimary: 100, LimitReached: true,
+		FetchedAt: now, ResetAtPrimary: now.Add(7 * 24 * time.Hour),
+	}
+	refresher.mu.Lock()
+	refresher.snapshots[auth.ID] = prev
+	refresher.mu.Unlock()
+
+	// Next cycle: the window rolled over — usage collapsed to zero, and
+	// wham now reports a floating reset_at (fresh window, no requests yet).
+	snap := coreauth.QuotaSnapshot{
+		UsedPercentPrimary: 0, LimitReached: false,
+		FetchedAt: now.Add(10 * time.Minute), ResetAtPrimary: now.Add(10*time.Minute + 7*24*time.Hour),
+	}
+	refresher.maybeProbeAfterReset(context.Background(), auth, snap)
+	if probeCalls.Load() != 1 {
+		t.Fatalf("reset transition: expected 1 probe, got %d", probeCalls.Load())
+	}
+
+	// A second reset-like observation within the throttle window must
+	// not double-fire.
+	refresher.maybeProbeAfterReset(context.Background(), auth, snap)
+	if probeCalls.Load() != 1 {
+		t.Fatalf("throttled reset probe: expected still 1, got %d", probeCalls.Load())
+	}
+
+	// A snapshot still saturated must never probe.
+	refresher.maybeProbeAfterReset(context.Background(), auth, coreauth.QuotaSnapshot{
+		UsedPercentPrimary: 90, LimitReached: false, FetchedAt: now.Add(20 * time.Minute),
+	})
+	if probeCalls.Load() != 1 {
+		t.Fatalf("saturated snapshot: expected no probe, got %d", probeCalls.Load())
+	}
+}
+
+// TestResetProbe_NoProbeWithoutPriorSaturation verifies the reset probe
+// does not fire when there is no previous observation (or the previous
+// one was already low — e.g. steady-state zero-usage accounts).
+func TestResetProbe_NoProbeWithoutPriorSaturation(t *testing.T) {
+	now := time.Now()
+	fetcher := newFakeFetcher()
+	auth := &coreauth.Auth{ID: "reset-2", Provider: "codex"}
+
+	var probeCalls atomic.Int64
+	refresher := NewRefresher(fetcher, func() []*coreauth.Auth { return nil }, func(authID string, snap coreauth.QuotaSnapshot) {},
+		WithProbePin(func(ctx context.Context, a *coreauth.Auth) error {
+			probeCalls.Add(1)
+			return nil
+		}))
+
+	// No previous observation at all.
+	refresher.maybeProbeAfterReset(context.Background(), auth, coreauth.QuotaSnapshot{
+		UsedPercentPrimary: 0, FetchedAt: now, ResetAtPrimary: now.Add(7 * 24 * time.Hour),
+	})
+	if probeCalls.Load() != 0 {
+		t.Fatalf("no previous observation: expected no probe, got %d", probeCalls.Load())
+	}
+
+	// Previous observation was already low — not a reset transition.
+	refresher.mu.Lock()
+	refresher.snapshots[auth.ID] = coreauth.QuotaSnapshot{UsedPercentPrimary: 2, FetchedAt: now}
+	refresher.mu.Unlock()
+	refresher.maybeProbeAfterReset(context.Background(), auth, coreauth.QuotaSnapshot{
+		UsedPercentPrimary: 1, FetchedAt: now.Add(10 * time.Minute), ResetAtPrimary: now.Add(10*time.Minute + 7*24*time.Hour),
+	})
+	if probeCalls.Load() != 0 {
+		t.Fatalf("low-to-low transition: expected no probe, got %d", probeCalls.Load())
+	}
+}
+
+// TestRecordSuccess_AnchorsNextAtToCycleStart verifies the cadence fix:
+// recordSuccess must anchor the next scheduled refresh to the cycle
+// START (the tick that launched the fetch), not to fetch completion —
+// otherwise a fetch that finishes late pushes nextAt past the following
+// tick, and every auth silently halves its cadence (the observed
+// 20-min-cadence bug).
+func TestRecordSuccess_AnchorsNextAtToCycleStart(t *testing.T) {
+	t.Parallel()
+
+	r := NewRefresher(
+		newFakeFetcher(),
+		func() []*coreauth.Auth { return nil },
+		func(string, coreauth.QuotaSnapshot) {},
+		WithInterval(10*time.Minute),
+	)
+	const authID = "cadence-1"
+
+	cycleStart := time.Now()
+	// Simulate a fetch that finished 90 seconds after its cycle started
+	// (concurrency queuing).
+	finished := cycleStart.Add(90 * time.Second)
+	r.mu.Lock()
+	r.backoffs[authID] = &backoffState{}
+	r.mu.Unlock()
+	r.recordSuccess(authID, cycleStart)
+
+	r.mu.Lock()
+	nextAt := r.backoffs[authID].nextAt
+	r.mu.Unlock()
+
+	want := cycleStart.Add(10 * time.Minute)
+	if !nextAt.Equal(want) {
+		t.Fatalf("recordSuccess should anchor nextAt to cycleStart+interval; got %v, want %v", nextAt, want)
+	}
+	// Crucially, nextAt must be BEFORE finished+interval, so the next
+	// tick (cycleStart+10min) actually fires — the bug pushed it past.
+	if finished.Add(10 * time.Minute).Before(nextAt) {
+		t.Fatalf("nextAt %v is past finished+interval %v — cadence would halve", nextAt, finished.Add(10*time.Minute))
+	}
+	// And allowed() at cycleStart+interval must return true.
+	if !r.allowed(authID, cycleStart.Add(10*time.Minute)) {
+		t.Fatal("allowed=false at cycleStart+interval — cadence would halve")
+	}
+}
+
 // fakeFetcher implements coreauth.QuotaFetcher with deterministic
 // behaviour driven by per-auth fixtures. Each Fetch call increments a
 // counter so tests can assert how many times each auth was refreshed.
@@ -544,7 +678,7 @@ func TestRefresher_AlignCooldownEndPullsNextAtForward(t *testing.T) {
 	const authID = "a"
 
 	// Seed a "just refreshed, next due in 10 minutes" state.
-	r.recordSuccess(authID)
+	r.recordSuccess(authID, time.Now())
 	r.mu.Lock()
 	originalNext := r.backoffs[authID].nextAt
 	r.mu.Unlock()
