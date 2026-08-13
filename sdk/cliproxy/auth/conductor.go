@@ -2995,9 +2995,24 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
+								// Distinguish a genuinely dead credential from a
+								// transient upstream gate. The opencode zen gateway
+								// rejects ALL keys during a rate-limit / abuse
+								// window with invalid_bearer_credential even though
+								// the credential itself is fine — treating that as
+								// a 30-minute "unauthorized" cooldown froze the
+								// entire key pool (observed: 6/6 opencode keys
+								// suspended by one request's failover loop). A
+								// short cooldown keeps the key eligible again
+								// quickly while still throttling immediate retries.
 								next := now.Add(30 * time.Minute)
+								if isZenTransientInvalidBearer(result.Error.Message) {
+									next = now.Add(opencodeZenTransientCooldown)
+									suspendReason = "unauthorized_transient"
+								} else {
+									suspendReason = "unauthorized"
+								}
 								state.NextRetryAfter = next
-								suspendReason = "unauthorized"
 								shouldSuspendModel = true
 							}
 							// Auto-release this auth's session-affinity bindings
@@ -3383,6 +3398,28 @@ func statusCodeFromResult(err *Error) int {
 		return 0
 	}
 	return err.StatusCode()
+}
+
+// opencodeZenTransientCooldown is how long an auth that hit the zen
+// gateway's transient invalid_bearer_credential window is kept out of
+// candidacy. Longer than the 429 backoff (the upstream is still shaky
+// for a moment) but far shorter than the permanent-looking 30-minute
+// "unauthorized" cooldown, so a one-off abuse-window rejection cannot
+// freeze the whole key pool.
+const opencodeZenTransientCooldown = 1 * time.Minute
+
+// isZenTransientInvalidBearer reports whether a 401 message looks like the
+// opencode zen gateway's abuse/rate-limit window (invalid_bearer_credential
+// returned for every key regardless of the actual credential) rather than a
+// genuinely revoked key. Conservative: only matches when the upstream names
+// the bearer-credential failure explicitly.
+func isZenTransientInvalidBearer(message string) bool {
+	if message == "" {
+		return false
+	}
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "invalid_bearer_credential") ||
+		strings.Contains(lower, "missing or invalid bearer credential")
 }
 
 func isModelSupportErrorMessage(message string) bool {
