@@ -24,14 +24,14 @@ func TestMergeOpencodeZenToolsHardnessScenario(t *testing.T) {
 		"model": "deepseek-v4-flash-free",
 		"messages": [{"role": "user", "content": "q"}],
 		"tools": [
-			{"type": "function", "function": {"name": "read", "parameters": {"properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}},
-			{"type": "function", "function": {"name": "write", "parameters": {"properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}},
-			{"type": "function", "function": {"name": "edit", "parameters": {"properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}},
-			{"type": "function", "function": {"name": "pwsh", "parameters": {"properties": {"command": {"type": "string"}}}}},
-			{"type": "function", "function": {"name": "task", "parameters": {"properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}}},
-			{"type": "function", "function": {"name": "todowrite", "parameters": {"properties": {"todos": {"type": "array"}}, "required": ["todos"]}}},
-			{"type": "function", "function": {"name": "webfetch", "parameters": {"properties": {"url": {"type": "string"}}, "required": ["url"]}}},
-			{"type": "function", "function": {"name": "websearch", "parameters": {"properties": {"query": {"type": "string"}}, "required": ["query"]}}}
+			{"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}},
+			{"type": "function", "function": {"name": "write", "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}},
+			{"type": "function", "function": {"name": "edit", "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}},
+			{"type": "function", "function": {"name": "pwsh", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}},
+			{"type": "function", "function": {"name": "task", "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}}},
+			{"type": "function", "function": {"name": "todowrite", "parameters": {"type": "object", "properties": {"todos": {"type": "array"}}, "required": ["todos"]}}},
+			{"type": "function", "function": {"name": "webfetch", "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
+			{"type": "function", "function": {"name": "websearch", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}
 		]
 	}`
 	out := ConvertOpenAIRequestToOpencodeZen([]byte(input))
@@ -80,6 +80,30 @@ func TestMergeOpencodeZenToolsHardnessScenario(t *testing.T) {
 		if names[name] != 1 {
 			t.Errorf("canonical tool name %q must be present exactly once (got %d)", name, names[name])
 		}
+	}
+}
+
+// TestOpencodeZenNormalizeToolSchema verifies a colliding client tool whose
+// parameters lack the outer type gets type:"object" injected, so the gateway
+// schema check ("schema must be a JSON Schema of 'type: object'") passes.
+func TestOpencodeZenNormalizeToolSchema(t *testing.T) {
+	input := `{
+		"model": "deepseek-v4-flash-free",
+		"messages": [{"role": "user", "content": "q"}],
+		"tools": [
+			{"type": "function", "function": {"name": "read", "parameters": {"properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}}
+		]
+	}`
+	out := ConvertOpenAIRequestToOpencodeZen([]byte(input))
+	got := gjson.GetBytes(out, "tools.0.function.parameters.type").String()
+	if got != "object" {
+		t.Errorf("renamed tool parameters.type = %q, want object", got)
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.name").String(); got != "read_file" {
+		t.Errorf("renamed tool name = %q, want read_file", got)
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.properties.file_path").Exists(); !got {
+		t.Error("client file_path property must survive normalization")
 	}
 }
 

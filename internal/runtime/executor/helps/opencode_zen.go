@@ -554,6 +554,31 @@ func clientHasOwnTools(payload []byte) bool {
 	return hasOwn
 }
 
+// opencodeZenNormalizeToolSchema makes a renamed client tool's parameters a
+// valid JSON Schema object. The zen gateway validates tool schemas and
+// rejects a schema whose top-level type is missing ("schema must be a JSON
+// Schema of 'type: object', got 'type: null'"). Clients occasionally declare
+// parameters without the outer type (e.g. only properties/required), so
+// ensure parameters.type = "object" exists and parameters is an object.
+func opencodeZenNormalizeToolSchema(raw string) string {
+	params := gjson.Get(raw, "function.parameters")
+	if !params.Exists() || params.IsObject() && params.Get("type").String() == "" {
+		var err error
+		raw, err = sjson.Set(raw, "function.parameters.type", "object")
+		if err != nil {
+			return raw
+		}
+	}
+	if !params.Exists() {
+		var err error
+		raw, err = sjson.SetRaw(raw, "function.parameters", `{"type":"object"}`)
+		if err != nil {
+			return raw
+		}
+	}
+	return raw
+}
+
 // mergeOpencodeZenTools returns the client's own tools (deduplicated by
 // function name, listed first so the model prefers its environment's tools)
 // followed by the FULL canonical opencode tool set.
@@ -586,15 +611,17 @@ func mergeOpencodeZenTools(payload []byte) string {
 		}
 		seen[name] = struct{}{}
 		// Colliding tools get a meaningful model-facing alias; the schema stays
-		// the client's own (file_path etc).
+		// the client's own (file_path etc), normalized to a valid JSON Schema
+		// so the gateway schema check passes (it validates EVERY tool schema,
+		// renamed or not).
 		modelName := opencodeZenModelToolName(name)
 		if modelName != name {
 			if renamed, err := sjson.Set(tool.Raw, "function.name", modelName); err == nil {
-				clientTools = append(clientTools, renamed)
+				clientTools = append(clientTools, opencodeZenNormalizeToolSchema(renamed))
 				return true
 			}
 		}
-		clientTools = append(clientTools, tool.Raw)
+		clientTools = append(clientTools, opencodeZenNormalizeToolSchema(tool.Raw))
 		return true
 	})
 
