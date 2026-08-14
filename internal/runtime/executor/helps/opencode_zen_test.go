@@ -105,6 +105,52 @@ func TestConvertOpenAIRequestToOpencodeZen(t *testing.T) {
 	}
 }
 
+// TestConvertOpenAIRequestToOpencodeZenNormalizesDeveloperRole verifies the
+// opencode-go gateway fix: a client request carrying role "developer"
+// (OpenAI's Responses-dialect alias for system) must be normalized to
+// "system" in the rebuilt messages. The opencode-go chat-completions
+// endpoint rejects "developer" with 400 "unknown variant `developer`"
+// (observed 2026-08-15 on the Console Go upstream).
+func TestConvertOpenAIRequestToOpencodeZenNormalizesDeveloperRole(t *testing.T) {
+	input := `{
+		"model": "m",
+		"messages": [
+			{"role": "developer", "content": "client dev instruction"},
+			{"role": "user", "content": "hello"},
+			{"role": "assistant", "content": "hi"},
+			{"role": "user", "content": "world"}
+		],
+		"stream": true
+	}`
+	out := ConvertOpenAIRequestToOpencodeZen([]byte(input))
+	if !gjson.ValidBytes(out) {
+		t.Fatal("converted payload is not valid JSON")
+	}
+	messages := gjson.GetBytes(out, "messages").Array()
+	// canonical prompt + client developer (as system) + user + assistant + user
+	if len(messages) != 5 {
+		t.Fatalf("messages count = %d, want 5", len(messages))
+	}
+	if messages[0].Get("role").String() != "system" {
+		t.Fatalf("messages[0] role = %q, want system (canonical prompt)", messages[0].Get("role").String())
+	}
+	if messages[1].Get("role").String() != "system" {
+		t.Fatalf("client developer message must be normalized to system, got %q", messages[1].Get("role").String())
+	}
+	if messages[1].Get("content").String() != "client dev instruction" {
+		t.Fatalf("client developer content must be preserved, got %q", messages[1].Get("content").String())
+	}
+	// No "developer" role may survive anywhere in the rebuilt messages.
+	for i, m := range messages {
+		if m.Get("role").String() == "developer" {
+			t.Fatalf("messages[%d] still carries developer role: %s", i, m.Raw)
+		}
+	}
+	if messages[2].Get("role").String() != "user" || messages[3].Get("role").String() != "assistant" || messages[4].Get("role").String() != "user" {
+		t.Fatal("non-system messages were not preserved in order")
+	}
+}
+
 func TestConvertOpenAIRequestToOpencodeZenDeduplicatesCanonicalTools(t *testing.T) {
 	input := `{
 		"model": "m",

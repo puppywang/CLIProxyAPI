@@ -1,8 +1,8 @@
 package helps
 
 import (
-	_ "embed"
 	"bytes"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -201,12 +201,12 @@ const opencodeZenClientToolNote = "Note: you are running inside your own tool en
 // either duplicate the name upstream ("Tool names must be unique") or replace
 // the canonical definition (gateway 429 risk).
 var opencodeZenToolRename = map[string]string{
-	"read":      "read_file",      // MCP-style
-	"write":     "write_file",     // MCP-style
-	"task":      "delegate_task",  // opencode task spawns a sub-agent
-	"todowrite": "update_todos",   // semantic: update the task list
-	"webfetch":  "fetch_url",      // semantic: fetch a URL
-	"websearch": "web_search",     // Claude Code official name
+	"read":      "read_file",     // MCP-style
+	"write":     "write_file",    // MCP-style
+	"task":      "delegate_task", // opencode task spawns a sub-agent
+	"todowrite": "update_todos",  // semantic: update the task list
+	"webfetch":  "fetch_url",     // semantic: fetch a URL
+	"websearch": "web_search",    // Claude Code official name
 }
 
 // opencodeZenModelToolName returns the model-facing name for a client tool,
@@ -361,9 +361,21 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	rebuilt := "[" + sysRaw
 
 	// Client system messages come right after the canonical one, verbatim.
+	// "developer" is OpenAI's alias for system (same semantics, sent by
+	// clients that speak the newer Responses dialect); the opencode-go
+	// chat-completions gateway only accepts role system and rejects
+	// "developer" with 400 unknown variant, so normalize it to system here.
 	gjson.Parse(rawMessages).ForEach(func(_, value gjson.Result) bool {
-		if value.Get("role").String() == "system" {
+		switch value.Get("role").String() {
+		case "system":
 			rebuilt += "," + value.Raw
+		case "developer":
+			raw, err := sjson.SetRawBytes([]byte(value.Raw), "role", []byte(`"system"`))
+			if err != nil {
+				rebuilt += "," + value.Raw
+			} else {
+				rebuilt += "," + string(raw)
+			}
 		}
 		return true
 	})
@@ -382,7 +394,11 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	// names rewritten to the model-facing aliases (read -> read_file) so the
 	// history is consistent with the renamed tool definitions above.
 	gjson.Parse(opencodeZenRewriteRequestToolNames(rawMessages)).ForEach(func(_, value gjson.Result) bool {
-		if value.Get("role").String() == "system" {
+		switch value.Get("role").String() {
+		case "system", "developer":
+			// Already extracted into the leading system block; skip so a
+			// stray developer message is not passed through (opencode-go
+			// would reject it with 400 unknown variant).
 			return true
 		}
 		rebuilt += "," + opencodeZenEnsureReasoningContent(value)
