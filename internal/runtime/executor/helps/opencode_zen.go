@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
@@ -257,8 +258,10 @@ func opencodeZenRewriteRequestToolNames(rawMessages string) string {
 			var err error
 			raw, err = sjson.Set(raw, fmt.Sprintf("tool_calls.%d.function.name", i), modelName)
 			if err != nil {
+				log.Debugf("opencode zen: history rename %q -> %q failed: %v", name, modelName, err)
 				break
 			}
+			log.Debugf("opencode zen: history tool_calls[%d] renamed %q -> %q", i, name, modelName)
 		}
 		out = append(out, raw)
 	}
@@ -288,7 +291,12 @@ func RewriteOpencodeZenResponseToolNames(line []byte) []byte {
 		return line
 	}
 	for clientName, modelName := range opencodeZenToolRename {
-		out = bytes.ReplaceAll(out, []byte(`"name":"`+modelName+`"`), []byte(`"name":"`+clientName+`"`))
+		needle := []byte(`"name":"` + modelName + `"`)
+		replacement := []byte(`"name":"` + clientName + `"`)
+		if n := bytes.Count(out, needle); n > 0 {
+			log.Debugf("opencode zen: response rename %q -> %q (%d occurrences)", modelName, clientName, n)
+			out = bytes.ReplaceAll(out, needle, replacement)
+		}
 	}
 	return out
 }
@@ -579,6 +587,22 @@ func opencodeZenNormalizeToolSchema(raw string) string {
 	return raw
 }
 
+// opencodeZenParamKeys returns the comma-joined property names of a tool's
+// parameters schema (for debug logging only). Returns "" for no schema.
+func opencodeZenParamKeys(raw string) string {
+	props := gjson.Get(raw, "function.parameters.properties")
+	if !props.IsObject() {
+		return ""
+	}
+	keys := make([]string, 0, 8)
+	props.ForEach(func(k, _ gjson.Result) bool {
+		keys = append(keys, k.String())
+		return true
+	})
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
+}
+
 // mergeOpencodeZenTools returns the client's own tools (deduplicated by
 // function name, listed first so the model prefers its environment's tools)
 // followed by the FULL canonical opencode tool set.
@@ -616,10 +640,15 @@ func mergeOpencodeZenTools(payload []byte) string {
 		// renamed or not).
 		modelName := opencodeZenModelToolName(name)
 		if modelName != name {
-			if renamed, err := sjson.Set(tool.Raw, "function.name", modelName); err == nil {
-				clientTools = append(clientTools, opencodeZenNormalizeToolSchema(renamed))
+			renamed, err := sjson.Set(tool.Raw, "function.name", modelName)
+			if err == nil {
+				renamed = opencodeZenNormalizeToolSchema(renamed)
+				clientTools = append(clientTools, renamed)
+				log.Debugf("opencode zen: renamed client tool %q -> %q (schema kept client-defined, params keys: %s)",
+					name, modelName, opencodeZenParamKeys(renamed))
 				return true
 			}
+			log.Debugf("opencode zen: failed to rename client tool %q -> %q (sjson error: %v); keeping original", name, modelName, err)
 		}
 		clientTools = append(clientTools, opencodeZenNormalizeToolSchema(tool.Raw))
 		return true
