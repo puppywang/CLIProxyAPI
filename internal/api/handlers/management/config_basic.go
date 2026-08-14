@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -108,6 +109,68 @@ func WriteConfig(path string, data []byte) error {
 	return f.Close()
 }
 
+// topLevelYAMLKeys returns the set of top-level mapping keys in a YAML
+// document. Used by the full-file overwrite guard to detect config shapes
+// that are missing keys the live config depends on. Comments, ordering and
+// nested structure are irrelevant — only the root keys matter.
+func topLevelYAMLKeys(data []byte) (map[string]struct{}, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return nil, fmt.Errorf("invalid yaml document structure")
+	}
+	root := doc.Content[0]
+	if root == nil || root.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("expected root mapping node")
+	}
+	keys := make(map[string]struct{}, len(root.Content)/2)
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i] != nil && root.Content[i].Value != "" {
+			keys[root.Content[i].Value] = struct{}{}
+		}
+	}
+	return keys, nil
+}
+
+// rejectConfigKeyDrop refuses a full-file config overwrite whose submitted
+// document is missing top-level keys that exist in the config currently on
+// disk. No-op when the disk config is unreadable/absent (fresh install) or
+// the handler has no config path. The guard is advisory on parse errors of
+// the disk file (let the downstream validation surface real problems).
+func (h *Handler) rejectConfigKeyDrop(submitted []byte) error {
+	if h == nil || h.configFilePath == "" {
+		return nil
+	}
+	diskData, err := os.ReadFile(h.configFilePath)
+	if err != nil {
+		// Nothing to compare against — allow (fresh install / first write).
+		return nil
+	}
+	diskKeys, err := topLevelYAMLKeys(diskData)
+	if err != nil {
+		return nil
+	}
+	subKeys, err := topLevelYAMLKeys(submitted)
+	if err != nil {
+		return err
+	}
+	var missing []string
+	for key := range diskKeys {
+		if _, ok := subKeys[key]; !ok {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	return fmt.Errorf(
+		"submitted config is missing top-level key(s): %s — this endpoint replaces the file wholesale, so saving would silently drop live settings; fetch the current config (GET /v0/management/config.yaml), edit it in place and resubmit",
+		strings.Join(missing, ", "))
+}
+
 func (h *Handler) PutConfigYAML(c *gin.Context) {
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -117,6 +180,19 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 	var cfg config.Config
 	if err = yaml.Unmarshal(body, &cfg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": err.Error()})
+		return
+	}
+	// Full-file overwrite guard: a PUT replaces config.yaml wholesale (no
+	// merge), so a submitted document that silently drops top-level keys
+	// would wipe live settings. Observed 2026-08-13: a config overwrite
+	// removed auto-release-on-429, codex, payload, proxy-url and
+	// redis-usage-queue-retention-seconds, disabling the 429 failover for
+	// ~12h. The management YAML editor always submits the full current
+	// file (GET /config.yaml → edit → PUT), so this guard never blocks the
+	// normal flow — it only stops accidental rollbacks to a legacy/template
+	// shape that is missing keys the live config depends on.
+	if errGuard := h.rejectConfigKeyDrop(body); errGuard != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "missing_config_keys", "message": errGuard.Error()})
 		return
 	}
 	// Validate config using LoadConfigOptional with optional=false to enforce parsing
