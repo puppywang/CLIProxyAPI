@@ -2,6 +2,7 @@ package helps
 
 import (
 	_ "embed"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -180,10 +181,98 @@ func OpencodeZenEnsureReasoningContent(raw string) string {
 }
 
 // opencodeZenClientToolNote is appended as an extra system message when the
-// client request carries its own tool set (e.g. GitHub Copilot's workspace
-// tools). The canonical six tools must remain in the payload for the gateway
-// check, but the model must not call tools its environment cannot execute.
-const opencodeZenClientToolNote = "Note: your environment provides its own tool set; call only the tools that this environment exposes. Do not call read, task, todowrite, webfetch, websearch, or write unless they are listed among your environment's tools (they are placeholder definitions required by the gateway)."
+// client request carries its own tool set (e.g. DeepSeek Harness, GitHub
+// Copilot). The canonical six tools must remain in the payload for the gateway
+// check, but the model must not call tools its environment cannot execute —
+// and the opencode system prompt's tool policy does not apply either.
+const opencodeZenClientToolNote = "Note: you are running inside your own tool environment. The opencode system prompt above and its six tools (read, task, todowrite, webfetch, websearch, write) are placeholder definitions required by the API gateway — ignore their descriptions and usage policy, and DO NOT call them. Use ONLY the tools that your environment exposes; they are listed first and carry your environment's real parameter schemas."
+
+// opencodeZenToolRename maps client tool names that collide with the
+// canonical opencode six onto meaningful model-facing names. The client's own
+// schema (parameters/description) is preserved verbatim under the new name;
+// responses are renamed back before returning to the client. The names are
+// chosen to be self-describing and familiar to models (MCP/Claude-Code style)
+// so the agent prefers them over the canonical placeholders.
+var opencodeZenToolRename = map[string]string{
+	"read":  "read_file",
+	"write": "write_file",
+}
+
+// opencodeZenModelToolName returns the model-facing name for a client tool,
+// or the original name when no rename applies.
+func opencodeZenModelToolName(name string) string {
+	if mapped, ok := opencodeZenToolRename[name]; ok {
+		return mapped
+	}
+	return name
+}
+
+// opencodeZenClientToolName returns the client-facing name for a model tool,
+// or the original name when no rename applies (inverse of
+// opencodeZenModelToolName).
+func opencodeZenClientToolName(name string) string {
+	for clientName, modelName := range opencodeZenToolRename {
+		if modelName == name {
+			return clientName
+		}
+	}
+	return name
+}
+
+// opencodeZenRewriteRequestToolNames rewrites assistant tool_calls function
+// names in the message history from client names to model-facing names (e.g.
+// read -> read_file) so upstream history is consistent with the renamed tool
+// definitions injected by mergeOpencodeZenTools.
+func opencodeZenRewriteRequestToolNames(rawMessages string) string {
+	if !strings.Contains(rawMessages, "tool_calls") {
+		return rawMessages
+	}
+	parsed := gjson.Parse(rawMessages)
+	if !parsed.IsArray() {
+		return rawMessages
+	}
+	out := make([]string, 0, len(parsed.Array()))
+	for _, m := range parsed.Array() {
+		if m.Get("role").String() != "assistant" || len(m.Get("tool_calls").Array()) == 0 {
+			out = append(out, m.Raw)
+			continue
+		}
+		raw := m.Raw
+		for i, call := range m.Get("tool_calls").Array() {
+			name := call.Get("function.name").String()
+			modelName := opencodeZenModelToolName(name)
+			if modelName == name {
+				continue
+			}
+			var err error
+			raw, err = sjson.Set(raw, fmt.Sprintf("tool_calls.%d.function.name", i), modelName)
+			if err != nil {
+				break
+			}
+		}
+		out = append(out, raw)
+	}
+	return "[" + strings.Join(out, ",") + "]"
+}
+
+// RewriteOpencodeZenResponseToolNames rewrites tool_calls function names in an
+// upstream OpenAI-format response (streaming data line or non-streaming body)
+// from model-facing names back to client-facing names (e.g. read_file -> read)
+// so the client runtime recognizes the tools it declared.
+func RewriteOpencodeZenResponseToolNames(line []byte) []byte {
+	if !bytes.Contains(line, []byte("tool_calls")) && !bytes.Contains(line, []byte(`"name":"read_file"`)) && !bytes.Contains(line, []byte(`"name":"write_file"`)) {
+		return line
+	}
+	out := make([]byte, len(line))
+	copy(out, line)
+	for modelName, clientName := range map[string]string{
+		"read_file": "read",
+		"write_file": "write",
+	} {
+		out = bytes.ReplaceAll(out, []byte(`"name":"`+modelName+`"`), []byte(`"name":"`+clientName+`"`))
+	}
+	return out
+}
 
 // opencodeZenSystemPromptTrimmed returns the canonical opencode system prompt
 // trimmed at a verified-accepted boundary for clients that ship their own
@@ -262,8 +351,10 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	if note := opencodeZenRepeatNote(rawMessages); note != "" {
 		rebuilt += `,{"role":"system","content":` + opencodeZenJSONString(note) + `}`
 	}
-	// All other messages keep their original order.
-	gjson.Parse(rawMessages).ForEach(func(_, value gjson.Result) bool {
+	// All other messages keep their original order, with assistant tool_calls
+	// names rewritten to the model-facing aliases (read -> read_file) so the
+	// history is consistent with the renamed tool definitions above.
+	gjson.Parse(opencodeZenRewriteRequestToolNames(rawMessages)).ForEach(func(_, value gjson.Result) bool {
 		if value.Get("role").String() == "system" {
 			return true
 		}
@@ -448,17 +539,21 @@ func clientHasOwnTools(payload []byte) bool {
 // function name, listed first so the model prefers its environment's tools)
 // followed by the FULL canonical opencode tool set.
 //
-// The zen gateway requires the canonical six tools (read/task/todowrite/
-// webfetch/websearch/write) to be fully present in the payload — removing or
-// renaming any of them triggers 429. At the same time, a client-declared tool
-// keeps the client's OWN definition (schema/params) even when its name
-// collides with a canonical tool: replacing it with the canonical placeholder
-// (e.g. opencode's camelCase "filePath" read/write) breaks clients whose
-// runtime validates snake_case "file_path" (DeepSeek Harness, Claude
-// Code-style environments). Both can coexist; the client tool is listed first
-// so models prefer it, and the canonical copy satisfies the gateway check.
-// The injected client tool note already tells models the canonical tools are
-// placeholder definitions required by the gateway.
+// The zen gateway enforces TWO invariants that must both hold:
+//  1. The canonical six tool definitions must be FULLY present — removing or
+//     altering one triggers 429.
+//  2. Tool names must be UNIQUE — emitting the client's read/write AND the
+//     canonical read/write duplicates the name and the upstream rejects the
+//     payload with "Tool names must be unique".
+//
+// Therefore a client-declared tool that collides with a canonical name is
+// injected under a meaningful model-facing alias (read -> read_file,
+// write -> write_file) with the client's OWN schema (snake_case file_path),
+// while the canonical tool keeps its original name and definition. Upstream
+// sees unique names, the canonical six survive verbatim (invariant 1), and
+// the model sees a self-describing tool it can actually call. Responses and
+// request histories are renamed back (read_file -> read) so the client
+// runtime always sees the tools it declared.
 func mergeOpencodeZenTools(payload []byte) string {
 	var clientTools []string
 	seen := make(map[string]struct{}, 8)
@@ -471,6 +566,15 @@ func mergeOpencodeZenTools(payload []byte) string {
 			return true
 		}
 		seen[name] = struct{}{}
+		// Colliding tools get a meaningful model-facing alias; the schema stays
+		// the client's own (file_path etc).
+		modelName := opencodeZenModelToolName(name)
+		if modelName != name {
+			if renamed, err := sjson.Set(tool.Raw, "function.name", modelName); err == nil {
+				clientTools = append(clientTools, renamed)
+				return true
+			}
+		}
 		clientTools = append(clientTools, tool.Raw)
 		return true
 	})
@@ -485,8 +589,9 @@ func mergeOpencodeZenTools(payload []byte) string {
 		b.WriteString(raw)
 		first = false
 	}
-	// Canonical six are always appended in full (even if a client tool shares
-	// the name) — the gateway check requires them verbatim.
+	// Canonical six are always appended in full and verbatim (unique names:
+	// colliding client tools were renamed above) — the gateway check requires
+	// them byte-for-byte.
 	for _, tool := range gjson.Parse(opencodeZenTools).Array() {
 		if !first {
 			b.WriteByte(',')

@@ -117,39 +117,30 @@ func TestConvertOpenAIRequestToOpencodeZenDeduplicatesCanonicalTools(t *testing.
 	}`
 	out := ConvertOpenAIRequestToOpencodeZen([]byte(input))
 	tools := gjson.GetBytes(out, "tools").Array()
-	// client read + special_tool + canonical six (read duplicated for gateway)
+	// read_file (aliased client read) + special_tool + canonical six = 8
 	if len(tools) != 8 {
-		t.Fatalf("tools count = %d, want 8 (client read + special_tool + canonical 6)", len(tools))
+		t.Fatalf("tools count = %d, want 8 (read_file + special_tool + canonical 6)", len(tools))
 	}
-	// Client-declared tools are listed first and keep their own definition.
-	if tools[0].Get("function.name").String() != "read" {
-		t.Fatalf("tools[0] = %q, want client read first", tools[0].Get("function.name").String())
+	// Client-declared tools are listed first, colliding read under alias.
+	if tools[0].Get("function.name").String() != "read_file" {
+		t.Fatalf("tools[0] = %q, want client read aliased to read_file first", tools[0].Get("function.name").String())
 	}
 	if tools[1].Get("function.name").String() != "special_tool" {
 		t.Fatalf("tools[1] = %q, want special_tool", tools[1].Get("function.name").String())
 	}
-	// Canonical six must all be present (gateway 429 guard), read/write may
-	// appear twice (client + canonical).
-	for _, name := range []string{"task", "todowrite", "webfetch", "websearch"} {
-		count := 0
-		for _, tool := range tools {
-			if tool.Get("function.name").String() == name {
-				count++
-			}
-		}
-		if count != 1 {
-			t.Fatalf("tool %q must appear exactly once, got %d", name, count)
+	// Canonical six must all be present exactly once (unique names).
+	names := make(map[string]int)
+	for _, tool := range tools {
+		names[tool.Get("function.name").String()]++
+	}
+	for name, count := range names {
+		if count > 1 {
+			t.Fatalf("tool %q appears %d times; names must be unique", name, count)
 		}
 	}
-	for _, name := range []string{"read", "write"} {
-		count := 0
-		for _, tool := range tools {
-			if tool.Get("function.name").String() == name {
-				count++
-			}
-		}
-		if count < 1 {
-			t.Fatalf("canonical tool %q must be present, got %d", name, count)
+	for _, name := range []string{"read", "task", "todowrite", "webfetch", "websearch", "write"} {
+		if names[name] != 1 {
+			t.Fatalf("canonical tool %q must be present exactly once, got %d", name, names[name])
 		}
 	}
 }

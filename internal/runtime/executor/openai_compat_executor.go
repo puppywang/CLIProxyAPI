@@ -207,6 +207,11 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	// Ensure we at least record the request even if upstream doesn't return usage
 	reporter.EnsurePublished(ctx)
 	// Translate response back to source format when needed
+	if e.zenEnabled(auth) {
+		// Restore client-facing tool names (read_file -> read) so the client
+		// runtime recognizes the tools it declared.
+		body = helps.RewriteOpencodeZenResponseToolNames(body)
+	}
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, body, &param)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
@@ -467,7 +472,15 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 
 			// OpenAI-compatible streams must use SSE data lines.
-			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmedLine), &param)
+			var zenLine []byte
+			if e.zenEnabled(auth) {
+				// Restore client-facing tool names (read_file -> read) before
+				// translating so the client sees its own tool names.
+				zenLine = helps.RewriteOpencodeZenResponseToolNames(bytes.Clone(trimmedLine))
+			} else {
+				zenLine = bytes.Clone(trimmedLine)
+			}
+			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, zenLine, &param)
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
