@@ -130,6 +130,13 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", translated)
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
+	// Same developer->system normalization as the streaming path: opencode-go
+	// (and other OpenAI-compatible gateways) reject role "developer" with 400
+	// unknown variant. Skipped for the responses/compact endpoint, where the
+	// body speaks the responses dialect and "developer" is a legal role.
+	if opts.Alt != "responses/compact" {
+		translated = helps.NormalizeOpenAIChatRoles(translated)
+	}
 	if e.zenEnabled(auth) && opts.Alt != "responses/compact" {
 		before := len(translated)
 		translated = helps.ConvertOpenAIRequestToOpencodeZen(translated)
@@ -347,6 +354,14 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
+	// Some OpenAI-compatible upstreams reject the "developer" role that
+	// newer OpenAI SDKs emit for system prompts (opencode-go / Console Go
+	// returns 400 "unknown variant `developer`"). Normalize it to "system"
+	// for every openai-compat channel — the zen converter below rebuilds
+	// messages anyway, so this mainly covers the default passthrough path
+	// (e.g. the opengo channel) where developer would otherwise reach the
+	// upstream verbatim.
+	translated = helps.NormalizeOpenAIChatRoles(translated)
 	if e.zenEnabled(auth) {
 		// Before conversion, snapshot the client-side reasoning shape so we
 		// can attribute "reasoning_content must be passed back" rejections to
