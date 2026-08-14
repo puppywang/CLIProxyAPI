@@ -258,7 +258,7 @@ func opencodeZenRewriteRequestToolNames(rawMessages string) string {
 			var err error
 			raw, err = sjson.Set(raw, fmt.Sprintf("tool_calls.%d.function.name", i), modelName)
 			if err != nil {
-				log.Debugf("opencode zen: history rename %q -> %q failed: %v", name, modelName, err)
+				log.Errorf("opencode zen: history rename %q -> %q failed: %v", name, modelName, err)
 				break
 			}
 			log.Debugf("opencode zen: history tool_calls[%d] renamed %q -> %q", i, name, modelName)
@@ -644,11 +644,11 @@ func mergeOpencodeZenTools(payload []byte) string {
 			if err == nil {
 				renamed = opencodeZenNormalizeToolSchema(renamed)
 				clientTools = append(clientTools, renamed)
-				log.Debugf("opencode zen: renamed client tool %q -> %q (schema kept client-defined, params keys: %s)",
+				log.Infof("opencode zen: renamed client tool %q -> %q (schema kept client-defined, params keys: %s)",
 					name, modelName, opencodeZenParamKeys(renamed))
 				return true
 			}
-			log.Debugf("opencode zen: failed to rename client tool %q -> %q (sjson error: %v); keeping original", name, modelName, err)
+			log.Errorf("opencode zen: failed to rename client tool %q -> %q (sjson error: %v); keeping original — upstream may reject duplicate tool names", name, modelName, err)
 		}
 		clientTools = append(clientTools, opencodeZenNormalizeToolSchema(tool.Raw))
 		return true
