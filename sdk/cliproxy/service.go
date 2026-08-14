@@ -1289,6 +1289,12 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 	if a.Disabled {
 		return
 	}
+	// Direct Cursor AgentService executor for the dedicated "cursor" provider.
+	if strings.EqualFold(strings.TrimSpace(a.Provider), "cursor") ||
+		strings.EqualFold(strings.TrimSpace(a.Attributes["compat_name"]), "cursor") {
+		s.coreManager.RegisterExecutor(executor.NewCursorExecutor(s.cfg))
+		return
+	}
 	if compatProviderKey, _, isCompat := openAICompatInfoFromAuth(a); isCompat {
 		if compatProviderKey == "" {
 			compatProviderKey = strings.ToLower(strings.TrimSpace(a.Provider))

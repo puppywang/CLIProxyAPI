@@ -446,22 +446,25 @@ func clientHasOwnTools(payload []byte) bool {
 
 // mergeOpencodeZenTools returns the client's own tools (deduplicated by
 // function name, listed first so the model prefers its environment's tools)
-// followed by the canonical opencode tool set. A tool whose name collides with
-// one of the canonical six is always emitted in its canonical form so the
-// gateway validation still passes.
+// followed by the FULL canonical opencode tool set.
+//
+// The zen gateway requires the canonical six tools (read/task/todowrite/
+// webfetch/websearch/write) to be fully present in the payload — removing or
+// renaming any of them triggers 429. At the same time, a client-declared tool
+// keeps the client's OWN definition (schema/params) even when its name
+// collides with a canonical tool: replacing it with the canonical placeholder
+// (e.g. opencode's camelCase "filePath" read/write) breaks clients whose
+// runtime validates snake_case "file_path" (DeepSeek Harness, Claude
+// Code-style environments). Both can coexist; the client tool is listed first
+// so models prefer it, and the canonical copy satisfies the gateway check.
+// The injected client tool note already tells models the canonical tools are
+// placeholder definitions required by the gateway.
 func mergeOpencodeZenTools(payload []byte) string {
-	canonicalNames := map[string]struct{}{
-		"read": {}, "task": {}, "todowrite": {},
-		"webfetch": {}, "websearch": {}, "write": {},
-	}
 	var clientTools []string
 	seen := make(map[string]struct{}, 8)
 	gjson.GetBytes(payload, "tools").ForEach(func(_, tool gjson.Result) bool {
 		name := tool.Get("function.name").String()
 		if name == "" {
-			return true
-		}
-		if _, isCanonical := canonicalNames[name]; isCanonical {
 			return true
 		}
 		if _, dup := seen[name]; dup {
@@ -482,6 +485,8 @@ func mergeOpencodeZenTools(payload []byte) string {
 		b.WriteString(raw)
 		first = false
 	}
+	// Canonical six are always appended in full (even if a client tool shares
+	// the name) — the gateway check requires them verbatim.
 	for _, tool := range gjson.Parse(opencodeZenTools).Array() {
 		if !first {
 			b.WriteByte(',')
