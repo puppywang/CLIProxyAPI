@@ -405,6 +405,38 @@ func cursorEncodeLocalExecResult(ctx context.Context, root string, exec cursorLo
 	return cursorExecClientMessage(exec, resultField, result, time.Since(started))
 }
 
+// cursorCommandOutputLimit caps how much stdout/stderr a shell command may
+// write. Without a cap a runaway command could buffer unbounded output in
+// memory and exhaust the process.
+const cursorCommandOutputLimit = 4 * 1024 * 1024 // 4 MiB per stream
+
+// cappedBuffer is a bytes.Buffer with a hard write ceiling. Writes beyond the
+// ceiling are dropped (the count is still reported so exec does not see an
+// error) and truncated is set so the caller can append a marker.
+type cappedBuffer struct {
+	buf       bytes.Buffer
+	max       int
+	truncated bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if c.max <= 0 {
+		c.max = cursorCommandOutputLimit
+	}
+	remaining := c.max - c.buf.Len()
+	if remaining <= 0 {
+		c.truncated = true
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		c.buf.Write(p[:remaining])
+		c.truncated = true
+	} else {
+		c.buf.Write(p)
+	}
+	return len(p), nil
+}
+
 func cursorExecuteShell(ctx context.Context, root string, execRequest cursorLocalExecRequest) []byte {
 	if execRequest.IsBackground {
 		return pbFieldLD(4, cursorShellRejected(execRequest.Command, execRequest.WorkingDir, "background shell execution is not supported"))
@@ -438,14 +470,20 @@ func cursorExecuteShell(ctx context.Context, root string, execRequest cursorLoca
 		command = exec.CommandContext(commandCtx, "/bin/sh", "-lc", execRequest.Command)
 	}
 	command.Dir = workingDir
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr cappedBuffer
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	started := time.Now()
 	err = command.Run()
 	elapsedMS := int(time.Since(started) / time.Millisecond)
-	out := cursorTrimCommandOutput(stdout.String())
-	errOut := cursorTrimCommandOutput(stderr.String())
+	out := cursorTrimCommandOutput(stdout.buf.String())
+	errOut := cursorTrimCommandOutput(stderr.buf.String())
+	if stdout.truncated && !strings.Contains(out, "[output truncated]") {
+		out += "\n[stdout truncated]\n"
+	}
+	if stderr.truncated && !strings.Contains(errOut, "[output truncated]") {
+		errOut += "\n[stderr truncated]\n"
+	}
 
 	if errors.Is(commandCtx.Err(), context.DeadlineExceeded) {
 		timeout := pbFieldStr(1, execRequest.Command)
@@ -520,7 +558,7 @@ func cursorExecuteRead(root string, execRequest cursorLocalExecRequest) []byte {
 	if err != nil {
 		return pbFieldLD(3, cursorPathReason(execRequest.Path, err.Error()))
 	}
-	data, err := os.ReadFile(path)
+	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return pbFieldLD(4, pbFieldStr(1, path))
@@ -530,12 +568,22 @@ func cursorExecuteRead(root string, execRequest cursorLocalExecRequest) []byte {
 		}
 		return pbFieldLD(2, cursorPathError(path, err.Error()))
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return pbFieldLD(2, cursorPathError(path, err.Error()))
-	}
 	if !info.Mode().IsRegular() {
 		return pbFieldLD(6, cursorPathReason(path, "not a regular file"))
+	}
+	// Guard against reading arbitrarily large files fully into memory.
+	if info.Size() > cursorGrepMaxFileBytes {
+		return pbFieldLD(6, cursorPathReason(path, fmt.Sprintf("file too large to read (%d bytes)", info.Size())))
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return pbFieldLD(4, pbFieldStr(1, path))
+		}
+		if os.IsPermission(err) {
+			return pbFieldLD(5, pbFieldStr(1, path))
+		}
+		return pbFieldLD(2, cursorPathError(path, err.Error()))
 	}
 
 	// ReadArgs offset/limit are line-oriented in the Cursor agent tool. Keep
@@ -705,6 +753,18 @@ type cursorGrepMatch struct {
 	contentTruncated bool
 }
 
+// grep scan limits: without caps a recursive grep over a huge tree could read
+// unbounded data into memory or take minutes. When a limit is hit the scan
+// stops early and the result carries the truncated flag so the model knows
+// the listing is partial.
+const (
+	cursorGrepMaxFiles      = 2000
+	cursorGrepMaxFileBytes  = 64 * 1024 * 1024
+	cursorGrepMaxTotalBytes = 512 * 1024 * 1024
+)
+
+var errCursorGrepLimit = errors.New("cursor grep: scan limit reached")
+
 func cursorExecuteGrep(root string, execRequest cursorLocalExecRequest) []byte {
 	searchPath, err := cursorResolveWorkspacePath(root, execRequest.Path)
 	if err != nil {
@@ -722,6 +782,8 @@ func cursorExecuteGrep(root string, execRequest cursorLocalExecRequest) []byte {
 		return pbFieldLD(2, pbFieldStr(1, err.Error()))
 	}
 	var files []cursorGrepFile
+	var scannedBytes int64
+	scanLimitHit := false
 	visit := func(path string, data []byte) {
 		if bytes.IndexByte(data, 0) >= 0 {
 			return
@@ -789,6 +851,9 @@ func cursorExecuteGrep(root string, execRequest cursorLocalExecRequest) []byte {
 		return pbFieldLD(2, pbFieldStr(1, err.Error()))
 	}
 	if !info.IsDir() {
+		if info.Size() > cursorGrepMaxFileBytes {
+			return pbFieldLD(2, pbFieldStr(1, fmt.Sprintf("file too large to scan (%d bytes)", info.Size())))
+		}
 		if data, readErr := os.ReadFile(searchPath); readErr == nil {
 			visit(searchPath, data)
 		}
@@ -803,17 +868,30 @@ func cursorExecuteGrep(root string, execRequest cursorLocalExecRequest) []byte {
 			if execRequest.Glob != "" && !cursorGlobMatches(root, path, execRequest.Glob) {
 				return nil
 			}
+			if len(files) >= cursorGrepMaxFiles {
+				scanLimitHit = true
+				return filepath.SkipAll
+			}
+			if scannedBytes >= cursorGrepMaxTotalBytes {
+				scanLimitHit = true
+				return filepath.SkipAll
+			}
 			resolvedPath, resolveErr := cursorResolveWorkspacePath(root, path)
 			if resolveErr != nil {
 				return nil
 			}
+			fileInfo, statErr := os.Stat(resolvedPath)
+			if statErr != nil || fileInfo.Size() > cursorGrepMaxFileBytes {
+				return nil
+			}
 			data, readErr := os.ReadFile(resolvedPath)
 			if readErr == nil {
+				scannedBytes += int64(len(data))
 				visit(resolvedPath, data)
 			}
 			return nil
 		})
-		if walkErr != nil {
+		if walkErr != nil && walkErr != filepath.SkipAll {
 			return pbFieldLD(2, pbFieldStr(1, walkErr.Error()))
 		}
 	}
@@ -854,7 +932,7 @@ func cursorExecuteGrep(root string, execRequest cursorLocalExecRequest) []byte {
 			files = files[execRequest.GrepOffset:]
 		}
 	}
-	clientTruncated := false
+	clientTruncated := scanLimitHit
 	if execRequest.HeadLimit > 0 && len(files) > execRequest.HeadLimit {
 		files = files[:execRequest.HeadLimit]
 		clientTruncated = true
@@ -895,7 +973,7 @@ func cursorGlobMatches(root, candidate, glob string) bool {
 
 func cursorEncodeGrepUnion(files []cursorGrepFile, mode string, totalFiles, totalMatches int, clientTruncated, offsetApplied, headLimitApplied bool) []byte {
 	switch mode {
-	case "files", "file":
+	case "files", "file", "files_with_matches":
 		result := make([]byte, 0)
 		for _, file := range files {
 			result = append(result, pbFieldStr(1, file.path)...)

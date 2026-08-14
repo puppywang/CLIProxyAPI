@@ -462,6 +462,10 @@ func cursorBaseModel(model string) string {
 		"-thinking-high-fast", "-thinking-high", "-thinking-max-fast", "-thinking-max",
 		"-thinking-xhigh-fast", "-thinking-xhigh", "-thinking-low-fast", "-thinking-low",
 		"-thinking-medium-fast", "-thinking-medium",
+		// "-extra-high-fast"/"-extra-high" MUST precede "-high-fast"/"-high":
+		// gpt-5.5/gpt-5.4 use extra-high, and suffix matching would otherwise
+		// truncate "-extra-high" at "-high" leaving a corrupted base model.
+		"-extra-high-fast", "-extra-high",
 		"-xhigh-fast", "-xhigh", "-high-fast", "-high", "-medium-fast", "-medium",
 		"-low-fast", "-low", "-max-fast", "-max", "-none", "-fast", "-minimal",
 	} {

@@ -19,6 +19,10 @@ type cursorAgentSession struct {
 	Pending    []cursorPendingCall
 	LastUsed   time.Time
 	Generation int
+
+	// mu serializes access to mutable fields (Pending) so concurrent
+	// follow-up requests on the same session cannot race.
+	mu sync.Mutex
 }
 
 type cursorAgentSessionStore struct {

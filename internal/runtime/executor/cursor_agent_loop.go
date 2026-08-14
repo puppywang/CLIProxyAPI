@@ -112,11 +112,11 @@ func (e *CursorExecutor) consumeAgentStream(ctx context.Context, req cliproxyexe
 	chunks := make(chan cliproxyexecutor.StreamChunk, 64)
 	go func() {
 		defer close(chunks)
-		defer func() {
-			if ctx.Err() != nil {
-				cursorAgentSessions.drop(sess.Key)
-			}
-		}()
+		// NOTE: do NOT drop the session when the request context is cancelled.
+		// The transport has its own lifecycle (see dialBidiCursorAgent) so a
+		// tool-calling turn survives the first HTTP request ending; the client
+		// submits tool results in a follow-up request. Sessions are reclaimed
+		// by TTL cleanup or explicit Close.
 		var param any
 		sendJSON := func(raw []byte) bool {
 			return cursorSendTranslatedChunk(ctx, req, opts, originalPayload, translatedPayload, raw, &param, chunks)
@@ -199,7 +199,9 @@ func (e *CursorExecutor) consumeAgentStream(ctx context.Context, req cliproxyexe
 		finish := "stop"
 		if len(pending) > 0 {
 			finish = "tool_calls"
+			sess.mu.Lock()
 			sess.Pending = pending
+			sess.mu.Unlock()
 			cursorAgentSessions.put(sess)
 		} else {
 			cursorAgentSessions.drop(sess.Key)

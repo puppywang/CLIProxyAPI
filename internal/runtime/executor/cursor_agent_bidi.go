@@ -48,6 +48,7 @@ type bidiCursorAgent struct {
 	events    chan cursorAgentEvent
 	pw        *io.PipeWriter
 	writeMu   sync.Mutex
+	submitMu  sync.Mutex
 	pending   []cursorBidiExec
 	cancel    context.CancelFunc
 	ctx       context.Context
@@ -74,6 +75,12 @@ func (t *bidiCursorAgent) writePayload(payload []byte) error {
 }
 
 func (t *bidiCursorAgent) SubmitToolResults(_ context.Context, results []cursorToolResult) error {
+	// Serialize concurrent tool-result submissions on the same transport:
+	// without this, two racing requests could both read the same pending exec
+	// list, write duplicate results and clear each other's pending state.
+	t.submitMu.Lock()
+	defer t.submitMu.Unlock()
+
 	t.closeMu.Lock()
 	pending := append([]cursorBidiExec(nil), t.pending...)
 	t.closeMu.Unlock()
@@ -170,10 +177,18 @@ func dialBidiCursorAgent(ctx context.Context, exec *CursorExecutor, auth *clipro
 		return nil, err
 	}
 
+	// The bidi transport outlives the HTTP request that created it: after a
+	// tool-calling turn the client submits tool results in a follow-up
+	// request, and the underlying Cursor run must stay alive across those
+	// requests. Deriving the transport context from the request context would
+	// cancel the stream the moment the first request finishes (handler-level
+	// cliCancel), breaking continuation. The transport therefore gets its own
+	// lifecycle: it lives until the session TTL cleanup, an explicit Close
+	// (session replacement/eviction), or the server closing the stream.
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	runCtx, cancel := context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancel(context.Background())
 	pr, pw := io.Pipe()
 	t := &bidiCursorAgent{
 		events: make(chan cursorAgentEvent, 32),

@@ -307,6 +307,59 @@ func TestCursorLocalExecGrepUsesOfficialNestedResults(t *testing.T) {
 	}
 }
 
+func TestCursorLocalExecGrepFilesWithMatchesMode(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("needle here\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.txt"), []byte("nothing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// files_with_matches (official Cursor mode) must produce the files listing,
+	// not fall through to the default content mode.
+	request := cursorLocalExecRequest{
+		Kind:       cursorLocalExecGrep,
+		Pattern:    "needle",
+		Path:       ".",
+		OutputMode: "files_with_matches",
+	}
+	result := cursorEncodeLocalExecResult(context.Background(), root, request)
+	client := pbFirstLD(pbIter(result), 2)
+	grepResult := pbFirstLD(pbIter(client), 5)
+	success := pbFirstLD(pbIter(grepResult), 1)
+	entry := pbFirstLD(pbIter(success), 4)
+	union := pbFirstLD(pbIter(entry), 2)
+	filesField, ok := pbFirst(pbIter(union), 2)
+	if !ok {
+		t.Fatalf("files listing missing in files_with_matches mode: %x", union)
+	}
+	var names []string
+	for _, f := range pbIter(filesField.Data) {
+		if f.Num == 1 && f.Wire == 2 {
+			names = append(names, string(f.Data))
+		}
+	}
+	if len(names) != 1 || names[0] != "a.txt" {
+		t.Fatalf("files_with_matches names = %v, want [a.txt]", names)
+	}
+}
+
+func TestCursorBaseModelExtraHigh(t *testing.T) {
+	cases := map[string]string{
+		"cursor-gpt-5.5":                 "gpt-5.5",
+		"cursor-gpt-5.5-fast":            "gpt-5.5",
+		"cursor-gpt-5.5-extra-high":      "gpt-5.5",
+		"cursor-gpt-5.5-extra-high-fast": "gpt-5.5",
+		"cursor-gpt-5.4-extra-high":      "gpt-5.4",
+		"cursor-gpt-5.6-sol-xhigh-fast":  "gpt-5.6-sol",
+	}
+	for in, want := range cases {
+		if got := cursorBaseModel(in); got != want {
+			t.Errorf("cursorBaseModel(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestCursorBidiFallbackOnAuthFailure(t *testing.T) {
 	authSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nope", http.StatusUnauthorized)
