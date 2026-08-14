@@ -15,9 +15,10 @@ import (
 //     triggers 429.
 //  2. Tool names MUST be unique — the upstream rejects duplicate tool names
 //     with "Tool names must be unique".
-//  3. Colliding client tools (read/write) are injected under meaningful
-//     model-facing aliases (read_file/write_file) with the client's own
-//     snake_case schema, so the model can actually call them.
+//  3. ALL colliding client tools are injected under meaningful model-facing
+//     aliases (read_file/write_file/delegate_task/update_todos/fetch_url/
+//     web_search) with the client's own schema, so the model can actually
+//     call them.
 func TestMergeOpencodeZenToolsHardnessScenario(t *testing.T) {
 	input := `{
 		"model": "deepseek-v4-flash-free",
@@ -26,14 +27,18 @@ func TestMergeOpencodeZenToolsHardnessScenario(t *testing.T) {
 			{"type": "function", "function": {"name": "read", "parameters": {"properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}},
 			{"type": "function", "function": {"name": "write", "parameters": {"properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}},
 			{"type": "function", "function": {"name": "edit", "parameters": {"properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}},
-			{"type": "function", "function": {"name": "pwsh", "parameters": {"properties": {"command": {"type": "string"}}}}}
+			{"type": "function", "function": {"name": "pwsh", "parameters": {"properties": {"command": {"type": "string"}}}}},
+			{"type": "function", "function": {"name": "task", "parameters": {"properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}}},
+			{"type": "function", "function": {"name": "todowrite", "parameters": {"properties": {"todos": {"type": "array"}}, "required": ["todos"]}}},
+			{"type": "function", "function": {"name": "webfetch", "parameters": {"properties": {"url": {"type": "string"}}, "required": ["url"]}}},
+			{"type": "function", "function": {"name": "websearch", "parameters": {"properties": {"query": {"type": "string"}}, "required": ["query"]}}}
 		]
 	}`
 	out := ConvertOpenAIRequestToOpencodeZen([]byte(input))
 	tools := gjson.GetBytes(out, "tools").Array()
 
 	// 3) Client tools first, colliding ones under model-facing aliases with
-	//    the client's own schema.
+	//    the client's own schema. Non-colliding (edit/pwsh) keep their names.
 	expect := []struct {
 		name  string
 		hasFp bool // expects file_path param
@@ -42,6 +47,10 @@ func TestMergeOpencodeZenToolsHardnessScenario(t *testing.T) {
 		{"write_file", true},
 		{"edit", true},
 		{"pwsh", false},
+		{"delegate_task", false},
+		{"update_todos", false},
+		{"fetch_url", false},
+		{"web_search", false},
 	}
 	for i, e := range expect {
 		got := tools[i].Get("function.name").String()
@@ -102,6 +111,30 @@ func TestRewriteOpencodeZenResponseToolNames(t *testing.T) {
 	plain := []byte(`data: {"choices":[{"delta":{"content":"hi"}}]}`)
 	if got := string(RewriteOpencodeZenResponseToolNames(plain)); got != string(plain) {
 		t.Errorf("unrelated line must pass through, got %q", got)
+	}
+}
+
+// TestRewriteOpencodeZenResponseAllAliases verifies every canonical-collision
+// alias is rewritten back to its client name in one pass.
+func TestRewriteOpencodeZenResponseAllAliases(t *testing.T) {
+	body := []byte(`{"choices":[{"message":{"tool_calls":[
+		{"function":{"name":"read_file"}},
+		{"function":{"name":"write_file"}},
+		{"function":{"name":"delegate_task"}},
+		{"function":{"name":"update_todos"}},
+		{"function":{"name":"fetch_url"}},
+		{"function":{"name":"web_search"}}
+	]}}]}`)
+	out := RewriteOpencodeZenResponseToolNames(body)
+	want := []string{"read", "write", "task", "todowrite", "webfetch", "websearch"}
+	calls := gjson.GetBytes(out, "choices.0.message.tool_calls").Array()
+	if len(calls) != len(want) {
+		t.Fatalf("tool_calls = %d, want %d", len(calls), len(want))
+	}
+	for i, w := range want {
+		if got := calls[i].Get("function.name").String(); got != w {
+			t.Errorf("tool_calls[%d] = %q, want %q", i, got, w)
+		}
 	}
 }
 

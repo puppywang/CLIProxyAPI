@@ -193,9 +193,19 @@ const opencodeZenClientToolNote = "Note: you are running inside your own tool en
 // responses are renamed back before returning to the client. The names are
 // chosen to be self-describing and familiar to models (MCP/Claude-Code style)
 // so the agent prefers them over the canonical placeholders.
+//
+// All six canonical names are covered, because any of them can collide with a
+// client-declared tool (Copilot ships task; harness-style runtimes often
+// declare their own todo/web tools). A collision that is NOT aliased would
+// either duplicate the name upstream ("Tool names must be unique") or replace
+// the canonical definition (gateway 429 risk).
 var opencodeZenToolRename = map[string]string{
-	"read":  "read_file",
-	"write": "write_file",
+	"read":      "read_file",      // MCP-style
+	"write":     "write_file",     // MCP-style
+	"task":      "delegate_task",  // opencode task spawns a sub-agent
+	"todowrite": "update_todos",   // semantic: update the task list
+	"webfetch":  "fetch_url",      // semantic: fetch a URL
+	"websearch": "web_search",     // Claude Code official name
 }
 
 // opencodeZenModelToolName returns the model-facing name for a client tool,
@@ -258,17 +268,26 @@ func opencodeZenRewriteRequestToolNames(rawMessages string) string {
 // RewriteOpencodeZenResponseToolNames rewrites tool_calls function names in an
 // upstream OpenAI-format response (streaming data line or non-streaming body)
 // from model-facing names back to client-facing names (e.g. read_file -> read)
-// so the client runtime recognizes the tools it declared.
+// so the client runtime recognizes the tools it declared. Uses the full
+// opencodeZenToolRename map so every aliased tool is covered.
 func RewriteOpencodeZenResponseToolNames(line []byte) []byte {
-	if !bytes.Contains(line, []byte("tool_calls")) && !bytes.Contains(line, []byte(`"name":"read_file"`)) && !bytes.Contains(line, []byte(`"name":"write_file"`)) {
+	if len(opencodeZenToolRename) == 0 {
 		return line
 	}
 	out := make([]byte, len(line))
 	copy(out, line)
-	for modelName, clientName := range map[string]string{
-		"read_file": "read",
-		"write_file": "write",
-	} {
+	// Fast path: nothing to do unless a known alias appears.
+	changed := false
+	for _, modelName := range opencodeZenToolRename {
+		if bytes.Contains(out, []byte(`"name":"`+modelName+`"`)) {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return line
+	}
+	for clientName, modelName := range opencodeZenToolRename {
 		out = bytes.ReplaceAll(out, []byte(`"name":"`+modelName+`"`), []byte(`"name":"`+clientName+`"`))
 	}
 	return out
