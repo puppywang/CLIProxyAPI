@@ -944,6 +944,18 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		bound := findCacheHitAuthForStrictBypass(auths, cachedAuthID, model)
 		if bound == nil {
 			entry.Warnf("session-affinity: bound auth missing or disabled, refusing fallback (strict) | session=%s bound_auth=%s provider=%s model=%s", truncateSessionID(primaryID), cachedAuthID, provider, model)
+			// Auto-release linkage: when auto-release-on-429 is enabled,
+			// drop this auth's session bindings so the stranded conversation
+			// re-picks a fresh credential on its next turn instead of being
+			// permanently stuck on the missing/disabled bound auth. Without
+			// this, a strict-refuse 429 never reaches the conductor's
+			// MarkResult path (no upstream request happens), so the binding
+			// would never be released and every turn would hard-429.
+			if autoReleaseOn429.Load() {
+				if released := s.InvalidateAuthBindings(cachedAuthID); released > 0 {
+					entry.Infof("session-affinity: auto-release dropped %d binding(s) for missing/disabled bound auth | session=%s bound_auth=%s provider=%s model=%s", released, truncateSessionID(primaryID), cachedAuthID, provider, model)
+				}
+			}
 			// Return the upstream-shape 429 so Codex CLI recognises the
 			// outcome as a quota event and renders the right message to
 			// the user. Earlier we shipped an internal

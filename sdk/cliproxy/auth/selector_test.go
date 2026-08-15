@@ -703,11 +703,102 @@ func TestSessionAffinitySelector_StrictRefusesFailover(t *testing.T) {
 	}
 }
 
+// Strict-refuse 429 must ALSO release the dead auth's bindings when
+// auto-release-on-429 is enabled, so the stranded conversation re-picks a
+// fresh credential on its next turn instead of being permanently stuck.
+// NOTE: not parallel — autoReleaseOn429 is a global toggle.
+func TestSessionAffinitySelector_StrictRefuseAutoReleasesBindings(t *testing.T) {
+	SetAutoReleaseOn429(true)
+	t.Cleanup(func() { SetAutoReleaseOn429(false) })
+
+	fallback := &RoundRobinSelector{}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: fallback,
+		TTL:      time.Minute,
+		Strict:   true,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	payload := []byte(`{"metadata":{"user_id":"user_xxx_account__session_strict-release-uuid"}}`)
+	opts := cliproxyexecutor.Options{OriginalRequest: payload}
+
+	first, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+
+	// Bound auth removed from the pool → strict-refuse should drop the binding.
+	availableWithoutFirst := make([]*Auth, 0, len(auths)-1)
+	for _, a := range auths {
+		if a.ID != first.ID {
+			availableWithoutFirst = append(availableWithoutFirst, a)
+		}
+	}
+	if _, err := selector.Pick(context.Background(), "claude", "claude-3", opts, availableWithoutFirst); err == nil {
+		t.Fatal("strict Pick() with bound auth removed: expected error, got nil")
+	}
+
+	// After the auto-release, the SAME session must be able to re-pick a
+	// fresh credential instead of strict-refusing again.
+	re, err := selector.Pick(context.Background(), "claude", "claude-3", opts, availableWithoutFirst)
+	if err != nil {
+		t.Fatalf("Pick() after auto-release = %v, want successful re-pick onto a fresh auth", err)
+	}
+	if re == nil || re.ID == first.ID {
+		t.Fatalf("re-pick auth = %v, want a fresh credential different from %q", re, first.ID)
+	}
+}
+
+// With auto-release DISABLED, strict-refuse must keep the binding intact
+// (the 429 surfaces and the session stays bound).
+// NOTE: not parallel — autoReleaseOn429 is a global toggle.
+func TestSessionAffinitySelector_StrictRefuseKeepsBindingWhenAutoReleaseOff(t *testing.T) {
+	SetAutoReleaseOn429(false)
+	t.Cleanup(func() { SetAutoReleaseOn429(false) })
+
+	fallback := &RoundRobinSelector{}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: fallback,
+		TTL:      time.Minute,
+		Strict:   true,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	payload := []byte(`{"metadata":{"user_id":"user_xxx_account__session_strict-keep-uuid"}}`)
+	opts := cliproxyexecutor.Options{OriginalRequest: payload}
+
+	first, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+
+	availableWithoutFirst := make([]*Auth, 0, len(auths)-1)
+	for _, a := range auths {
+		if a.ID != first.ID {
+			availableWithoutFirst = append(availableWithoutFirst, a)
+		}
+	}
+	if _, err = selector.Pick(context.Background(), "claude", "claude-3", opts, availableWithoutFirst); err == nil {
+		t.Fatal("strict Pick() with bound auth removed: expected error, got nil")
+	}
+
+	// Auto-release off → binding survives; a further strict-refuse must
+	// still return the usage_limit_reached error (not silently re-pick).
+	if _, err = selector.Pick(context.Background(), "claude", "claude-3", opts, availableWithoutFirst); err == nil {
+		t.Fatal("second strict Pick() must still refuse when auto-release is off")
+	}
+	var se *Error
+	if !errors.As(err, &se) || se.Code != "usage_limit_reached" {
+		t.Fatalf("second strict Pick() error = %v, want usage_limit_reached", err)
+	}
+}
+
 // Strict mode must NOT block the first request of a brand-new session —
 // only when a session that's already bound finds its auth removed.
 func TestSessionAffinitySelector_StrictAllowsInitialPick(t *testing.T) {
 	t.Parallel()
-
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 		Fallback: &RoundRobinSelector{},
 		TTL:      time.Minute,
