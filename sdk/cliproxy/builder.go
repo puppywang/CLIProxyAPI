@@ -263,6 +263,8 @@ func (b *Builder) Build() (*Service, error) {
 		switch strategy {
 		case "fill-first", "fillfirst", "ff":
 			selector = &coreauth.FillFirstSelector{}
+		case "weighted-round-robin", "weightedroundrobin", "wrr":
+			selector = &coreauth.WeightedRoundRobinSelector{}
 		default:
 			leastBound = coreauth.NewLeastBoundSelector(nil, nil)
 			selector = leastBound

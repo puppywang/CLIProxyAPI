@@ -67,6 +67,9 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 		if entry.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(entry.Priority)
 		}
+		if entry.Weight != nil {
+			attrs[coreauth.AttributeWeight] = strconv.Itoa(*entry.Weight)
+		}
 		if base != "" {
 			attrs["base_url"] = base
 		}
@@ -122,6 +125,9 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		if ck.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(ck.Priority)
 		}
+		if ck.Weight != nil {
+			attrs[coreauth.AttributeWeight] = strconv.Itoa(*ck.Weight)
+		}
 		if base != "" {
 			attrs["base_url"] = base
 		}
@@ -176,6 +182,9 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		}
 		if ck.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(ck.Priority)
+		}
+		if ck.Weight != nil {
+			attrs[coreauth.AttributeWeight] = strconv.Itoa(*ck.Weight)
 		}
 		if ck.BaseURL != "" {
 			attrs["base_url"] = ck.BaseURL
@@ -249,6 +258,9 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			}
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
+			}
+			if entry.Weight != nil {
+				attrs[coreauth.AttributeWeight] = strconv.Itoa(*entry.Weight)
 			}
 			if key != "" {
 				attrs["api_key"] = key
@@ -340,6 +352,9 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		}
 		if compat.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(compat.Priority)
+		}
+		if compat.Weight != nil {
+			attrs[coreauth.AttributeWeight] = strconv.Itoa(*compat.Weight)
 		}
 		if key != "" {
 			attrs["api_key"] = key
