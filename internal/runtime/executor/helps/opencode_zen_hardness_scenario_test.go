@@ -111,9 +111,13 @@ func TestOpencodeZenNormalizeToolSchema(t *testing.T) {
 // restores client-facing names for both non-streaming bodies and streaming
 // data lines, while leaving arguments untouched.
 func TestRewriteOpencodeZenResponseToolNames(t *testing.T) {
+	// Client declared a tool named "read" (collides with canonical), so the
+	// alias read_file -> read must be reversed.
+	renamed := map[string]bool{"read": true, "write": true}
+
 	// Non-streaming body.
 	body := []byte(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"read_file","arguments":"{\"file_path\":\"/x\"}"}}]}}]}`)
-	out := RewriteOpencodeZenResponseToolNames(body)
+	out := RewriteOpencodeZenResponseToolNames(body, renamed)
 	if got := gjson.GetBytes(out, "choices.0.message.tool_calls.0.function.name").String(); got != "read" {
 		t.Errorf("non-stream rename = %q, want read", got)
 	}
@@ -123,7 +127,7 @@ func TestRewriteOpencodeZenResponseToolNames(t *testing.T) {
 
 	// Streaming data line (arguments are incremental fragments — untouched).
 	line := []byte(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"write_file","arguments":"{\"fi"}}]}}]}`)
-	out = RewriteOpencodeZenResponseToolNames(line)
+	out = RewriteOpencodeZenResponseToolNames(line, renamed)
 	if got := gjson.GetBytes(out, "choices.0.delta.tool_calls.0.function.name").String(); got != "write" {
 		t.Errorf("stream rename = %q, want write", got)
 	}
@@ -133,8 +137,58 @@ func TestRewriteOpencodeZenResponseToolNames(t *testing.T) {
 
 	// Unrelated line unchanged.
 	plain := []byte(`data: {"choices":[{"delta":{"content":"hi"}}]}`)
-	if got := string(RewriteOpencodeZenResponseToolNames(plain)); got != string(plain) {
+	if got := string(RewriteOpencodeZenResponseToolNames(plain, renamed)); got != string(plain) {
 		t.Errorf("unrelated line must pass through, got %q", got)
+	}
+}
+
+// TestRewriteOpencodeZenResponseToolNamesSkipsClientNamedAliases verifies the
+// fix for the Copilot regression: a client whose own tool is ALREADY named
+// read_file (no collision with the canonical read) must keep read_file in the
+// response. Only aliases for tools the client actually declared under a
+// colliding name are reversed.
+func TestRewriteOpencodeZenResponseToolNamesSkipsClientNamedAliases(t *testing.T) {
+	// Client declared read_file/write_file directly — no collision, no rename.
+	renamed := map[string]bool{}
+
+	body := []byte(`{"choices":[{"message":{"tool_calls":[
+		{"function":{"name":"read_file","arguments":"{\"filePath\":\"/x\"}"}},
+		{"function":{"name":"write_file","arguments":"{\"filePath\":\"/y\"}"}}
+	]}}]}`)
+	out := RewriteOpencodeZenResponseToolNames(body, renamed)
+	calls := gjson.GetBytes(out, "choices.0.message.tool_calls").Array()
+	if len(calls) != 2 {
+		t.Fatalf("tool_calls = %d, want 2", len(calls))
+	}
+	if got := calls[0].Get("function.name").String(); got != "read_file" {
+		t.Errorf("tool_calls[0] = %q, want read_file (client's real tool name)", got)
+	}
+	if got := calls[1].Get("function.name").String(); got != "write_file" {
+		t.Errorf("tool_calls[1] = %q, want write_file (client's real tool name)", got)
+	}
+	if got := calls[0].Get("function.arguments").String(); got != `{"filePath":"/x"}` {
+		t.Errorf("arguments must stay untouched, got %q", got)
+	}
+}
+
+// TestRewriteOpencodeZenResponseToolNamesPartialAliases verifies that only
+// the aliases whose client-side original was declared are reversed: a client
+// declaring read but NOT write keeps read_file -> read while write_file stays
+// untouched.
+func TestRewriteOpencodeZenResponseToolNamesPartialAliases(t *testing.T) {
+	renamed := map[string]bool{"read": true}
+
+	body := []byte(`{"choices":[{"message":{"tool_calls":[
+		{"function":{"name":"read_file"}},
+		{"function":{"name":"write_file"}}
+	]}}]}`)
+	out := RewriteOpencodeZenResponseToolNames(body, renamed)
+	calls := gjson.GetBytes(out, "choices.0.message.tool_calls").Array()
+	if got := calls[0].Get("function.name").String(); got != "read" {
+		t.Errorf("tool_calls[0] = %q, want read (client declared read)", got)
+	}
+	if got := calls[1].Get("function.name").String(); got != "write_file" {
+		t.Errorf("tool_calls[1] = %q, want write_file (client did not declare write)", got)
 	}
 }
 
@@ -149,7 +203,8 @@ func TestRewriteOpencodeZenResponseAllAliases(t *testing.T) {
 		{"function":{"name":"fetch_url"}},
 		{"function":{"name":"web_search"}}
 	]}}]}`)
-	out := RewriteOpencodeZenResponseToolNames(body)
+	renamed := map[string]bool{"read": true, "write": true, "task": true, "todowrite": true, "webfetch": true, "websearch": true}
+	out := RewriteOpencodeZenResponseToolNames(body, renamed)
 	want := []string{"read", "write", "task", "todowrite", "webfetch", "websearch"}
 	calls := gjson.GetBytes(out, "choices.0.message.tool_calls").Array()
 	if len(calls) != len(want) {

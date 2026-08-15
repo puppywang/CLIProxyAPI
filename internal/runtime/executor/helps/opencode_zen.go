@@ -296,25 +296,50 @@ func opencodeZenRewriteRequestToolNames(rawMessages string) string {
 	return "[" + strings.Join(out, ",") + "]"
 }
 
+// OpencodeZenRenamedClientTools returns the set of client-declared tool names
+// that collide with the canonical opencode six and are therefore injected
+// upstream under model-facing aliases (read -> read_file, write -> write_file,
+// ...). The response rewrite must only reverse aliases for tools that were
+// ACTUALLY renamed: a client whose own tool is already named read_file (e.g.
+// GitHub Copilot) must keep read_file in responses — rewriting it to "read"
+// would produce a tool call the client runtime does not recognize.
+func OpencodeZenRenamedClientTools(payload []byte) map[string]bool {
+	renamed := make(map[string]bool)
+	gjson.GetBytes(payload, "tools").ForEach(func(_, tool gjson.Result) bool {
+		name := tool.Get("function.name").String()
+		if _, ok := opencodeZenToolRename[name]; ok {
+			renamed[name] = true
+		}
+		return true
+	})
+	return renamed
+}
+
 // RewriteOpencodeZenResponseToolNames rewrites tool_calls function names in an
 // upstream OpenAI-format response (streaming data line or non-streaming body)
 // from model-facing names back to client-facing names (e.g. read_file -> read)
-// so the client runtime recognizes the tools it declared. Uses the full
-// opencodeZenToolRename map so every aliased tool is covered. When context
-// injection is disabled the alias map is not in effect, so the rewrite is a
-// no-op.
-func RewriteOpencodeZenResponseToolNames(line []byte) []byte {
+// so the client runtime recognizes the tools it declared.
+//
+// renamedClientTools is the set returned by OpencodeZenRenamedClientTools for
+// the request that produced this response: only aliases whose client-side
+// original name was actually declared by the client are reversed. A client
+// tool that already carried the model-facing name (read_file, write_file, ...)
+// is NOT renamed — it is the client's real tool name and must survive
+// verbatim. When context injection is disabled the alias map is not in
+// effect, so the rewrite is a no-op.
+func RewriteOpencodeZenResponseToolNames(line []byte, renamedClientTools map[string]bool) []byte {
 	if !opencodeZenInjectContext.Load() {
 		return line
 	}
-	if len(opencodeZenToolRename) == 0 {
+	if len(opencodeZenToolRename) == 0 || len(renamedClientTools) == 0 {
 		return line
 	}
 	out := make([]byte, len(line))
 	copy(out, line)
 	// Fast path: nothing to do unless a known alias appears.
 	changed := false
-	for _, modelName := range opencodeZenToolRename {
+	for clientName := range renamedClientTools {
+		modelName := opencodeZenToolRename[clientName]
 		if bytes.Contains(out, []byte(`"name":"`+modelName+`"`)) {
 			changed = true
 			break
@@ -323,7 +348,8 @@ func RewriteOpencodeZenResponseToolNames(line []byte) []byte {
 	if !changed {
 		return line
 	}
-	for clientName, modelName := range opencodeZenToolRename {
+	for clientName := range renamedClientTools {
+		modelName := opencodeZenToolRename[clientName]
 		needle := []byte(`"name":"` + modelName + `"`)
 		replacement := []byte(`"name":"` + clientName + `"`)
 		if n := bytes.Count(out, needle); n > 0 {

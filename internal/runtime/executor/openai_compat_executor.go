@@ -137,7 +137,15 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if opts.Alt != "responses/compact" {
 		translated = helps.NormalizeOpenAIChatRoles(translated)
 	}
+	// Client tools that collide with the canonical opencode six are injected
+	// upstream under model-facing aliases (read -> read_file). Only those
+	// aliases may be reversed in the response; a client tool that already
+	// carries the model-facing name (e.g. Copilot's read_file) must survive
+	// verbatim. Compute the renamed set from the ORIGINAL client payload
+	// before conversion.
+	var zenRenamedClientTools map[string]bool
 	if e.zenEnabled(auth) && opts.Alt != "responses/compact" {
+		zenRenamedClientTools = helps.OpencodeZenRenamedClientTools(translated)
 		before := len(translated)
 		translated = helps.ConvertOpenAIRequestToOpencodeZen(translated)
 		if len(translated) < before {
@@ -216,8 +224,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	// Translate response back to source format when needed
 	if e.zenEnabled(auth) {
 		// Restore client-facing tool names (read_file -> read) so the client
-		// runtime recognizes the tools it declared.
-		body = helps.RewriteOpencodeZenResponseToolNames(body)
+		// runtime recognizes the tools it declared. Only aliases for tools the
+		// client actually declared under a colliding name are reversed; a
+		// client tool already named read_file survives verbatim.
+		body = helps.RewriteOpencodeZenResponseToolNames(body, zenRenamedClientTools)
 	}
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, body, &param)
@@ -362,7 +372,15 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// (e.g. the opengo channel) where developer would otherwise reach the
 	// upstream verbatim.
 	translated = helps.NormalizeOpenAIChatRoles(translated)
+	// Client tools that collide with the canonical opencode six are injected
+	// upstream under model-facing aliases (read -> read_file). Only those
+	// aliases may be reversed in the response; a client tool that already
+	// carries the model-facing name (e.g. Copilot's read_file) must survive
+	// verbatim. Compute the renamed set from the ORIGINAL client payload
+	// before conversion.
+	var zenRenamedClientTools map[string]bool
 	if e.zenEnabled(auth) {
+		zenRenamedClientTools = helps.OpencodeZenRenamedClientTools(translated)
 		// Before conversion, snapshot the client-side reasoning shape so we
 		// can attribute "reasoning_content must be passed back" rejections to
 		// the client payload vs our trimming.
@@ -490,8 +508,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			var zenLine []byte
 			if e.zenEnabled(auth) {
 				// Restore client-facing tool names (read_file -> read) before
-				// translating so the client sees its own tool names.
-				zenLine = helps.RewriteOpencodeZenResponseToolNames(bytes.Clone(trimmedLine))
+				// translating so the client sees its own tool names. Only
+				// aliases for tools the client actually declared under a
+				// colliding name are reversed; a client tool already named
+				// read_file survives verbatim.
+				zenLine = helps.RewriteOpencodeZenResponseToolNames(bytes.Clone(trimmedLine), zenRenamedClientTools)
 			} else {
 				zenLine = bytes.Clone(trimmedLine)
 			}
