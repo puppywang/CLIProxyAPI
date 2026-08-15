@@ -1585,6 +1585,14 @@ func appendPath(path []string, key string) []string {
 // represents a known default value that should not be written to the config file.
 // This prevents non-zero defaults from polluting the config.
 func isKnownDefaultValue(path []string, node *yaml.Node) bool {
+	// Credential weights are meaningful at zero (weight <= 0 excludes the
+	// credential from weighted round-robin selection), so a weight key must
+	// never be pruned as a "default" — otherwise a weight: 0 entry silently
+	// vanishes from the persisted config and the credential stays selectable.
+	if len(path) > 0 && path[len(path)-1] == "weight" {
+		return false
+	}
+
 	// First check if it's a zero value
 	if isZeroValueNode(node) {
 		return true
