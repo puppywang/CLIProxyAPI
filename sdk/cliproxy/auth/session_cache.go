@@ -24,6 +24,7 @@ import (
 // validated against real production traffic first.
 type sessionEntry struct {
 	authID    string
+	model     string // model the binding was established for (display only)
 	expiresAt time.Time
 	closed    bool
 	closedAt  time.Time
@@ -36,6 +37,7 @@ type sessionEntry struct {
 // load cleanly into the new struct (their entries simply have closed=false).
 type persistedEntry struct {
 	AuthID    string    `json:"auth_id"`
+	Model     string    `json:"model,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
 	Closed    bool      `json:"closed,omitempty"`
 	ClosedAt  time.Time `json:"closed_at,omitempty"`
@@ -150,12 +152,21 @@ func (c *SessionCache) GetAndRefresh(sessionID string) (string, bool) {
 
 // Set binds a session to an auth ID with TTL refresh.
 func (c *SessionCache) Set(sessionID, authID string) {
+	c.SetWithModel(sessionID, authID, "")
+}
+
+// SetWithModel binds a session to an auth ID with TTL refresh and records
+// the model the binding was established for. The model is display-only —
+// it lets the operator-facing bindings panel show which model each
+// conversation is using without affecting Pick/LeastBound behaviour.
+func (c *SessionCache) SetWithModel(sessionID, authID, model string) {
 	if sessionID == "" || authID == "" {
 		return
 	}
 	c.mu.Lock()
 	c.entries[sessionID] = sessionEntry{
 		authID:    authID,
+		model:     model,
 		expiresAt: time.Now().Add(c.ttl),
 	}
 	c.mu.Unlock()
@@ -194,6 +205,7 @@ func (c *SessionCache) Invalidate(sessionID string) {
 type BindingSnapshotEntry struct {
 	SessionKey string
 	AuthID     string
+	Model      string
 	ExpiresAt  time.Time
 	Closed     bool
 	ClosedAt   time.Time
@@ -223,6 +235,7 @@ func (c *SessionCache) SnapshotByAuth() map[string][]BindingSnapshotEntry {
 		out[e.authID] = append(out[e.authID], BindingSnapshotEntry{
 			SessionKey: key,
 			AuthID:     e.authID,
+			Model:      e.model,
 			ExpiresAt:  e.expiresAt,
 			Closed:     e.closed,
 			ClosedAt:   e.closedAt,

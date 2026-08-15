@@ -1086,13 +1086,22 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	// overwrite the mirror so future sub-agents inherit the freshest
 	// parent's binding rather than a stale one.
 	writeBinding := func(authID string) {
-		s.cache.Set(cacheKey, authID)
+		s.cache.SetWithModel(cacheKey, authID, model)
 		if mirrorKey != "" {
-			s.cache.Set(mirrorKey, authID)
+			s.cache.SetWithModel(mirrorKey, authID, model)
 		}
 	}
 
 	cachedAuthID, hit := s.cache.GetAndRefresh(cacheKey)
+	if hit && cachedAuthID != "" {
+		// Backfill the model on cache hits so bindings established before
+		// the model-tracking change (or by older binaries) still show the
+		// model in the operator-facing bindings panel.
+		s.cache.SetWithModel(cacheKey, cachedAuthID, model)
+		if mirrorKey != "" {
+			s.cache.SetWithModel(mirrorKey, cachedAuthID, model)
+		}
+	}
 
 	// Strict-mode bypass: when we already have a binding for this session,
 	// honor it even if the auth is currently in a temporary cooldown. The
@@ -1156,7 +1165,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		}
 		if mirrorKey != "" {
-			s.cache.Set(mirrorKey, bound.ID)
+			s.cache.SetWithModel(mirrorKey, bound.ID, model)
 		}
 		// Distinguish a normal cache hit (auth fully available) from a
 		// real bypass (auth is currently in cooldown / unavailable). The
@@ -1192,7 +1201,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
 				if mirrorKey != "" {
-					s.cache.Set(mirrorKey, auth.ID)
+					s.cache.SetWithModel(mirrorKey, auth.ID, model)
 				}
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil

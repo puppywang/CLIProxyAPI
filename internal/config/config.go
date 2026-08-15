@@ -1604,6 +1604,14 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		return false
 	}
 
+	// The opencode zen context-injection toggle defaults to enabled (true),
+	// so a persisted false is a deliberate operator override and must never
+	// be pruned as a "default" — otherwise the monitor-panel toggle stops
+	// surviving restarts.
+	if len(path) > 0 && path[len(path)-1] == "opencode-zen-inject-context" {
+		return false
+	}
+
 	// First check if it's a zero value
 	if isZeroValueNode(node) {
 		return true

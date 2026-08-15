@@ -25,6 +25,7 @@ import (
 type CachedBinding struct {
 	SessionKey string    // e.g. "mixed::codex-thread:<uuid>"
 	AuthID     string    // e.g. "codex-tanaka.haru23@..."
+	Model      string    // model the binding was established for (display only)
 	ExpiresAt  time.Time // when the cache TTL elapses
 	Closed     bool
 	ClosedAt   time.Time
@@ -143,6 +144,7 @@ func quotaHistoryHandler(reg *Registry) gin.HandlerFunc {
 type bindingsWindow struct {
 	UUID      string `json:"uuid"`
 	Kind      string `json:"kind"` // "thread", "window", or "both"
+	Model     string `json:"model,omitempty"`
 	Workspace string `json:"workspace,omitempty"`
 	ExpiresAt string `json:"expires_at"`
 	Closed    bool   `json:"closed,omitempty"`
@@ -223,6 +225,9 @@ func bindingsHandler(reg *Registry, bindingsFunc BindingsByAuthFunc, authLookup 
 				if w == nil {
 					w = &bindingsWindow{UUID: id, Workspace: workspaces[id], Closed: true}
 					perUUID[id] = w
+				}
+				if w.Model == "" && e.Model != "" {
+					w.Model = e.Model
 				}
 				if !e.Closed {
 					perUUIDOpen[id]++

@@ -457,6 +457,7 @@
   .kind-badge.kind-thread { color: #8fc6ff; border-color: rgba(143,198,255,0.35); }
   .kind-badge.kind-window { color: #ffd66f; border-color: rgba(255,214,111,0.35); }
   .kind-badge.kind-msg    { color: #c4a0ff; border-color: rgba(196,160,255,0.35); }
+  .kind-badge.model       { color: #9bb8f0; border-color: rgba(99,132,217,0.45); }
   .kind-badge.closed      { color: #ff8a8a; border-color: rgba(255,138,138,0.35); }
   .binding-row.binding-closed code { color: rgba(255,255,255,0.35); text-decoration: line-through; }
   .binding-row.binding-closed .workspace-cell { color: rgba(255,255,255,0.35); }
@@ -3428,6 +3429,12 @@
     const kindBadge = w.kind === 'both'
       ? ''
       : '<span class="kind-badge kind-' + escapeAttr(w.kind || 'other') + '">' + escapeHtml(w.kind || '') + '</span>';
+    // Model badge — for content-hash sessions (msg:<hash>, e.g. opencode /
+    // Copilot Chat) the uuid is opaque, so the model is the only useful
+    // identifier of what this conversation is doing.
+    const modelBadge = w.model
+      ? '<span class="kind-badge model" title="Model bound to this conversation">' + escapeHtml(w.model) + '</span>'
+      : '';
     const closedSuffix = w.closed
       ? '<span class="kind-badge closed">closed</span>' +
         (w.forked_to ? '<span class="muted forked-arrow">→ ' + escapeHtml(w.forked_to || '') + '</span>' : '')
@@ -3437,7 +3444,7 @@
       'data-release-binding="' + escapeAttr(authID) + '" data-binding-uuid="' + escapeAttr(w.uuid || '') + '" ' +
       'title="Release this conversation\u2019s binding so it re-picks a fresh account on its next turn (others unaffected)">⏏</button>';
     return '<div class="' + rowClass + '">' +
-      '<div class="binding-main"><code>' + escapeHtml(w.uuid || '') + '</code> ' + kindBadge + closedSuffix + ' ' + wsCell + '</div>' +
+      '<div class="binding-main"><code>' + escapeHtml(w.uuid || '') + '</code> ' + kindBadge + modelBadge + closedSuffix + ' ' + wsCell + '</div>' +
       releaseBtn +
       '</div>';
   }

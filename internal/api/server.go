@@ -1067,6 +1067,7 @@ func (s *Server) registerManagementRoutes() {
 					converted = append(converted, monitor.CachedBinding{
 						SessionKey: e.SessionKey,
 						AuthID:     e.AuthID,
+						Model:      e.Model,
 						ExpiresAt:  e.ExpiresAt,
 						Closed:     e.Closed,
 						ClosedAt:   e.ClosedAt,
