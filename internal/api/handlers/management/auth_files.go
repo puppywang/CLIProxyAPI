@@ -458,7 +458,13 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		return nil
 	}
 	path := strings.TrimSpace(authAttribute(auth, "path"))
-	if path == "" && !runtimeOnly {
+	// Config-synthesized API-key credentials (gemini/claude/codex/
+	// openai-compat/vertex) have no backing auth file — they live only
+	// in memory with a `source: config:<provider>[<hash>]` attribute.
+	// Surface them in the auth-files list too so the monitor panel can
+	// show every credential the proxy actually routes on.
+	configSourced := strings.HasPrefix(strings.TrimSpace(authAttribute(auth, "source")), "config:")
+	if path == "" && !runtimeOnly && !configSourced {
 		return nil
 	}
 	name := strings.TrimSpace(auth.FileName)
@@ -479,6 +485,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"runtime_only":   runtimeOnly,
 		"source":         "memory",
 		"size":           int64(0),
+	}
+	if configSourced {
+		entry["source"] = "config"
 	}
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed

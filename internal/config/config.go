@@ -89,6 +89,16 @@ type Config struct {
 	// different account. Persisted so the toggle survives restarts.
 	AutoReleaseOn429 bool `yaml:"auto-release-on-429" json:"auto-release-on-429"`
 
+	// OpencodeZenInjectContext, when true (the default), injects the
+	// canonical opencode system prompt and the canonical six tools into
+	// every opencode-zen request so the zen gateway's content check passes.
+	// When false, requests are forwarded with only legal-shape fixes
+	// (reasoning_content backfill, developer->system, include_usage, payload
+	// budget) and the client's own prompt/tools pass through untouched. The
+	// monitor panel can flip this at runtime; the value here is the default
+	// and is also persisted when the panel toggle changes.
+	OpencodeZenInjectContext bool `yaml:"opencode-zen-inject-context" json:"opencode-zen-inject-context"`
+
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
@@ -835,6 +845,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.RedisUsageQueueRetentionSeconds = 60
 	cfg.DisableCooling = false
 	cfg.AutoReleaseOn429 = false
+	cfg.OpencodeZenInjectContext = true
 	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr

@@ -7,11 +7,39 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// opencodeZenInjectContext is the runtime toggle for the opencode zen
+// "context injection" (canonical opencode system prompt + canonical six
+// tools + tool_choice auto + client tool note + repeat note + tool-name
+// aliasing). It defaults to enabled so behaviour is unchanged unless an
+// operator flips it from the monitor panel (management API
+// /opencode-zen-inject-context). When disabled, requests are forwarded with
+// only the legal-shape fixes the gateway requires (reasoning_content
+// backfill, developer->system, include_usage, payload budget), leaving the
+// client's own system prompt and tools untouched.
+var opencodeZenInjectContext atomic.Bool
+
+func init() {
+	opencodeZenInjectContext.Store(true)
+}
+
+// SetOpencodeZenInjectContext flips the context-injection toggle. Takes
+// effect immediately for every subsequent opencode-zen request.
+func SetOpencodeZenInjectContext(enable bool) {
+	opencodeZenInjectContext.Store(enable)
+}
+
+// OpencodeZenInjectContextEnabled reports the current context-injection
+// toggle state.
+func OpencodeZenInjectContextEnabled() bool {
+	return opencodeZenInjectContext.Load()
+}
 
 // opencodeZenSystemPrompt is the exact system prompt captured from a real
 // opencode CLI request. The zen gateway performs a content-based check on the
@@ -272,8 +300,13 @@ func opencodeZenRewriteRequestToolNames(rawMessages string) string {
 // upstream OpenAI-format response (streaming data line or non-streaming body)
 // from model-facing names back to client-facing names (e.g. read_file -> read)
 // so the client runtime recognizes the tools it declared. Uses the full
-// opencodeZenToolRename map so every aliased tool is covered.
+// opencodeZenToolRename map so every aliased tool is covered. When context
+// injection is disabled the alias map is not in effect, so the rewrite is a
+// no-op.
 func RewriteOpencodeZenResponseToolNames(line []byte) []byte {
+	if !opencodeZenInjectContext.Load() {
+		return line
+	}
 	if len(opencodeZenToolRename) == 0 {
 		return line
 	}
@@ -342,9 +375,17 @@ func OpencodeZenSystemPromptTrimmed() string {
 // tools to be fully present; everything else in the payload is mergeable.
 // All other fields (model, max_tokens, reasoning_effort, stream, ...) pass
 // through unchanged.
+//
+// When the context-injection toggle is off (see SetOpencodeZenInjectContext)
+// the conversion degrades to opencodeZenLegalOnly: no system prompt / tools
+// are injected, the client's own instructions and tools pass through
+// untouched, and only the gateway-required legal-shape fixes are applied.
 func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
+	}
+	if !opencodeZenInjectContext.Load() {
+		return opencodeZenLegalOnly(payload)
 	}
 
 	rawMessages := gjson.GetBytes(payload, "messages").Raw
@@ -428,6 +469,49 @@ func ConvertOpenAIRequestToOpencodeZen(payload []byte) []byte {
 	out, _ = sjson.DeleteBytes(out, "prompt_cache_key")
 	out = enforceOpencodeZenPayloadBudget(out)
 	return out
+}
+
+// opencodeZenLegalOnly rewrites an OpenAI chat payload for the opencode zen
+// gateway with context injection disabled: the client's own system prompt,
+// tools and tool_choice are forwarded verbatim, and only the gateway's
+// legal-shape requirements are repaired:
+//
+//  1. assistant tool-calling turns get a reasoning_content backfill
+//     (the thinking-mode gateway rejects tool-call turns that omit it);
+//  2. role "developer" is normalized to "system" (opencode-go rejects
+//     developer with 400 unknown variant);
+//  3. stream_options.include_usage is forced on so usage accounting
+//     survives the gateway;
+//  4. proxy-only fields are dropped and the payload budget is enforced.
+func opencodeZenLegalOnly(payload []byte) []byte {
+	rawMessages := gjson.GetBytes(payload, "messages")
+	if !rawMessages.Exists() {
+		return payload
+	}
+	rebuilt := make([]string, 0, len(rawMessages.Array()))
+	gjson.Parse(rawMessages.Raw).ForEach(func(_, value gjson.Result) bool {
+		if value.Get("role").String() == "developer" {
+			raw, err := sjson.SetRawBytes([]byte(value.Raw), "role", []byte(`"system"`))
+			if err == nil {
+				rebuilt = append(rebuilt, opencodeZenEnsureReasoningContent(gjson.Parse(string(raw))))
+				return true
+			}
+		}
+		rebuilt = append(rebuilt, opencodeZenEnsureReasoningContent(value))
+		return true
+	})
+	out, err := sjson.SetRawBytes(payload, "messages", []byte("["+strings.Join(rebuilt, ",")+"]"))
+	if err != nil {
+		return payload
+	}
+	if gjson.GetBytes(out, "stream").Bool() {
+		out, err = sjson.SetRawBytes(out, "stream_options.include_usage", []byte(`true`))
+		if err != nil {
+			return payload
+		}
+	}
+	out, _ = sjson.DeleteBytes(out, "prompt_cache_key")
+	return enforceOpencodeZenPayloadBudget(out)
 }
 
 // opencodeZenRepeatThreshold is the number of identical tool calls tolerated

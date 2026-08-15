@@ -393,6 +393,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	auth.SetAutoReleaseOn429(cfg.AutoReleaseOn429)
+	helps.SetOpencodeZenInjectContext(cfg.OpencodeZenInjectContext)
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
@@ -997,6 +998,13 @@ func (s *Server) registerManagementRoutes() {
 		// account — transparent failover with no client-side fork.
 		mgmt.GET("/auto-release-429", s.mgmt.GetAutoRelease429)
 		mgmt.PUT("/auto-release-429", s.mgmt.SetAutoRelease429)
+		// Opencode zen context-injection toggle. When on (default), the
+		// canonical opencode system prompt + six tools are injected into
+		// every opencode-zen request so the gateway's content check passes;
+		// when off, only legal-shape fixes are applied and the client's own
+		// prompt/tools pass through verbatim.
+		mgmt.GET("/opencode-zen-inject-context", s.mgmt.GetOpencodeZenInjectContext)
+		mgmt.PUT("/opencode-zen-inject-context", s.mgmt.SetOpencodeZenInjectContext)
 		// Codex referral invite. Sends invites from the selected codex
 		// auth via chatgpt.com wham/referrals/invite; defaults mirror
 		// LTbinglingfeng/cpa-plugin-codex-invite. Body is a JSON
@@ -1874,6 +1882,10 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 
 	if oldCfg == nil || oldCfg.AutoReleaseOn429 != cfg.AutoReleaseOn429 {
 		auth.SetAutoReleaseOn429(cfg.AutoReleaseOn429)
+	}
+
+	if oldCfg == nil || oldCfg.OpencodeZenInjectContext != cfg.OpencodeZenInjectContext {
+		helps.SetOpencodeZenInjectContext(cfg.OpencodeZenInjectContext)
 	}
 
 	if oldCfg != nil && oldCfg.DisableImageGeneration != cfg.DisableImageGeneration {

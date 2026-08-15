@@ -793,6 +793,11 @@
     background: rgba(217,119,87,0.12);
     border: 1px solid rgba(217,119,87,0.35);
   }
+  .provider-pill.opencode {
+    color: #9bb8f0;
+    background: rgba(99,132,217,0.12);
+    border: 1px solid rgba(99,132,217,0.35);
+  }
   /* Clickable Grok Build/API endpoint toggle on a grok quota row. Green =
      Build (cli-chat-proxy, larger allowance); amber = official API. */
   .grok-build-toggle {
@@ -1517,7 +1522,7 @@
 
   <details class="history" id="quotaSection">
     <summary>
-      Account quota — Codex, Grok &amp; Claude (<span id="quotaCount">0</span>)
+      Account quota — Codex, Grok, Claude &amp; opencode (<span id="quotaCount">0</span>)
       <button type="button" id="quotaRefreshAllBtn" class="quota-refresh-all" title="Re-fetch the latest quota snapshots for every account now (codex wham/usage · grok billing; claude has no quota API)">Refresh all</button>
       <button type="button" id="deleteDeadBtn" class="quota-refresh-all quota-delete-dead" title="Delete every account flagged deactivated (terminal 4XX from quota refresh). A confirmation lists all of them first." hidden>🗑 Delete deactivated</button>
       <button type="button" id="registerAgentBtn" class="quota-refresh-all" title="Import an account from a one-time access_token via Agent Identity — no refresh_token / SMS code needed">+ Import via token</button>
@@ -1525,6 +1530,11 @@
         <input type="checkbox" id="autoRelease429Checkbox">
         <span>Auto-release on 429/402</span>
         <span class="ar429-hint">(429/402→500 + drop bindings)</span>
+      </label>
+      <label class="auto-release-429-toggle" title="When on (default), the canonical opencode system prompt + six tools are injected into every opencode-zen request so the gateway's content check passes. When off, only legal-shape fixes remain (reasoning_content backfill, developer→system, include_usage, payload budget) and the client's own prompt/tools pass through verbatim — for setups where the zen gateway no longer content-checks the canonical prompt">
+        <input type="checkbox" id="opencodeZenInjectCheckbox">
+        <span>Opencode zen context injection</span>
+        <span class="ar429-hint">(canonical prompt + 6 tools)</span>
       </label>
     </summary>
     <!-- Aggregate panel — fleet-wide rollup of 5h + 7d capacity. Each cell:
@@ -2880,7 +2890,7 @@
       noteServerNow(data.now);
       const files = (data.files || []).filter(a => {
         const p = (a.type || a.provider || '').toLowerCase();
-        return p === 'codex' || p === 'xai' || p === 'claude';
+        return p === 'codex' || p === 'xai' || p === 'claude' || p === 'opencode' || p === 'opengo';
       });
       $('quotaCount').textContent = String(files.length);
       lastQuotaFiles = files;
@@ -3102,23 +3112,27 @@
     const rowProvider = (a.provider || a.type || '').toLowerCase();
     const isXai = rowProvider === 'xai';
     const isClaude = rowProvider === 'claude';
+    const isOpencode = rowProvider === 'opencode' || rowProvider === 'opengo';
     const fileName = (function () {
       const nm = String(a.name || a.id || '').trim();
       if (nm) return nm;
       if (isClaude) return 'claude-' + (a.email || 'unknown') + '.json';
+      if (isOpencode) return (a.label || rowProvider || 'opencode') + ' (config key)';
       const acct = (a.id_token && a.id_token.chatgpt_account_id) || a.account_id || (a.account && a.account.id) || '';
       const seg = String(acct).split('-')[0] || 'unknown';
       return 'codex-' + (a.email || 'unknown') + '-' + seg + '.json';
     })();
     const sub = '<div class="muted qc-filename" title="' + escapeAttr(fileName) + '">' + escapeHtml(fileName) + '</div>';
     const q = a.quota || null;
-    // Provider chip so grok/claude rows are unmistakable in a mixed pool.
+    // Provider chip so grok/claude/opencode rows are unmistakable in a mixed pool.
     // Codex is the implicit default and stays unlabelled to avoid clutter.
     const providerPill = isXai
       ? '<span class="provider-pill xai" title="xAI / Grok account">grok</span>'
       : (isClaude
         ? '<span class="provider-pill claude" title="Anthropic / Claude account">claude</span>'
-        : '');
+        : (isOpencode
+          ? '<span class="provider-pill opencode" title="opencode zen API key (config)">' + rowProvider + '</span>'
+          : ''));
     // Clickable Grok endpoint toggle (grok rows only). a.xai_using_api is true
     // for the official API path, false for Grok Build. The label shows the mode
     // the account is CURRENTLY on; clicking switches it.
@@ -4025,6 +4039,58 @@
     });
   }
 
+  // Opencode zen context-injection toggle. Loads the current state once
+  // on connect and mirrors flips to PUT /v0/management/opencode-zen-inject-context.
+  // When off, opencode-zen requests skip the canonical opencode system
+  // prompt + six tools injection; the gateway-required legal-shape fixes
+  // (reasoning_content backfill, developer->system, include_usage, payload
+  // budget) stay active and the client's own prompt/tools pass through
+  // verbatim. The checkbox lives in the quota panel summary next to the
+  // opencode accounts it affects.
+  const zenInjectCheckbox = $('opencodeZenInjectCheckbox');
+  let zenInjectInflight = false;
+  async function loadOpencodeZenInject() {
+    if (!zenInjectCheckbox) return;
+    try {
+      const res = await apiFetch('/v0/management/opencode-zen-inject-context');
+      const s = await res.json();
+      zenInjectInflight = true;
+      zenInjectCheckbox.checked = !!s.enabled;
+      zenInjectInflight = false;
+    } catch (err) {
+      // Best-effort: default to enabled (the config default) on failure.
+      zenInjectInflight = true;
+      zenInjectCheckbox.checked = true;
+      zenInjectInflight = false;
+    }
+  }
+  if (zenInjectCheckbox) {
+    zenInjectCheckbox.addEventListener('change', async () => {
+      if (zenInjectInflight) return;
+      const want = zenInjectCheckbox.checked;
+      try {
+        const res = await apiFetch('/v0/management/opencode-zen-inject-context', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: want }),
+        });
+        const s = await res.json();
+        zenInjectInflight = true;
+        zenInjectCheckbox.checked = !!s.enabled;
+        zenInjectInflight = false;
+        setStatus(want
+          ? 'Opencode zen context injection ENABLED — canonical opencode prompt + 6 tools injected into every opencode-zen request'
+          : 'Opencode zen context injection DISABLED — opencode-zen requests pass through with only legal-shape fixes (reasoning_content backfill etc.), client prompt/tools untouched');
+      } catch (err) {
+        // Revert the checkbox to the server's last known state.
+        zenInjectInflight = true;
+        zenInjectCheckbox.checked = !want;
+        zenInjectInflight = false;
+        setStatus('opencode-zen-inject-context toggle failed: ' + (err && err.message ? err.message : err), true);
+      }
+    });
+  }
+
   // Codex invite modal — state captured once so handlers can read it.
   // The button that opened the modal is remembered so we can restore
   // its disabled/textContent on close. cap tracks the authoritative
@@ -4752,6 +4818,7 @@
     // First paint must pull quota history; later 10s ticks reuse the TTL cache.
     loadAccountQuota({ forceHistory: true });
     loadAutoRelease429();
+    loadOpencodeZenInject();
   }
 
   $('connectBtn').addEventListener('click', connect);
