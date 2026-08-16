@@ -1021,8 +1021,12 @@ func (r *Registry) SetStreamFailure(t *trackedRequest, reason string) {
 }
 
 // terminalLingerDuration keeps finished/canceled entries visible briefly so
-// operators can see the outcome before they disappear from the list.
-const terminalLingerDuration = 5 * time.Second
+// operators can see the outcome before they disappear from the list. 30s
+// gives operators time to read the token counts on long-running upstreams
+// (e.g. local llama.cpp qwen) whose usage chunk only arrives at the very
+// end of the stream — with 5s the row vanished before the numbers were
+// readable.
+const terminalLingerDuration = 30 * time.Second
 
 // Finish marks an entry as completed. The entry briefly lingers in the
 // registry (in finished/canceled state) before being removed, so the UI can

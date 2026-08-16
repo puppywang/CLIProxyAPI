@@ -1957,6 +1957,14 @@
     const hasIn = e.input_tokens > 0;
     const hasOut = e.output_tokens > 0;
     if (!hasIn && !hasOut) {
+      // No usage yet. For a streaming request still in flight this is
+      // expected — most upstreams (incl. local llama.cpp qwen) only emit
+      // the usage chunk at the very end of the stream. Show a subtle
+      // "usage pending" hint instead of a bare dash so it's clear the
+      // numbers will arrive, not that tracking is broken.
+      if (e.streaming && e.status === 'running' && e.response_bytes > 0) {
+        return '<span class="muted tokens-pending" title="Token usage arrives with the final stream chunk — still streaming">…</span>';
+      }
       return '<span class="muted">—</span>';
     }
     let parts = [];
