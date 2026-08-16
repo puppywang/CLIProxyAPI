@@ -283,6 +283,14 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	if len(data) == 0 {
 		return nil, nil
 	}
+	// Skip internal system files that live in the auth dir but are not
+	// credentials: the session-affinity cache and the round-robin cursor
+	// map. Without this they surface as type=unknown "accounts" in the
+	// operator-facing auth-files list.
+	base := filepath.Base(path)
+	if base == "session-affinity-cache.json" || base == "round-robin-cursor.json" {
+		return nil, nil
+	}
 	metadata := make(map[string]any)
 	if err = json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("unmarshal auth json: %w", err)

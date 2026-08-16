@@ -469,6 +469,29 @@
     font-weight: 500;
   }
   /* Codex account quota panel */
+  .qc-provider-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin: 0 0 8px;
+  }
+  .qc-provider-chip {
+    padding: 2px 8px;
+    border-radius: 3px;
+    border: 1px solid rgba(255,255,255,0.18);
+    background: rgba(255,255,255,0.04);
+    color: rgba(255,255,255,0.65);
+    font-size: 11px;
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .qc-provider-chip:hover { background: rgba(255,255,255,0.1); }
+  .qc-provider-chip.active {
+    background: rgba(143,198,255,0.18);
+    border-color: rgba(143,198,255,0.5);
+    color: #8fc6ff;
+  }
   .quota-aggregate {
     margin: 8px 0 12px;
     padding: 10px 14px;
@@ -798,6 +821,11 @@
     color: #9bb8f0;
     background: rgba(99,132,217,0.12);
     border: 1px solid rgba(99,132,217,0.35);
+  }
+  .provider-pill.generic {
+    color: #b8c4d8;
+    background: rgba(184,196,216,0.10);
+    border: 1px solid rgba(184,196,216,0.30);
   }
   /* Clickable Grok Build/API endpoint toggle on a grok quota row. Green =
      Build (cli-chat-proxy, larger allowance); amber = official API. */
@@ -1545,6 +1573,9 @@
          contributing up to one extra window when its reset_at falls
          inside the horizon. See aggregateQuotaSummary() for the math. -->
     <div id="quotaAggregate" class="quota-aggregate" hidden></div>
+    <!-- Provider filter chips — derived from the auth-files payload each
+         refresh; click to narrow the table to one provider. -->
+    <div id="quotaProviderChips" class="qc-provider-chips"></div>
     <div class="table-wrap">
       <table>
         <colgroup>
@@ -2860,6 +2891,35 @@
   // former standalone "Active bindings by account" panel folded in here.
   let quotaBindingsByAuth = {};
 
+  // Provider filter for the account quota table. 'all' (default) shows every
+  // auth file; any other value narrows to that provider. Persisted in
+  // localStorage so the operator's preferred view survives reloads.
+  let quotaProviderFilter = 'all';
+  try {
+    const saved = localStorage.getItem('quotaProviderFilter');
+    if (saved) quotaProviderFilter = saved;
+  } catch (_) { /* localStorage unavailable */ }
+
+  // Render the provider filter chips above the quota table. Chips are
+  // derived from the current auth-files payload, so new providers appear
+  // automatically without a UI rebuild. All + one chip per provider, each
+  // with a live count.
+  function renderQuotaProviderChips(allFiles) {
+    const root = $('quotaProviderChips');
+    if (!root) return;
+    const counts = {};
+    for (const a of allFiles) {
+      const p = (a.type || a.provider || '').toLowerCase() || 'other';
+      counts[p] = (counts[p] || 0) + 1;
+    }
+    const providers = Object.keys(counts).sort();
+    let html = '<button type="button" class="qc-provider-chip' + (quotaProviderFilter === 'all' ? ' active' : '') + '" data-provider-filter="all">All (' + allFiles.length + ')</button>';
+    for (const p of providers) {
+      html += '<button type="button" class="qc-provider-chip' + (quotaProviderFilter === p ? ' active' : '') + '" data-provider-filter="' + escapeAttr(p) + '">' + escapeHtml(p) + ' (' + counts[p] + ')</button>';
+    }
+    root.innerHTML = html;
+  }
+
   async function loadAccountQuota(opts) {
     if (quotaInflight) return;
     quotaInflight = true;
@@ -2889,12 +2949,24 @@
       }
       const data = await res.json();
       noteServerNow(data.now);
-      const files = (data.files || []).filter(a => {
+      // All auth files are shown now (codex, grok, claude, opencode, cline,
+      // nvidia, qwen, cursor, ...). The provider filter chips above the table
+      // narrow the view; 'all' shows everything.
+      const allFiles = (data.files || []).filter(a => {
         const p = (a.type || a.provider || '').toLowerCase();
-        return p === 'codex' || p === 'xai' || p === 'claude' || p === 'opencode' || p === 'opengo';
+        // System files (round-robin cursor, session-affinity cache) are
+        // filtered server-side; belt-and-braces skip here too.
+        const nm = String(a.name || '').toLowerCase();
+        if (nm === 'round-robin-cursor.json' || nm === 'session-affinity-cache.json') return false;
+        return p !== 'unknown';
+      });
+      const files = allFiles.filter(a => {
+        const p = (a.type || a.provider || '').toLowerCase();
+        return quotaProviderFilter === 'all' || p === quotaProviderFilter;
       });
       $('quotaCount').textContent = String(files.length);
       lastQuotaFiles = files;
+      renderQuotaProviderChips(allFiles);
       // Show the bulk-delete button (with a live count) only when there is
       // at least one deactivated account to clean up.
       const deadCount = files.filter(a => a.quota && a.quota.dead_reason).length;
@@ -3125,15 +3197,19 @@
     })();
     const sub = '<div class="muted qc-filename" title="' + escapeAttr(fileName) + '">' + escapeHtml(fileName) + '</div>';
     const q = a.quota || null;
-    // Provider chip so grok/claude/opencode rows are unmistakable in a mixed pool.
+    // Provider chip so non-codex rows are unmistakable in a mixed pool.
     // Codex is the implicit default and stays unlabelled to avoid clutter.
+    // Every other provider (grok, claude, opencode, cline, nvidia, qwen,
+    // cursor, ...) gets a pill labelled with its provider name.
     const providerPill = isXai
       ? '<span class="provider-pill xai" title="xAI / Grok account">grok</span>'
       : (isClaude
         ? '<span class="provider-pill claude" title="Anthropic / Claude account">claude</span>'
         : (isOpencode
           ? '<span class="provider-pill opencode" title="opencode zen API key (config)">' + rowProvider + '</span>'
-          : ''));
+          : (rowProvider && rowProvider !== 'codex'
+            ? '<span class="provider-pill generic" title="' + escapeAttr(rowProvider) + ' account">' + escapeHtml(rowProvider) + '</span>'
+            : '')));
     // Clickable Grok endpoint toggle (grok rows only). a.xai_using_api is true
     // for the official API path, false for Grok Build. The label shows the mode
     // the account is CURRENTLY on; clicking switches it.
@@ -3218,7 +3294,8 @@
     // Sync plan from live wham/usage — codex only. After a free→plus upgrade
     // this rewrites plan_type and re-registers the model catalog (adds sol)
     // without re-importing the credential file.
-    const planBtn = (isXai || isClaude)
+    const isCodex = rowProvider === 'codex';
+    const planBtn = (isXai || isClaude || !isCodex)
       ? ''
       : '<button type="button" class="plan-refresh-btn" data-plan-refresh="' + escapeAttr(a.id) + '" title="Sync ChatGPT plan from server (wham/usage plan_type) and re-register models">♛</button>';
     // Delete is always available (even for a disabled account) — it removes
@@ -3236,16 +3313,17 @@
         ' ' + deleteBtn;
     } else {
       // Codex referral invites (✉) only make sense for codex accounts; show a
-      // disabled placeholder for grok/claude so the action column stays aligned.
-      const inviteBtn = (isXai || isClaude)
+      // disabled placeholder for grok/claude/other providers so the action
+      // column stays aligned.
+      const inviteBtn = (isXai || isClaude || !isCodex)
         ? '<button type="button" class="codex-invite-btn" disabled title="Codex only">✉</button>'
         : '<button type="button" class="codex-invite-btn" data-codex-invite="' + escapeAttr(a.id) + '" title="Send Codex referral invites from this account">✉</button>';
       // The backend quota refresher only speaks codex wham/usage and grok
-      // billing; there is no Claude usage poller yet, so the per-row
-      // refresh stays disabled on claude rows instead of throwing a
-      // guaranteed server-side error on click.
-      const refreshBtn = isClaude
-        ? '<button type="button" class="quota-refresh-btn" disabled title="No quota API for Claude accounts yet — usage windows are tracked by Anthropic server-side only">↻</button>'
+      // billing; claude and other providers (cline, nvidia, qwen, cursor,
+      // opencode) have no quota poller, so their per-row refresh stays
+      // disabled instead of throwing a guaranteed server-side error on click.
+      const refreshBtn = (isClaude || !isXai && !isCodex)
+        ? '<button type="button" class="quota-refresh-btn" disabled title="No quota API for this provider">↻</button>'
         : '<button type="button" class="quota-refresh-btn" data-quota-refresh="' + escapeAttr(a.id) + '" title="' + (isXai ? 'Refresh grok billing for this account' : 'Refresh wham/usage for this account') + '">↻</button>';
       actions =
         refreshBtn +
@@ -4760,6 +4838,14 @@
     if (bindingsBtn) {
       ev.preventDefault();
       openBindingsModal(bindingsBtn.getAttribute('data-bindings-popup'));
+      return;
+    }
+    const chipBtn = ev.target.closest('button[data-provider-filter]');
+    if (chipBtn) {
+      ev.preventDefault();
+      quotaProviderFilter = chipBtn.getAttribute('data-provider-filter') || 'all';
+      try { localStorage.setItem('quotaProviderFilter', quotaProviderFilter); } catch (_) {}
+      loadAccountQuota();
       return;
     }
     const deleteBtn = ev.target.closest('button[data-delete-account]');
