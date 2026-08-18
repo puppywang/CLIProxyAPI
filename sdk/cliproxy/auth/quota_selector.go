@@ -43,6 +43,14 @@ type QuotaSnapshot struct {
 	// was frozen at registration and would otherwise keep advertising the
 	// wrong model catalog after an upgrade.
 	PlanType string
+	// HasCredits mirrors wham/usage credits.has_credits — the account is
+	// on a credits-based billing plan (workspace credits / pay-per-use).
+	// CreditsUnlimited mirrors credits.unlimited (no balance cap).
+	// CreditsBalance is the raw balance string from credits.balance
+	// (e.g. "9.99"); empty when the backend hides it.
+	HasCredits       bool
+	CreditsUnlimited bool
+	CreditsBalance   string
 }
 
 // QuotaFetcher retrieves a current QuotaSnapshot for a single auth. Returns
@@ -526,20 +534,59 @@ func QuotaLimitIgnored(a *Auth) bool {
 	return strings.EqualFold(strings.TrimSpace(a.Attributes["ignore_quota_limit"]), "true")
 }
 
+// CreditSchedulingAllowed reports whether an operator allowed this auth to
+// keep serving requests from its credits balance once the quota windows are
+// exhausted. Codex accounts on credits-based billing (workspace credits /
+// pay-per-use) keep working after limit_reached — upstream simply starts
+// charging credits. The operator may not want that (credits cost money), so
+// the default is off: an exhausted account is treated as quota-limited and
+// dropped from selection. When on AND the snapshot shows usable credits
+// (unlimited or has_credits), effectiveQuotaSnapshot clears limit_reached so
+// the account stays schedulable as a last resort.
+func CreditSchedulingAllowed(a *Auth) bool {
+	if a == nil || a.Attributes == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(a.Attributes["allow_credit_scheduling"]), "true")
+}
+
+// hasUsableCredits reports whether a snapshot carries usable credits —
+// mirroring the Codex CLI's has_usable_workspace_credits (unlimited OR
+// has_credits). A balance string is not required: "Available" credits
+// (has_credits=true, balance hidden) are still spendable.
+func hasUsableCredits(snap QuotaSnapshot) bool {
+	return snap.CreditsUnlimited || snap.HasCredits
+}
+
 // effectiveQuotaSnapshot applies the operator's ignore-quota-limit override to a
 // snapshot before it drives selection: limit_reached is cleared and the used
 // percentages are clamped just below the exclusion threshold, which keeps the
 // account selectable while ranking it behind accounts with real headroom.
+// The allow-credit-scheduling override is narrower: it only clears
+// limit_reached when the snapshot actually shows usable credits — an account
+// with no credits stays excluded even with the flag on.
 func effectiveQuotaSnapshot(a *Auth, snap QuotaSnapshot) QuotaSnapshot {
-	if !QuotaLimitIgnored(a) {
+	if a == nil {
 		return snap
 	}
-	snap.LimitReached = false
-	if snap.UsedPercentPrimary >= UnhealthyUsedPercent {
-		snap.UsedPercentPrimary = UnhealthyUsedPercent - 1
+	if QuotaLimitIgnored(a) {
+		snap.LimitReached = false
+		if snap.UsedPercentPrimary >= UnhealthyUsedPercent {
+			snap.UsedPercentPrimary = UnhealthyUsedPercent - 1
+		}
+		if snap.UsedPercentSecondary >= UnhealthyUsedPercent {
+			snap.UsedPercentSecondary = UnhealthyUsedPercent - 1
+		}
+		return snap
 	}
-	if snap.UsedPercentSecondary >= UnhealthyUsedPercent {
-		snap.UsedPercentSecondary = UnhealthyUsedPercent - 1
+	if CreditSchedulingAllowed(a) && hasUsableCredits(snap) {
+		snap.LimitReached = false
+		if snap.UsedPercentPrimary >= UnhealthyUsedPercent {
+			snap.UsedPercentPrimary = UnhealthyUsedPercent - 1
+		}
+		if snap.UsedPercentSecondary >= UnhealthyUsedPercent {
+			snap.UsedPercentSecondary = UnhealthyUsedPercent - 1
+		}
 	}
 	return snap
 }

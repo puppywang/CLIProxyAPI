@@ -583,6 +583,27 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			}
 		}
 	}
+	// Expose the operator's allow-credit-scheduling override so the UI can
+	// show and toggle it. When set AND the account has usable credits
+	// (wham/usage credits.has_credits / unlimited), the quota selector
+	// keeps the account schedulable after its windows are exhausted —
+	// upstream then charges the credits balance.
+	if strings.EqualFold(strings.TrimSpace(authAttribute(auth, "allow_credit_scheduling")), "true") {
+		entry["allow_credit_scheduling"] = true
+	} else if auth.Metadata != nil {
+		if raw, ok := auth.Metadata["allow_credit_scheduling"]; ok {
+			switch v := raw.(type) {
+			case bool:
+				if v {
+					entry["allow_credit_scheduling"] = true
+				}
+			case string:
+				if parsed, errParse := strconv.ParseBool(strings.TrimSpace(v)); errParse == nil && parsed {
+					entry["allow_credit_scheduling"] = true
+				}
+			}
+		}
+	}
 	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
 	if p := strings.TrimSpace(authAttribute(auth, "priority")); p != "" {
@@ -1723,6 +1744,14 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	if _, ok := touchedRoots["disabled"]; ok {
 		syncAuthFileDisabledState(auth)
 	}
+	// allow_credit_scheduling drives the quota selector's credits fallback
+	// (keep serving from the credits balance once windows are exhausted).
+	// Without this, PATCH only rewrote the on-disk metadata and left
+	// Attributes stale, so the selector never saw the operator's toggle
+	// until a full file re-synthesis (rename/restart) rebuilt Attributes.
+	if _, ok := touchedRoots["allow_credit_scheduling"]; ok {
+		syncAuthFileCreditSchedulingAttribute(auth)
+	}
 	// plan_type drives the codex model catalog (free omits gpt-5.6-sol;
 	// plus/team/pro include it). Without this, PATCH only rewrote the
 	// on-disk metadata and left Attributes["plan_type"] stale, so the
@@ -1730,6 +1759,38 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	// file re-synthesis (rename/restart) rebuilt Attributes.
 	if _, ok := touchedRoots["plan_type"]; ok {
 		syncAuthFilePlanTypeAttribute(auth)
+	}
+}
+
+// syncAuthFileCreditSchedulingAttribute copies Metadata["allow_credit_scheduling"]
+// into Attributes["allow_credit_scheduling"] so the quota selector's
+// CreditSchedulingAllowed sees the operator's toggle immediately. Empty or
+// false values clear the attribute (default: credits are NOT spent).
+func syncAuthFileCreditSchedulingAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	raw, ok := auth.Metadata["allow_credit_scheduling"]
+	if !ok {
+		delete(auth.Attributes, "allow_credit_scheduling")
+		return
+	}
+	enabled := false
+	switch v := raw.(type) {
+	case bool:
+		enabled = v
+	case string:
+		if parsed, errParse := strconv.ParseBool(strings.TrimSpace(v)); errParse == nil {
+			enabled = parsed
+		}
+	}
+	if enabled {
+		auth.Attributes["allow_credit_scheduling"] = "true"
+	} else {
+		delete(auth.Attributes, "allow_credit_scheduling")
 	}
 }
 

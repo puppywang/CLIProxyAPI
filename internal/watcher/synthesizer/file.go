@@ -189,6 +189,24 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 		}
 	}
+	// Read the operator's allow-credit-scheduling override from the auth
+	// file. When set, the quota selector keeps this account schedulable
+	// after its windows are exhausted as long as wham/usage reports usable
+	// credits (credits.has_credits / unlimited) — upstream then charges the
+	// credits balance. Default off: exhausted accounts are treated as
+	// quota-limited unless the operator opts into spending credits.
+	if rawCredit, ok := metadata["allow_credit_scheduling"]; ok {
+		switch v := rawCredit.(type) {
+		case bool:
+			if v {
+				a.Attributes["allow_credit_scheduling"] = "true"
+			}
+		case string:
+			if parsed, errParse := strconv.ParseBool(strings.TrimSpace(v)); errParse == nil && parsed {
+				a.Attributes["allow_credit_scheduling"] = "true"
+			}
+		}
+	}
 	// Read note from auth file.
 	if rawNote, ok := metadata["note"]; ok {
 		if note, isStr := rawNote.(string); isStr {

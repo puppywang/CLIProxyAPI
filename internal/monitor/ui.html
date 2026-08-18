@@ -627,6 +627,38 @@
   .status-pill.unavail  { color: #f5c98a; border-color: rgba(245,201,138,0.35); background: rgba(245,201,138,0.08); }
   .status-pill.disabled { color: rgba(255,255,255,0.4); border-color: rgba(255,255,255,0.15); background: rgba(255,255,255,0.03); }
   .status-pill.dead     { color: #ff5c5c; border-color: rgba(255,92,92,0.6); background: rgba(255,92,92,0.14); font-weight: 700; }
+  /* Credits column: balance text + the allow-credit-scheduling toggle.
+     The toggle is a compact checkbox that PATCHes the auth's
+     allow_credit_scheduling attribute; when on AND the account has usable
+     credits, the quota selector keeps it schedulable after its windows
+     are exhausted (upstream then charges the credits balance). */
+  .qc-credits-cell {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  .qc-credits-balance {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 12px;
+    color: rgba(255,255,255,0.75);
+  }
+  .qc-credits-balance.unlimited { color: #6ad36a; }
+  .qc-credits-balance.available { color: #8fc6ff; }
+  .qc-credits-balance.empty     { color: rgba(255,255,255,0.35); }
+  .qc-credits-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 10px;
+    color: rgba(255,255,255,0.45);
+    cursor: pointer;
+    user-select: none;
+  }
+  .qc-credits-toggle input { margin: 0; cursor: pointer; }
+  .qc-credits-toggle.on { color: #f5c98a; }
+  .qc-credits-toggle.off { color: rgba(255,255,255,0.35); }
+  .qc-credits-toggle:disabled { opacity: 0.4; cursor: not-allowed; }
   /* Front-of-row flag for a credential the quota fetcher found permanently
      unusable (e.g. wham/usage 402 deactivated_workspace). A compact icon-only
      badge pinned before the email — the STATUS column already spells out
@@ -1306,14 +1338,15 @@
      The accompanying .quota-bar-wrap loses its min-width so the bar
      never forces its column wider than the colgroup says. */
   #quotaSection table { table-layout: fixed; width: 100%; }
-  #quotaSection col.qc-account   { width: 14%; }
+  #quotaSection col.qc-account   { width: 13%; }
   #quotaSection col.qc-status    { width: 7%; }
-  #quotaSection col.qc-bar       { width: 10%; }
+  #quotaSection col.qc-bar       { width: 9%; }
+  #quotaSection col.qc-credits   { width: 9%; }
   #quotaSection col.qc-trend     { width: 8%; }
   #quotaSection col.qc-resets    { width: 9%; }
   #quotaSection col.qc-fetched   { width: 7%; }
   #quotaSection col.qc-bindings  { width: 7%; }
-  #quotaSection col.qc-cooldown  { width: 14%; }
+  #quotaSection col.qc-cooldown  { width: 13%; }
   #quotaSection col.qc-actions   { width: 14%; }
   /* Bindings cell — a compact "N active" button that opens a popup with the
      full session list (uuids + workspace paths) rather than cramming them
@@ -1583,6 +1616,7 @@
           <col class="qc-status">
           <col class="qc-bar">
           <col class="qc-bar">
+          <col class="qc-credits">
           <col class="qc-trend">
           <col class="qc-resets">
           <col class="qc-fetched">
@@ -1596,6 +1630,7 @@
             <th>Status</th>
             <th title="Shorter-horizon limit — codex/claude: 5h · grok: weekly">5h window</th>
             <th title="Longer-horizon limit — codex/claude: 7d · grok: monthly">Weekly window</th>
+            <th title="Credits balance (workspace credits / pay-per-use). The toggle allows scheduling this account from its credits once the windows are exhausted — upstream then charges the balance">Credits</th>
             <th title="Usage curve over the retained history (click for the full chart, peaks and resets)">Trend</th>
             <th>Resets</th>
             <th>Last fetched</th>
@@ -2796,6 +2831,7 @@
       a.unavailable ? 1 : 0,
       Number(a.priority) || 0,
       a.xai_using_api ? 1 : 0,
+      a.allow_credit_scheduling ? 1 : 0,
       a.label || a.email || a.name || '',
       a.name || a.id || '',
       a.provider || a.type || '',
@@ -2804,6 +2840,9 @@
       q.limit_reached ? 1 : 0,
       q.used_percent_primary || 0,
       q.used_percent_secondary || 0,
+      q.has_credits ? 1 : 0,
+      q.credits_unlimited ? 1 : 0,
+      q.credits_balance || '',
       q.reset_at_primary || '',
       q.reset_at_secondary || '',
       q.fetched_at || '',
@@ -3351,6 +3390,7 @@
       '<td>' + statusPill + '</td>' +
       '<td>' + primaryCell + '</td>' +
       '<td>' + secondaryCell + '</td>' +
+      '<td>' + renderCreditsCell(a, q) + '</td>' +
       '<td>' + sparklineSVG(a.id, quotaHistoryByAuth[a.id]) + '</td>' +
       '<td>' + resetsCell + '</td>' +
       '<td>' + fetchedCell + '</td>' +
@@ -3358,6 +3398,40 @@
       '<td>' + renderQuotaCooldownCell(a) + '</td>' +
       '<td>' + actions + '</td>';
     return tr;
+  }
+
+  // renderCreditsCell builds the Credits column: the account's credits
+  // balance (from wham/usage credits.{has_credits,unlimited,balance}) plus
+  // the allow-credit-scheduling toggle. The toggle is only meaningful for
+  // codex accounts with usable credits — other providers get an em-dash.
+  function renderCreditsCell(a, q) {
+    const isCodex = (a.provider || a.type || '').toLowerCase() === 'codex';
+    if (!isCodex) return '<span class="muted">—</span>';
+    const hasCredits = !!(q && (q.has_credits || q.credits_unlimited));
+    let balanceHtml;
+    if (q && q.credits_unlimited) {
+      balanceHtml = '<span class="qc-credits-balance unlimited" title="Unlimited credits — no balance cap">∞</span>';
+    } else if (q && q.has_credits && q.credits_balance) {
+      balanceHtml = '<span class="qc-credits-balance" title="Credits balance">' + escapeHtml(q.credits_balance) + '</span>';
+    } else if (q && q.has_credits) {
+      balanceHtml = '<span class="qc-credits-balance available" title="Credits available (balance hidden by backend)">avail</span>';
+    } else if (q) {
+      balanceHtml = '<span class="qc-credits-balance empty" title="No credits on this account">—</span>';
+    } else {
+      balanceHtml = '<span class="muted">—</span>';
+    }
+    // Toggle: only enabled when the account actually has usable credits.
+    // Disabled (but visible) when there are no credits — the operator can
+    // see the control exists but it cannot do anything until credits land.
+    const allowed = !!a.allow_credit_scheduling;
+    const toggle = hasCredits
+      ? '<label class="qc-credits-toggle ' + (allowed ? 'on' : 'off') + '" title="' +
+        (allowed
+          ? 'Credit scheduling ON — this account keeps serving from its credits once the windows are exhausted (upstream charges the balance)'
+          : 'Credit scheduling OFF — when the windows are exhausted this account is treated as quota-limited. Turn on to allow spending its credits') +
+        '"><input type="checkbox" data-credit-toggle="' + escapeAttr(a.id) + '"' + (allowed ? ' checked' : '') + '>cred</label>'
+      : '<span class="qc-credits-toggle off" title="No usable credits — nothing to schedule">cred</span>';
+    return '<div class="qc-credits-cell">' + balanceHtml + toggle + '</div>';
   }
 
   // renderQuotaCooldownCell builds a single-line Cooldown summary from the
@@ -3759,6 +3833,43 @@
       setStatus('grok toggle failed: ' + (err && err.message ? err.message : err), true);
     } finally {
       if (btnEl && btnEl.isConnected) { btnEl.disabled = false; btnEl.textContent = originalText || (currentUsingAPI ? 'API' : 'Build'); }
+    }
+  }
+
+  // toggleCreditSchedulingOne flips an account's allow_credit_scheduling
+  // attribute via PatchAuthFileFields. When on, the quota selector keeps
+  // the account schedulable after its windows are exhausted as long as
+  // wham/usage reports usable credits — upstream then charges the credits
+  // balance. Confirm first: spending credits costs money.
+  async function toggleCreditSchedulingOne(authID, want, inputEl) {
+    if (!authID) return;
+    if (want && !window.confirm(
+      'Allow credit scheduling for ' + authID + '?\n\n' +
+      'When its quota windows are exhausted, this account will keep serving ' +
+      'requests from its credits balance — upstream charges the credits ' +
+      '(real money). Turn off to treat it as quota-limited instead.'
+    )) {
+      // Revert the checkbox on cancel.
+      if (inputEl && inputEl.isConnected) inputEl.checked = false;
+      return;
+    }
+    const originalDisabled = inputEl ? inputEl.disabled : false;
+    if (inputEl) inputEl.disabled = true;
+    try {
+      await apiFetch('/v0/management/auth-files/fields', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: authID, allow_credit_scheduling: want }),
+      });
+      setStatus(want
+        ? 'credit scheduling ENABLED for ' + authID + ' — exhausted windows will fall through to its credits balance'
+        : 'credit scheduling disabled for ' + authID + ' — exhausted windows are treated as quota-limited');
+      await loadAccountQuota();
+    } catch (err) {
+      setStatus('credit scheduling toggle failed: ' + (err && err.message ? err.message : err), true);
+      if (inputEl && inputEl.isConnected) inputEl.checked = !want;
+    } finally {
+      if (inputEl && inputEl.isConnected) inputEl.disabled = originalDisabled;
     }
   }
 
@@ -4805,6 +4916,16 @@
     if (forceBtn) {
       ev.preventDefault();
       forceCooldownOne(forceBtn.getAttribute('data-cooldown-force'), forceBtn);
+      return;
+    }
+    // Credit-scheduling toggle: a checkbox inside the Credits column. When
+    // checked, the account may keep serving from its credits balance once
+    // its quota windows are exhausted. PATCHes allow_credit_scheduling on
+    // the auth file (same endpoint as priority/plan_type).
+    const creditToggle = ev.target.closest('input[data-credit-toggle]');
+    if (creditToggle) {
+      ev.preventDefault();
+      toggleCreditSchedulingOne(creditToggle.getAttribute('data-credit-toggle'), creditToggle.checked, creditToggle);
       return;
     }
     const inviteBtn = ev.target.closest('button[data-codex-invite]');

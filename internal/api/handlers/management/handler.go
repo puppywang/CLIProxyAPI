@@ -94,6 +94,12 @@ type QuotaSnapshotData struct {
 	// back onto the auth so agent-identity upgrades take effect without
 	// re-importing the credential file.
 	PlanType string `json:"plan_type,omitempty"`
+	// HasCredits / CreditsUnlimited / CreditsBalance mirror wham/usage
+	// credits so the monitor can show each account's credits balance and
+	// gate allow_credit_scheduling decisions on real data.
+	HasCredits       bool   `json:"has_credits,omitempty"`
+	CreditsUnlimited bool   `json:"credits_unlimited,omitempty"`
+	CreditsBalance   string `json:"credits_balance,omitempty"`
 	// DeadReason / DeadSince surface a terminal "account unusable" signal
 	// observed by the quota fetcher (e.g. wham/usage 402 deactivated_workspace).
 	// Set only for permanently-dead credentials the operator should clean up;

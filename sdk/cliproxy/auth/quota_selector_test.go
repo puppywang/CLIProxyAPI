@@ -747,3 +747,95 @@ func TestLeastRemainingQuotaSelector_IgnoreQuotaLimitOverride(t *testing.T) {
 		t.Fatalf("picked %v, want auth-plain (a healthy account must outrank a forced-exhausted one)", got2)
 	}
 }
+
+// TestLeastRemainingQuotaSelector_CreditScheduling verifies the
+// allow_credit_scheduling override: an exhausted account with usable credits
+// (wham/usage credits.has_credits / unlimited) stays schedulable when the
+// operator opted in, while an exhausted account WITHOUT credits (or without
+// the flag) is treated as quota-limited and excluded.
+func TestLeastRemainingQuotaSelector_CreditScheduling(t *testing.T) {
+	t.Parallel()
+
+	credit := &Auth{ID: "auth-credit", Provider: "codex", Attributes: map[string]string{"allow_credit_scheduling": "true"}}
+	creditNoFlag := &Auth{ID: "auth-credit-noflag", Provider: "codex"}
+	noCredits := &Auth{ID: "auth-nocredits", Provider: "codex", Attributes: map[string]string{"allow_credit_scheduling": "true"}}
+	plain := &Auth{ID: "auth-plain", Provider: "codex"}
+	selector := NewLeastRemainingQuotaSelector(LeastRemainingQuotaConfig{
+		Inner:   &FillFirstSelector{},
+		Fetcher: newFakeQuotaFetcher(nil),
+		TTL:     time.Minute,
+		Async:   true,
+	})
+	// All exhausted. Only auth-credit has the flag AND usable credits.
+	selector.PushSnapshot("auth-credit", QuotaSnapshot{UsedPercentPrimary: 100, LimitReached: true, HasCredits: true, CreditsBalance: "9.99"})
+	selector.PushSnapshot("auth-credit-noflag", QuotaSnapshot{UsedPercentPrimary: 100, LimitReached: true, HasCredits: true, CreditsBalance: "9.99"})
+	selector.PushSnapshot("auth-nocredits", QuotaSnapshot{UsedPercentPrimary: 100, LimitReached: true})
+	selector.PushSnapshot("auth-plain", QuotaSnapshot{UsedPercentPrimary: 100, LimitReached: true})
+
+	got, err := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, []*Auth{credit, creditNoFlag, noCredits, plain})
+	if err != nil {
+		t.Fatalf("Pick error = %v", err)
+	}
+	if got == nil || got.ID != "auth-credit" {
+		t.Fatalf("picked %v, want auth-credit (flag + usable credits must keep an exhausted account schedulable)", got)
+	}
+
+	// Unlimited credits also count as usable.
+	selector.PushSnapshot("auth-credit", QuotaSnapshot{UsedPercentPrimary: 100, LimitReached: true, CreditsUnlimited: true})
+	got2, err2 := selector.Pick(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, []*Auth{credit, plain})
+	if err2 != nil {
+		t.Fatalf("Pick error = %v", err2)
+	}
+	if got2 == nil || got2.ID != "auth-credit" {
+		t.Fatalf("picked %v, want auth-credit (unlimited credits must count as usable)", got2)
+	}
+}
+
+// TestEffectiveQuotaSnapshot_CreditScheduling pins the effectiveQuotaSnapshot
+// semantics for the allow_credit_scheduling override without going through
+// Pick's pool ordering:
+//   - flag off → limit_reached stays (exhausted = excluded)
+//   - flag on + usable credits (has_credits / unlimited) → limit_reached cleared
+//   - flag on + no credits → limit_reached stays (nothing to spend)
+//   - ignore_quota_limit still wins unconditionally (no credits required)
+func TestEffectiveQuotaSnapshot_CreditScheduling(t *testing.T) {
+	t.Parallel()
+
+	exhausted := QuotaSnapshot{UsedPercentPrimary: 100, UsedPercentSecondary: 100, LimitReached: true}
+	exhaustedWithCredits := QuotaSnapshot{UsedPercentPrimary: 100, UsedPercentSecondary: 100, LimitReached: true, HasCredits: true, CreditsBalance: "9.99"}
+
+	// Flag off: exhausted stays excluded even with credits.
+	off := &Auth{ID: "off", Provider: "codex"}
+	if got := effectiveQuotaSnapshot(off, exhaustedWithCredits); !got.LimitReached {
+		t.Fatalf("flag off: expected limit_reached to stay, got cleared")
+	}
+
+	// Flag on + has_credits: cleared and clamped below the exclusion threshold.
+	onCredits := &Auth{ID: "on-credits", Provider: "codex", Attributes: map[string]string{"allow_credit_scheduling": "true"}}
+	got := effectiveQuotaSnapshot(onCredits, exhaustedWithCredits)
+	if got.LimitReached {
+		t.Fatalf("flag on + has_credits: expected limit_reached cleared, got %+v", got)
+	}
+	if got.UsedPercentPrimary != UnhealthyUsedPercent-1 {
+		t.Fatalf("flag on + has_credits: primary used = %d, want %d (clamped below exclusion)", got.UsedPercentPrimary, UnhealthyUsedPercent-1)
+	}
+
+	// Flag on + unlimited credits: cleared.
+	onUnlimited := &Auth{ID: "on-unlimited", Provider: "codex", Attributes: map[string]string{"allow_credit_scheduling": "true"}}
+	got2 := effectiveQuotaSnapshot(onUnlimited, QuotaSnapshot{UsedPercentPrimary: 100, LimitReached: true, CreditsUnlimited: true})
+	if got2.LimitReached {
+		t.Fatalf("flag on + unlimited: expected limit_reached cleared, got %+v", got2)
+	}
+
+	// Flag on + no credits: stays excluded.
+	onNoCredits := &Auth{ID: "on-nocredits", Provider: "codex", Attributes: map[string]string{"allow_credit_scheduling": "true"}}
+	if got3 := effectiveQuotaSnapshot(onNoCredits, exhausted); !got3.LimitReached {
+		t.Fatalf("flag on + no credits: expected limit_reached to stay, got cleared")
+	}
+
+	// ignore_quota_limit still wins unconditionally (no credits required).
+	ignored := &Auth{ID: "ignored", Provider: "codex", Attributes: map[string]string{"ignore_quota_limit": "true"}}
+	if got4 := effectiveQuotaSnapshot(ignored, exhausted); got4.LimitReached {
+		t.Fatalf("ignore_quota_limit: expected limit_reached cleared, got %+v", got4)
+	}
+}

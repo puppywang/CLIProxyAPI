@@ -968,6 +968,9 @@ func (s *Service) startQuotaRefresher(ctx context.Context) {
 				ResetAtSecondary:     optTime(snap.ResetAtSecondary),
 				FetchedAt:            optTime(snap.FetchedAt),
 				PlanType:             strings.TrimSpace(snap.PlanType),
+				HasCredits:           snap.HasCredits,
+				CreditsUnlimited:     snap.CreditsUnlimited,
+				CreditsBalance:       strings.TrimSpace(snap.CreditsBalance),
 			}
 		}
 		snapshotFn := func(authID string) (managementHandlers.QuotaSnapshotData, bool) {

@@ -170,6 +170,14 @@ func parseWhamUsage(body []byte) (coreauth.QuotaSnapshot, bool, error) {
 		// (free/plus/team/pro/…). Agent-identity credentials freeze plan
 		// at registration; the refresher uses this field to re-sync.
 		PlanType: strings.TrimSpace(gjson.GetBytes(body, "plan_type").String()),
+		// Credits: accounts on credits-based billing (workspace credits /
+		// pay-per-use) carry credits.{has_credits,unlimited,balance}.
+		// Mirrors the Codex CLI's CreditsSnapshot. The selector consults
+		// these only when the operator enables allow_credit_scheduling —
+		// an exhausted account can then keep serving from its balance.
+		HasCredits:       gjson.GetBytes(body, "credits.has_credits").Bool(),
+		CreditsUnlimited: gjson.GetBytes(body, "credits.unlimited").Bool(),
+		CreditsBalance:   strings.TrimSpace(gjson.GetBytes(body, "credits.balance").String()),
 	}
 	if v := gjson.GetBytes(body, "rate_limit.primary_window.reset_at").Int(); v > 0 {
 		snap.ResetAtPrimary = time.Unix(v, 0)
